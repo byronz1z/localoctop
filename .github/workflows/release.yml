@@ -1,0 +1,52 @@
+name: Release
+
+# Tag pushes (v*) build the single EXE on GitHub's official CI, package it
+# with a sha256 checksum, and publish a GitHub Release. Local builds are
+# self-test evidence only — they are never a deliverable.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Compile single EXE
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -ldflags "-s -w" -o dist/octop-local-bridge-${{ github.ref_name }}-windows-amd64.exe ./cmd/bridge
+
+      - name: Zip + sha256
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "dist/octop-local-bridge-$tag-windows-amd64.zip"
+          Compress-Archive -Path "dist/octop-local-bridge-$tag-windows-amd64.exe" -DestinationPath $zip
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$zip.sha256" -Value "$h  octop-local-bridge-$tag-windows-amd64.zip" -NoNewline
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.sha256
+          generate_release_notes: true

@@ -1,0 +1,14 @@
+# Build artifacts
+dist/
+*.exe
+*.zip
+*.sha256
+
+# Local runtime files
+audit.log
+audit.jsonl
+
+# Editor/OS noise
+.DS_Store
+Thumbs.db
+*.swp

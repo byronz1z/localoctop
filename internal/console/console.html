@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Octop Local Bridge 控制台</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1a2233; --muted: #6b7385;
+    --line: #e3e6ec; --accent: #2f5ee8; --ok: #188a4c; --bad: #c23a3a; --warn: #a06a00;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.6 "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  header .dot.on { background: var(--ok); }
+  header .dot.off { background: var(--bad); }
+  nav { margin-left: auto; display: flex; gap: 4px; }
+  nav button { border: 0; background: none; padding: 8px 14px; border-radius: 8px; cursor: pointer; font: inherit; color: var(--muted); }
+  nav button.active { background: var(--bg); color: var(--ink); font-weight: 600; }
+  main { max-width: 860px; margin: 0 auto; padding: 20px; }
+  .page { display: none; }
+  .page.active { display: block; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .stat { flex: 1; min-width: 140px; }
+  .stat .k { color: var(--muted); font-size: 12px; }
+  .stat .v { font-size: 20px; font-weight: 600; }
+  .v.ok { color: var(--ok); } .v.bad { color: var(--bad); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  #auditStream { max-height: 380px; overflow-y: auto; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.allow { background: #e5f4ec; color: var(--ok); }
+  .tag.deny  { background: #fbe9e9; color: var(--bad); }
+  .tag.error { background: #fdf3e0; color: var(--warn); }
+  label { display: block; margin: 12px 0 4px; color: var(--muted); font-size: 13px; }
+  input[type=text], input[type=password], input[type=number], input[type=url] {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: inherit;
+  }
+  input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  .dirs li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); list-style: none; }
+  .dirs ul, .dirs { padding: 0; margin: 0; }
+  .dirs code { background: var(--bg); padding: 2px 8px; border-radius: 6px; flex: 1; overflow-wrap: anywhere; }
+  .btn { border: 0; background: var(--accent); color: #fff; padding: 9px 22px; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 600; }
+  .btn.secondary { background: var(--bg); color: var(--ink); border: 1px solid var(--line); }
+  .btn.danger { background: none; color: var(--bad); border: 1px solid var(--bad); padding: 4px 12px; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .chk { display: flex; gap: 8px; align-items: center; margin: 12px 0; }
+  .msg { margin: 10px 0; padding: 8px 14px; border-radius: 8px; display: none; }
+  .msg.ok { display: block; background: #e5f4ec; color: var(--ok); }
+  .msg.err { display: block; background: #fbe9e9; color: var(--bad); }
+  .muted { color: var(--muted); font-size: 12px; }
+  #onboard { max-width: 560px; }
+  .mono { font-family: Consolas, monospace; font-size: 12.5px; }
+  .pill { font-size: 11px; padding: 1px 8px; border-radius: 8px; border: 1px solid var(--line); color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="connDot"></span>
+  <h1>Octop Local Bridge</h1>
+  <span class="pill mono" id="connText">未连接</span>
+  <nav>
+    <button data-page="status" class="active">状态</button>
+    <button data-page="dirs">目录白名单</button>
+    <button data-page="conn">连接配置</button>
+    <button data-page="about">关于</button>
+  </nav>
+</header>
+
+<main>
+  <!-- 引导页（首次启动无配置） -->
+  <section class="page" id="page-onboard">
+    <div class="card" id="onboard">
+      <h2>欢迎使用 Octop Local Bridge</h2>
+      <p class="muted">首次使用需要完成三步：选择白名单目录 → 填写服务器地址与令牌 → 保存并连接。</p>
+      <form id="onboardForm">
+        <label>白名单目录（云端 AI 只能访问这些目录）</label>
+        <input type="text" id="obDir" placeholder="例如 C:\Users\me\Documents\Octop" required>
+        <label>服务器地址</label>
+        <input type="url" id="obURL" placeholder="wss://your-octop-server/mcp-localfs/ws" required>
+        <label>访问令牌（由服务器管理员签发）</label>
+        <input type="password" id="obToken" placeholder="token" required autocomplete="off">
+        <div style="margin-top:16px"><button class="btn" type="submit">保存并连接</button></div>
+        <div class="msg" id="obMsg"></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- 状态页 -->
+  <section class="page active" id="page-status">
+    <div class="card">
+      <h2>连接状态</h2>
+      <div class="row">
+        <div class="stat"><div class="k">状态</div><div class="v" id="stConn">—</div></div>
+        <div class="stat"><div class="k">重连次数</div><div class="v" id="stReconn">0</div></div>
+        <div class="stat"><div class="k">客户端 ID</div><div class="v mono" id="stClient" style="font-size:14px">—</div></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <div class="stat" style="flex:3"><div class="k">服务器</div><div class="v mono" id="stServer" style="font-size:13px">—</div></div>
+        <div class="stat"><div class="k">最近审计</div><div class="v mono" id="stAudit" style="font-size:13px">—</div></div>
+      </div>
+      <div class="muted" id="stErr" style="margin-top:6px"></div>
+    </div>
+    <div class="card">
+      <h2>审计活动（实时）</h2>
+      <table id="auditStream">
+        <thead><tr><th style="width:150px">时间</th><th style="width:90px">结果</th><th>操作</th><th>路径</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted" style="margin-top:8px">全部记录（含历史）见本地审计日志文件；此处仅实时追加最近 200 条。</div>
+    </div>
+  </section>
+
+  <!-- 目录白名单页 -->
+  <section class="page" id="page-dirs">
+    <div class="card">
+      <h2>目录白名单</h2>
+      <p class="muted">云端 AI 只能访问以下目录（及其子目录）。禁用的目录不会被服务，但仍保留在配置中。</p>
+      <div class="dirs"><ul id="dirList"></ul></div>
+      <div class="row" style="margin-top:12px; align-items:center">
+        <input type="text" id="newDir" placeholder="添加目录（绝对路径，如 D:\projects\docs）" style="flex:1">
+        <button class="btn" id="addDirBtn">添加</button>
+      </div>
+      <div class="msg" id="dirMsg"></div>
+    </div>
+  </section>
+
+  <!-- 连接配置页 -->
+  <section class="page" id="page-conn">
+    <div class="card">
+      <h2>连接配置</h2>
+      <form id="connForm">
+        <label>服务器地址（WebSocket URL）</label>
+        <input type="url" id="cfURL" placeholder="wss://your-octop-server/mcp-localfs/ws">
+        <label>访问令牌</label>
+        <input type="password" id="cfToken" autocomplete="off" placeholder="token" title="令牌仅保存在本机配置文件中，不会出现在日志里">
+        <div class="chk"><input type="checkbox" id="cfWrite"><label for="cfWrite" style="margin:0">允许写入（默认关闭：只读访问）</label></div>
+        <div class="chk"><input type="checkbox" id="cfBrowser"><label for="cfBrowser" style="margin:0">启动时自动打开控制台页面</label></div>
+        <label>控制台端口（重启后生效）</label>
+        <input type="number" id="cfPort" min="1024" max="65535">
+        <div style="margin-top:16px; display:flex; gap:10px">
+          <button class="btn" type="submit" id="cfSave">保存并重连</button>
+          <button class="btn secondary" type="button" id="cfShowToken">显示令牌</button>
+        </div>
+        <div class="msg" id="cfMsg"></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- 关于页 -->
+  <section class="page" id="page-about">
+    <div class="card">
+      <h2>关于</h2>
+      <p><strong>Octop Local Bridge</strong> — 本地文件访问桥。运行在本机的出站客户端：
+      主动连接云端适配器，把云端 AI 的文件工具调用限制在白名单目录内，所有访问均记入本地审计日志。</p>
+      <table>
+        <tr><th>版本</th><td class="mono" id="abVersion">—</td></tr>
+        <tr><th>许可证</th><td>Apache-2.0</td></tr>
+        <tr><th>控制台地址</th><td class="mono" id="abConsole">—</td></tr>
+        <tr><th>配置文件</th><td class="mono" id="abConfig">—</td></tr>
+        <tr><th>审计日志</th><td class="mono" id="abAudit">—</td></tr>
+      </table>
+      <p class="muted" style="margin-top:14px">安全模型：路径白名单 + 穿越/符号链接逃逸防护 + Bearer 认证 + 全量审计（allow/deny/error）。
+      写工具默认禁用。控制台仅监听 127.0.0.1。</p>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const state = { dirs: [], token: "" };
+
+/* ---------- navigation ---------- */
+document.querySelectorAll("nav button").forEach(btn => {
+  btn.addEventListener("click", () => showPage(btn.dataset.page));
+});
+function showPage(name) {
+  document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+  $("page-" + name).classList.add("active");
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.page === name));
+}
+
+/* ---------- helpers ---------- */
+function flash(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+  setTimeout(() => { el.className = "msg"; }, ok ? 3500 : 8000);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+/* ---------- config load ---------- */
+async function loadAbout() {
+  try {
+    const a = await api("/api/about");
+    $("abVersion").textContent = a.version || "—";
+    $("abConsole").textContent = a.console_url || "—";
+    $("abConfig").textContent = a.config_path || "—";
+    $("abAudit").textContent = a.audit_path || "—";
+  } catch { /* about page stays on placeholders */ }
+}
+
+/* ---------- onboarding ---------- */
+$("onboardForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const cfg = await api("/api/config");
+  cfg.server_url = $("obURL").value.trim();
+  cfg.token = $("obToken").value;
+  if (state.dirs.length === 0 && $("obDir").value.trim()) state.dirs.push({ path: $("obDir").value.trim(), enabled: true });
+  cfg.allowed_dirs = state.dirs;
+  try {
+    await api("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    flash($("obMsg"), "已保存，正在连接…", true);
+    setTimeout(() => showPage("status"), 900);
+  } catch (err) { flash($("obMsg"), err.message, false); }
+});
+
+/* ---------- dirs page ---------- */
+function renderDirs() {
+  const ul = $("dirList");
+  ul.innerHTML = "";
+  if (state.dirs.length === 0) {
+    ul.innerHTML = '<li class="muted" style="list-style:none">（尚未配置任何目录）</li>';
+    return;
+  }
+  state.dirs.forEach((d, i) => {
+    const li = document.createElement("li");
+    const chk = document.createElement("input");
+    chk.type = "checkbox"; chk.checked = d.enabled;
+    chk.addEventListener("change", () => saveDirs());
+    const code = document.createElement("code"); code.textContent = d.path;
+    const del = document.createElement("button");
+    del.className = "btn danger"; del.textContent = "删除";
+    del.addEventListener("click", () => { state.dirs.splice(i, 1); saveDirs(); });
+    li.append(chk, code, del);
+    ul.appendChild(li);
+  });
+}
+async function saveDirs() {
+  const items = [...document.querySelectorAll("#dirList li")].map((li, i) => ({
+    path: state.dirs[i].path, enabled: li.querySelector("input").checked
+  }));
+  state.dirs = items;
+  const cfg = await api("/api/config");
+  cfg.allowed_dirs = items;
+  try {
+    await api("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    flash($("dirMsg"), "白名单已保存并应用（桥已用新白名单重连）", true);
+  } catch (err) { flash($("dirMsg"), err.message, false); }
+}
+$("addDirBtn").addEventListener("click", async () => {
+  const p = $("newDir").value.trim();
+  if (!p) return;
+  if (state.dirs.some(d => d.path.toLowerCase() === p.toLowerCase())) {
+    flash($("dirMsg"), "该目录已在白名单中", false); return;
+  }
+  state.dirs.push({ path: p, enabled: true });
+  $("newDir").value = "";
+  await saveDirs();
+  renderDirs();
+});
+
+/* ---------- connection page ---------- */
+$("cfShowToken").addEventListener("click", () => {
+  const t = $("cfToken");
+  t.type = t.type === "password" ? "text" : "password";
+});
+$("connForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  const cfg = await api("/api/config");
+  cfg.server_url = $("cfURL").value.trim();
+  cfg.token = $("cfToken").value;
+  cfg.allow_write = $("cfWrite").checked;
+  cfg.open_browser = $("cfBrowser").checked;
+  cfg.console_port = parseInt($("cfPort").value, 10) || 19880;
+  try {
+    await api("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    flash($("cfMsg"), "已保存并重连", true);
+  } catch (err) { flash($("cfMsg"), err.message, false); }
+});
+
+/* ---------- SSE: status + audit stream ---------- */
+let auditRows = 0;
+function fmtTime(ts) {
+  if (!ts) return "—";
+  try { return new Date(ts).toLocaleTimeString(); } catch { return ts; }
+}
+function renderStatus(s) {
+  const on = s.connected;
+  $("connDot").className = "dot " + (on ? "on" : "off");
+  $("connText").textContent = on ? "已连接" : "未连接";
+  $("stConn").textContent = on ? "已连接" : "未连接";
+  $("stConn").className = "v " + (on ? "ok" : "bad");
+  $("stReconn").textContent = s.reconnects;
+  $("stClient").textContent = s.client_id || "—";
+  $("stServer").textContent = s.server_url || "—";
+  $("stAudit").textContent = s.last_audit_ts ? fmtTime(s.last_audit_ts) : "—";
+  $("stErr").textContent = s.last_error ? ("最近错误：" + s.last_error) : "";
+}
+function appendAudit(ev) {
+  const tb = document.querySelector("#auditStream tbody");
+  const tr = document.createElement("tr");
+  const td = (txt, cls) => { const d = document.createElement("td"); if (cls) d.className = cls; d.textContent = txt; return d; };
+  const tag = document.createElement("span");
+  tag.className = "tag " + (ev.decision || "error");
+  const label = { allow: "允许", deny: "拒绝", error: "错误" }[ev.decision] || ev.decision;
+  tag.textContent = label;
+  const tdm = document.createElement("td"); tdm.appendChild(tag);
+  tr.append(td(fmtTime(ev.ts)), tdm, td(ev.method || ""), td(ev.path || ""));
+  tb.prepend(tr);
+  if (++auditRows > 200) { tb.lastElementChild.remove(); auditRows = 200; }
+}
+function connectSSE() {
+  const es = new EventSource("/api/events");
+  es.addEventListener("status", e => renderStatus(JSON.parse(e.data)));
+  es.addEventListener("audit", e => appendAudit(JSON.parse(e.data)));
+  es.addEventListener("ping", () => {});
+  es.onerror = () => { /* EventSource auto-reconnects */ };
+}
+
+/* ---------- boot ---------- */
+async function boot() {
+  try {
+    const [cfg, st] = await Promise.all([api("/api/config"), api("/api/status")]);
+    state.dirs = cfg.allowed_dirs || [];
+    state.token = cfg.token || "";
+    $("cfURL").value = cfg.server_url || "";
+    $("cfToken").value = cfg.token || "";
+    $("cfWrite").checked = !!cfg.allow_write;
+    $("cfBrowser").checked = !!cfg.open_browser;
+    $("cfPort").value = cfg.console_port || 19880;
+    renderDirs();
+    renderStatus(st);
+    if (!cfg.configured) showPage("onboard"); else showPage("status");
+  } catch (err) { console.error(err); }
+  loadAbout();
+  connectSSE();
+}
+boot();
+</script>
+</body>
+</html>
