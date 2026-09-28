@@ -1,4 +1,4 @@
-package localfsbridge
+package octobridge
 
 import (
 	"context"
@@ -314,7 +314,7 @@ func TestE2E_BadTokenRejected(t *testing.T) {
 }
 
 // TestHandleRequest_Direct exercises the transport-agnostic entry point used
-// by embedders (e.g. Wails IPC) without a socket.
+// by embedders that drive the bridge in-process without a socket.
 func TestHandleRequest_Direct(t *testing.T) {
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "f.txt"), []byte("data"), 0o644))

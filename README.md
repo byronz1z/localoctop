@@ -1,151 +1,164 @@
-# localfsbridge — 本地文件访问客户端桥（Go）
+# Octop Local Bridge
 
-员工本机运行的出站 WSS 客户端。它主动连接云端 `mcp-localfs` 适配器，把云端
-AI 助手（经 Octop「自定义 MCP 连接器」）发来的文件工具调用，落地成对**白名单目录**
-的只读访问，并记录本地审计日志。
+本地文件访问桥：运行在员工本机的**出站** WSS 客户端。它主动连接云端
+`mcp-localfs` 适配器，把云端 AI 助手（经 Octop「自定义 MCP 连接器」）发来的
+文件工具调用，落地成对**白名单目录**的受控访问，并把每一次访问记入本地审计日志。
 
-- 模块名：`github.com/byronz1z/localfsbridge`
-- **零第三方依赖**：内置最小 RFC 6455 WebSocket 实现，`go build ./...` 可完全离线编译
-- 自包含：不 import 任何主工程包，不引用本目录外的路径
+交付形态是**单个 EXE**：桥核心 + 内嵌本地 Web 控制台 + 系统托盘，同一进程，
+`go build` 即得，无 node 构建链。
 
-## 目录结构
+- 模块名：`github.com/byronz1z/octop-local-bridge`
+- 许可证：Apache-2.0
+- 版本：v0.1.0（预览期）
 
+## 是什么
+
+```text
+云端 AI 助手
+   |  工具调用（MCP）
+   v
+mcp-localfs 适配器（云端）
+   |  WebSocket（由本程序主动拨出，防火墙友好）
+   v
+Octop Local Bridge（本机，单 EXE）
+   |  仅限白名单目录
+   v
+你的文件
 ```
-localfsbridge/
-├── go.mod                 # module github.com/byronz1z/localfsbridge（无 require）
-├── config.go              # Config + 校验/默认值/白名单目录规范化
-├── errors.go              # 线上错误码（与 Python 侧 protocol/errors 对齐）
-├── protocol.go            # 线协议类型：Request/Response/RegisterFrame + 工具结果结构
-├── pathguard.go           # ★安全核心：白名单 / 路径规范化 / .. 拒绝 / 符号链接逃逸防护
-├── tools.go               # 4 个只读工具 + 2 个预留写工具（默认关）
-├── audit.go               # 本地审计日志（JSON lines，带轮转）
-├── logger.go              # 分级 Logger 接口 + stderr 实现
-├── ws.go                  # 内置最小 WebSocket（客户端拨号 + 服务端 Upgrade）
-├── client.go              # ★Bridge：出站连接、指数退避重连、请求分发
-├── *_test.go              # 单元测试（路径穿越、大小上限、写开关、WS、端到端）
-├── cmd/
-│   ├── bridge/            # 独立运行器（联调用 / Wails 一行接入示例）
-│   └── mockserver/        # mock 适配器：模拟云端 WS 端点 + /call 控制台
-└── scripts/
-    ├── integration.ps1    # Windows 联调脚本（build→test→mock→桥→断言）
-    └── integration.sh     # Linux/CI 等价脚本
-```
+
+本机不开任何入站服务端口（控制台只监听 `127.0.0.1`），桥**只向外拨号**；
+断线自动指数退避重连（1s→2s→…→60s 封顶）。
 
 ## 快速开始
 
-```bash
-# 编译（离线，无需联网下载依赖）
-go build ./...
+### 下载
 
-# 单元测试 + 竞态检测
-go test ./...
-go test -race ./...
+从 [GitHub Releases](../../releases) 下载 `octop-local-bridge-vX.Y.Z-windows-amd64.zip`
+（含 `sha256` 校验文件），解压得到 `octop-local-bridge-*.exe`。
 
-# 跑 vet
-go vet ./...
-```
+> EXE 只由 GitHub 官方 CI（tag `v*` 触发的 windows-latest workflow）构建发布；
+> 任何"本地编译的 EXE"都不是交付物。
 
-### 联调（mock 服务端）
+### 首次运行
 
-一个终端起 mock 适配器：
+双击运行（或命令行 `octop-local-bridge-*.exe`）：
 
-```bash
-go run ./cmd/mockserver -addr 127.0.0.1:18443 -token dev-token -v
-```
+1. 系统托盘出现桥图标；浏览器自动打开控制台 `http://127.0.0.1:19880`；
+2. 首次启动进入**引导页**：选择白名单目录 → 填写服务器地址（`wss://…/mcp-localfs/ws`）
+   与访问令牌 → 「保存并连接」；
+3. 状态页显示「已连接」，审计活动开始实时滚动。
 
-另一个终端起桥客户端，白名单指向任意目录：
+### 从源码构建（clone 即 build，无第三方构建链）
 
 ```bash
-go run ./cmd/bridge \
-  -server "ws://127.0.0.1:18443/mcp-localfs/ws" \
-  -token  dev-token \
-  -dir    "~/Documents/ZBSwork" \
-  -audit  "./audit.log" \
-  -v
+go build ./...          # 编译
+go vet ./...            # 静态检查
+go test ./...           # 单元测试
+
+# 产出单 EXE（与 CI 发布同参数）
+go build -ldflags "-s -w" -o dist/bridge.exe ./cmd/bridge
 ```
 
-用 mock 的 `/call` 控制台发工具调用：
+Go 1.22+（CI 使用 1.23）。前端是手写单页 HTML + 原生 JS，经 `go:embed`
+内嵌，**不需要** node/webpack 等任何前端构建工具。
+
+## 控制台（四页）
+
+| 页面 | 功能 |
+|---|---|
+| 状态 | 连接状态 / 重连次数 / 客户端 ID / 服务器 / 审计流实时追加（SSE） |
+| 目录白名单 | 增加 / 删除 / 启停白名单目录；保存即重建桥连接 |
+| 连接配置 | 服务器 URL / 令牌（mask 显示）/ 写开关 / 控制台端口；保存写配置文件并自动重连 |
+| 关于 | 版本 / 控制台地址 / 配置文件与审计日志路径 |
+
+控制台只绑定 `127.0.0.1`；令牌只保存在本机配置文件（0600），不进日志，
+输入框默认 mask。
+
+## 配置
+
+配置文件位置（JSON）：
+
+- Windows: `%AppData%\octop-local-bridge\config.json`
+- Linux: `$XDG_CONFIG_HOME/octop-local-bridge/config.json`
+- macOS: `$HOME/Library/Application Support/octop-local-bridge/config.json`
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `server_url` | — | 适配器 WebSocket URL，`wss://…/mcp-localfs/ws`（接受 `https://`，自动转 `wss://`） |
+| `token` | — | 适配器签发的用户令牌 |
+| `allowed_dirs` | — | 白名单目录列表，`[{path, enabled}]`；`enabled:false` 保留但不服务 |
+| `allow_write` | `false` | 是否开启预留写工具（`write_file`/`create_directory`） |
+| `console_port` | `19880` | 控制台首选端口；被占用时自动向上探测（最多 20 个） |
+| `open_browser` | `true` | 启动时自动打开控制台页面 |
+| `audit_log_path` | 数据目录下 `audit.jsonl` | 审计日志位置 |
+
+### `--headless` 无人值守模式
+
+不带控制台与托盘的纯桥模式，行为等价于早期 `cmd/bridge` CLI：
 
 ```bash
-curl -s -X POST http://127.0.0.1:18443/call \
-  -H 'Content-Type: application/json' \
-  -d '{"token":"dev-token","method":"list_directory","params":{"path":"."}}'
-
-# 路径穿越会被拒绝（错误码 4001）
-curl -s -X POST http://127.0.0.1:18443/call \
-  -H 'Content-Type: application/json' \
-  -d '{"token":"dev-token","method":"read_file","params":{"path":"../../etc/passwd"}}'
+octop-local-bridge.exe --headless \
+  -server "wss://octop.example.com/mcp-localfs/ws" \
+  -token  <token> \
+  -dir    "D:/projects/docs" \
+  -audit  "./audit.jsonl"
 ```
 
-一键端到端联调（构建 + 测试 + mock + 桥 + 安全断言 + 重连）：
+标志留空时自动回退读取配置文件；也支持环境变量
+`LOCALFS_SERVER_URL` / `LOCALFS_TOKEN` / `LOCALFS_DIRS` / `LOCALFS_ALLOW_WRITE` / `LOCALFS_AUDIT`。
+
+## 安全模型
+
+| 要求 | 实现 |
+|---|---|
+| 白名单目录 | 所有路径必须落在某个白名单根内（`pathguard.go`） |
+| 拒绝 `..` 穿越 | 词法 + 组件级双重校验 |
+| 符号链接逃逸 | `EvalSymlinks` 解析真实路径后二次校验 |
+| NUL/UNC/绝对盘符注入 | 显式拒绝 |
+| 单文件大小上限 | 读 20 MB / 写 10 MB（可配） |
+| 写工具默认关 | `allow_write=false` 时写类调用返回 4004 |
+| Bearer 认证 | 握手头 `Authorization: Bearer <token>` + register 帧 |
+| 全量审计 | JSONL：allow/deny/error 全记录，带轮转（默认 8 MB） |
+| 控制台隔离 | 仅 `127.0.0.1`；令牌不落日志 |
+
+错误码：`0` OK · `-32602` 参数错误 · `-32601` 方法未找到 · `-32000` 内部错误 ·
+`4001` 路径不允许 · `4002` 不存在 · `4003` 超限 · `4004` 写禁用 · `4005` 超时
+
+## 仓库结构
+
+```
+├── config.go / pathguard.go / tools.go / audit.go / ws.go / client.go …
+│                      # 桥核心（零第三方依赖的最小 RFC 6455 实现）
+├── cmd/bridge/        # 产品入口：桌面模式（控制台+托盘）与 --headless
+├── internal/appcfg/   # 用户配置文件读写（OS 配置目录，0600）
+├── internal/console/  # 内嵌单页控制台 + JSON API + SSE
+├── internal/tray/     # 系统托盘（fyne.io/systray，Windows 无 cgo）
+├── internal/testserver/  # 开发/联调用 mock 适配器（非交付物，勿部署）
+├── scripts/           # 端到端联调脚本（ps1 / sh）
+└── .github/workflows/ # push=build+test；tag v*=单 EXE zip+sha256 发布
+```
+
+### 联调（开发者）
 
 ```powershell
-# Windows
+# Windows 一键：构建 + 测试 + mock + 桥 + 安全断言 + 重连
 powershell -ExecutionPolicy Bypass -File scripts\integration.ps1
 ```
 
 ```bash
-# Linux / CI
-bash scripts/integration.sh
+bash scripts/integration.sh   # Linux/CI 等价
 ```
 
-## 在 ZBSwork（Wails）壳中接入
+`internal/testserver` 是模拟云端适配器的 mock（`go run ./internal/testserver
+-addr 127.0.0.1:18443 -token dev-token`），仅供本地联调与集成测试。
 
-任务书要求主工程「仅一处启动调用」。在壳的 `main.go` 启动流程里加入：
+## 致谢
 
-```go
-import "github.com/byronz1z/localfsbridge"
+本项目的控制台视觉风格（浅色、极简、卡片式、等宽字体代码块）与产品形态
+（本地 Server/边界注册/连接管理/活动流）参照了
+[cnPro/webcodex](https://github.com/cnPro/webcodex)（Apache-2.0）的公开设计；
+仅借鉴其风格，未复制其代码。
 
-// ctx 为应用生命周期 context（Wails 的 OnShutdown 可 cancel）
-cfg := localfsbridge.NewConfig()
-cfg.ServerURL = appSettings.LocalfsServerURL          // wss://<server>/mcp-localfs/ws
-cfg.Token     = appSettings.LocalfsToken              // 适配器为该用户签发的 token
-cfg.AllowedDirs = appSettings.LocalfsDirs             // 设置页可配，默认 ~/Documents/ZBSwork
-cfg.AllowWrite  = appSettings.LocalfsAllowWrite       // 默认 false
-cfg.AuditLogPath = filepath.Join(userDataDir, "localfs-audit.log")
-cfg.Logger = wailsLoggerAdapter{}                     // 可选：桥接到 Wails runtime logger
+## 许可证
 
-bridge, err := localfsbridge.New(cfg)
-if err != nil { /* 配置错误，提示用户 */ }
-go bridge.Run(ctx)   // ← 唯一的一行接入；阻塞直到 ctx 取消，自动重连
-```
-
-`Bridge` 是并发安全的；`Run` 在独立 goroutine 中维持连接并按指数退避重连
-（1s→2s→…→60s 封顶），重连后自动重新注册。进程退出时 cancel `ctx` 或调用
-`bridge.Shutdown()` 即可干净关闭。
-
-## 安全模型（三层中的客户端层）
-
-| 要求 | 实现 | 测试 |
-|---|---|---|
-| 白名单目录 | `Config.AllowedDirs`，所有路径必须落在某个根内 | `TestResolveAbsolute_RejectsOutside` |
-| 拒绝 `..` 穿越 | `pathGuard` 词法 + 组件级校验 | `TestResolveRelative_RejectsDotDot` |
-| 符号链接逃逸 | `EvalSymlinks` 解析真实路径后再次校验是否在根内 | `TestResolveSymlinkEscape` |
-| 单文件大小上限 | 读 20MB / 写 10MB（可配） | `TestReadFile_SizeCap` / `TestWriteEnabled_SizeCap` |
-| 本地审计日志 | JSON lines，allow/deny/error 全记录，带轮转 | `audit_test.go` |
-| 写工具默认关 | `AllowWrite=false` 时 `write_file`/`create_directory` 返回 4004 | `TestWriteDisabledByDefault` |
-| NUL/绝对/UNC 路径 | 显式拒绝 | `TestResolveRelative_RejectsNUL` 等 |
-
-所有文件访问都必须经过 `pathGuard`；工具层没有其它触达文件系统的路径。
-
-## 配置项（`Config`）
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `ServerURL` | — | `wss://.../mcp-localfs/ws`，接受 `https://`（自动转 `wss://`） |
-| `Token` | — | 适配器签发的用户 token |
-| `AllowedDirs` | — | 白名单根目录列表，支持 `~` 与相对路径（解析为绝对） |
-| `AllowWrite` | `false` | 是否开启预留写工具 |
-| `MaxReadBytes` | 20MB | 单文件读上限 |
-| `MaxWriteBytes` | 10MB | 单次写上限 |
-| `AuditLogPath` | 空 | 审计日志路径（空=仅回调，不落盘） |
-| `RequestWait` | 30s | 单次工具调用超时 |
-| `MinBackoff`/`MaxBackoff` | 1s / 60s | 指数退避区间 |
-| `PingInterval`/`PongWait` | 25s / 60s | 保活心跳 |
-| `Logger` | stderr | 分级日志接口 |
-| `OnStatus`/`OnAudit` | nil | 连接状态 / 审计事件回调（供 UI 展示） |
-
-## 错误码（与 Python 侧对齐）
-
-`0` OK · `-32602` 参数错误 · `-32601` 方法未找到 · `-32000` 内部错误 ·
-`4001` 路径不允许 · `4002` 不存在 · `4003` 超限 · `4004` 写禁用 · `4005` 超时
+[Apache License 2.0](LICENSE) · 漏洞报告见 [SECURITY.md](SECURITY.md)

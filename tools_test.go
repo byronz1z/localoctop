@@ -1,4 +1,4 @@
-package localfsbridge
+package octobridge
 
 import (
 	"encoding/base64"

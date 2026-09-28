@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # integration.sh — POSIX counterpart of scripts/integration.ps1 for CI/Linux.
 # Starts the mock adapter + bridge, fires tool calls, asserts security denials,
-# audit logging, and reconnection. Run from the localfsbridge directory:
+# audit logging, and reconnection. Run from the octop-local-bridge directory:
 #
 #   bash scripts/integration.sh
 set -euo pipefail
@@ -31,19 +31,19 @@ post_call() {
 }
 
 echo "== build =="
-go build -o "${BIN}/mockserver" ./cmd/mockserver
+go build -o "${BIN}/testserver" ./internal/testserver
 go build -o "${BIN}/bridge" ./cmd/bridge
 check "go build" 0
 
 echo "== start mock adapter =="
-"${BIN}/mockserver" -addr "127.0.0.1:${PORT}" -token it-token >"${TMP}/mock.log" 2>&1 &
+"${BIN}/testserver" -addr "127.0.0.1:${PORT}" -token it-token >"${TMP}/mock.log" 2>&1 &
 MOCK_PID=$!
 for _ in $(seq 1 40); do curl -sS -m 1 "${BASE}/sessions" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -sS -m 2 "${BASE}/sessions" >/dev/null; check "mock adapter up" 0
 
 echo "== start bridge client =="
 AUDIT="${TMP}/audit.log"
-"${BIN}/bridge" -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >"${TMP}/bridge.log" 2>&1 &
+"${BIN}/bridge" --headless -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >"${TMP}/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 for _ in $(seq 1 40); do
   n=$(curl -sS -m 2 "${BASE}/sessions" | grep -o '"client_id"' | wc -l)
@@ -87,7 +87,7 @@ echo "== reconnect =="
 kill "${BRIDGE_PID}"; sleep 1
 n=$(curl -sS -m 2 "${BASE}/sessions" | grep -o '"client_id"' | wc -l)
 [ "${n:-0}" -eq 0 ]; check "session dropped after kill" $?
-"${BIN}/bridge" -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >>"${TMP}/bridge.log" 2>&1 &
+"${BIN}/bridge" --headless -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >>"${TMP}/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 for _ in $(seq 1 40); do
   n=$(curl -sS -m 2 "${BASE}/sessions" | grep -o '"client_id"' | wc -l)

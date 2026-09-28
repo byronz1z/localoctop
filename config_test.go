@@ -1,4 +1,4 @@
-package localfsbridge
+package octobridge
 
 import (
 	"strings"

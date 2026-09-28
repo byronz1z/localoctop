@@ -1,4 +1,4 @@
-package localfsbridge
+package octobridge
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 )
 
 // Logger is the minimal logging surface the bridge needs. Plug in any
-// structured logger (slog, zap, Wails runtime logger) by adapting to it.
+// structured logger (slog, zap, or an app logger) by adapting to it.
 type Logger interface {
 	Debugf(format string, args ...any)
 	Infof(format string, args ...any)
@@ -25,7 +25,7 @@ type StderrLogger struct {
 // Debugf lines.
 func NewStderrLogger(debug bool) *StderrLogger {
 	return &StderrLogger{
-		l:     log.New(os.Stderr, "[localfsbridge] ", log.LstdFlags),
+		l:     log.New(os.Stderr, "[octobridge] ", log.LstdFlags),
 		debug: debug,
 	}
 }

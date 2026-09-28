@@ -1,4 +1,4 @@
-// Command mockserver is the local integration partner for the localfsbridge
+// Command testserver is the local integration partner for the octobridge (development-only)
 // client. It emulates the mcp-localfs adapter's WebSocket side:
 //
 //   - Accepts outbound client connections on /mcp-localfs/ws?token=...
@@ -11,7 +11,7 @@
 //
 // Usage:
 //
-//	go run ./cmd/mockserver -addr 127.0.0.1:18443 -token dev-token
+//	go run ./internal/testserver -addr 127.0.0.1:18443 -token dev-token
 //
 // Then start the bridge against ws://127.0.0.1:18443/mcp-localfs/ws?token=dev-token
 // and exercise it:
@@ -35,14 +35,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/byronz1z/localfsbridge"
+	"github.com/byronz1z/octop-local-bridge"
 )
 
 // session is one connected bridge client.
 type session struct {
 	token     string
 	clientID  string
-	conn      *localfsbridge.WSConn
+	conn      *octobridge.WSConn
 	connected time.Time
 
 	mu      sync.Mutex
@@ -64,7 +64,7 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose logging")
 	flag.Parse()
 
-	logger := log.New(os.Stderr, "[mockserver] ", log.LstdFlags)
+	logger := log.New(os.Stderr, "[testserver] ", log.LstdFlags)
 	s := &server{
 		log:    logger,
 		sess:   map[string]*session{},
@@ -116,7 +116,7 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := localfsbridge.UpgradeWS(w, r, 24<<20)
+	conn, err := octobridge.UpgradeWS(w, r, 24<<20)
 	if err != nil {
 		s.log.Printf("ws upgrade failed: %v", err)
 		return
@@ -274,7 +274,7 @@ func (s *server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, `localfsbridge mock adapter
+	fmt.Fprint(w, `octobridge mock adapter
 --------------------------
 GET  /sessions   list connected bridge sessions
 POST /call       {"token","method","params"} -> proxy a tool call to the bridge

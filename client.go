@@ -1,4 +1,4 @@
-package localfsbridge
+package octobridge
 
 import (
 	"context"
@@ -17,13 +17,12 @@ import (
 // cancelled. On any disconnect it reconnects with exponential backoff
 // (1s → 2s → … → 60s cap) and re-registers automatically.
 //
-// Typical embedding (e.g. from the Wails shell's main.go — the single
-// "one-line integration" the task spec allows):
+// Typical embedding (this is exactly what cmd/bridge/main.go does):
 //
-//	bridge := localfsbridge.New(localfsbridge.Config{
+//	bridge := octobridge.New(octobridge.Config{
 //	    ServerURL:   "wss://octop.example.com/mcp-localfs/ws",
 //	    Token:       userToken,
-//	    AllowedDirs: []string{"~/Documents/ZBSwork"},
+//	    AllowedDirs: []string{"~/Documents/Octop"},
 //	})
 //	go bridge.Run(ctx)
 type Bridge struct {
@@ -58,7 +57,7 @@ func New(cfg Config) (*Bridge, error) {
 	}
 	clientID, err := newClientID()
 	if err != nil {
-		return nil, fmt.Errorf("localfsbridge: generate client id: %w", err)
+		return nil, fmt.Errorf("octobridge: generate client id: %w", err)
 	}
 	guard := newPathGuard(cfg.AllowedDirs, cfg.Logger)
 	audit, err := NewAuditLogger(cfg.AuditLogPath, cfg.AuditMaxBytes, cfg.Logger, cfg.OnAudit)
@@ -166,7 +165,7 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 	start := time.Now()
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+b.cfg.Token)
-	headers.Set("User-Agent", "localfsbridge/"+Version)
+	headers.Set("User-Agent", "octobridge/"+Version)
 	conn, err := dialWS(dialCtx, b.cfg.ServerURL, headers, b.cfg.DialTimeout, nil, b.cfg.MaxMsgBytes)
 	if err != nil {
 		return err
@@ -385,12 +384,12 @@ func (b *Bridge) Shutdown() {
 }
 
 // HandleRequest is exported for tests and for embedders that want to drive the
-// bridge over a transport other than WebSocket (e.g. Wails IPC). It executes
-// one request and returns the serializable response.
+// bridge over a transport other than WebSocket (e.g. in-process IPC). It
+// executes one request and returns the serializable response.
 func (b *Bridge) HandleRequest(ctx context.Context, raw []byte) ([]byte, error) {
 	var req Request
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, fmt.Errorf("localfsbridge: malformed request: %w", err)
+		return nil, fmt.Errorf("octobridge: malformed request: %w", err)
 	}
 	start := time.Now()
 	result, berr := b.dispatch(ctx, req.Method, req.Params)

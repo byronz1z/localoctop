@@ -1,4 +1,4 @@
-package localfsbridge
+package octobridge
 
 import "encoding/json"
 
@@ -47,8 +47,9 @@ const (
 	MethodCreateDir     = "create_directory"
 )
 
-// Version is the bridge package version, reported in register frames.
-const Version = "1.0.0"
+// Version is the product version, reported in register frames and shown on
+// the console's about page. Preview releases start at v0.1.0.
+const Version = "0.1.0"
 
 // ---- Tool result shapes (mirrored by the adapter's MCP content blocks) ----
 

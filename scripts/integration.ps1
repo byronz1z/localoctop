@@ -1,9 +1,9 @@
-# integration.ps1 — localfsbridge <-> mock adapter end-to-end smoke test.
+# integration.ps1 — octop-local-bridge <-> mock adapter end-to-end smoke test.
 #
 # What it does:
 #   1. go build ./... && go vet ./...
 #   2. go test ./...
-#   3. starts cmd/mockserver on 127.0.0.1:18443
+#   3. starts internal/testserver on 127.0.0.1:18443
 #   4. starts cmd/bridge against it with a temp whitelist dir
 #   5. fires tool calls through POST /call and asserts:
 #        - list_directory / read_file / get_file_info / search_files succeed
@@ -13,7 +13,7 @@
 #        - audit log records allow+deny decisions
 #   6. kills the server, reconnects a bridge, verifies re-registration
 #
-# Run from the localfsbridge directory:
+# Run from the octop-local-bridge directory:
 #   powershell -ExecutionPolicy Bypass -File scripts\integration.ps1
 
 $ErrorActionPreference = "Stop"
@@ -43,14 +43,14 @@ function PostCall([string]$body) {
 $mock = $null; $bridge = $null
 try {
     Write-Host "== build =="
-    go build -o (Join-Path $bin "mockserver.exe") ./cmd/mockserver
-    if ($LASTEXITCODE -ne 0) { throw "go build mockserver failed" }
+    go build -o (Join-Path $bin "testserver.exe") ./internal/testserver
+    if ($LASTEXITCODE -ne 0) { throw "go build testserver failed" }
     go build -o (Join-Path $bin "bridge.exe") ./cmd/bridge
     if ($LASTEXITCODE -ne 0) { throw "go build bridge failed" }
     Check "go build" $true
 
     Write-Host "== start mock adapter =="
-    $mock = Start-Process -FilePath (Join-Path $bin "mockserver.exe") `
+    $mock = Start-Process -FilePath (Join-Path $bin "testserver.exe") `
         -ArgumentList "-addr", "127.0.0.1:$port", "-token", "it-token" `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "mock.log")
     $deadline = (Get-Date).AddSeconds(10)
@@ -63,7 +63,7 @@ try {
     Write-Host "== start bridge client =="
     $auditLog = Join-Path $tmp "audit.log"
     $bridge = Start-Process -FilePath (Join-Path $bin "bridge.exe") `
-        -ArgumentList "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
+        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge.log")
     $deadline = (Get-Date).AddSeconds(10)
     $registered = $false
@@ -112,7 +112,7 @@ try {
     $s = (Invoke-WebRequest -Uri "$base/sessions" -UseBasicParsing -TimeoutSec 2).Content | ConvertFrom-Json
     Check "session dropped after kill" ($s.sessions.Count -eq 0)
     $bridge = Start-Process -FilePath (Join-Path $bin "bridge.exe") `
-        -ArgumentList "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
+        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge2.log")
     $deadline = (Get-Date).AddSeconds(10)
     $reback = $false
@@ -127,7 +127,7 @@ try {
 
     Write-Host "== bad token =="
     $bad = Start-Process -FilePath (Join-Path $bin "bridge.exe") `
-        -ArgumentList "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "wrong", "-dir", $tmp `
+        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "wrong", "-dir", $tmp `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge-bad.log")
     Start-Sleep -Seconds 2
     Check "bad-token bridge not connected" (-not $bad.HasExited)  # keeps retrying, never registers
