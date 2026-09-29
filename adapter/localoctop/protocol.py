@@ -27,7 +27,7 @@ from .errors import (
 # Protocol identity reported during the MCP handshake.
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "localoctop"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 # Bridge method names — kept identical to localoctop/protocol.go.
 M_LIST_DIRECTORY = "list_directory"

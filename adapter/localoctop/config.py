@@ -72,6 +72,13 @@ class Settings:
     # --- server ---
     host: str = "0.0.0.0"  # noqa: S104 — container bind, fronted by a proxy
     port: int = 8080
+    # Optional second listener: TLS-terminated public port for employee
+    # bridges dialing in over wss:// (no reverse proxy required). When
+    # ssl_port is 0 / cert / key unset, only the plain listener runs and
+    # behaviour is identical to pre-1.1 deployments.
+    ssl_port: int = 0
+    ssl_certfile: str = ""
+    ssl_keyfile: str = ""
     # Public base path prefix, kept configurable for reverse-proxy mounting.
     mcp_path: str = "/mcp/localoctop/"
     ws_path: str = "/mcp/localoctop/ws"
@@ -153,6 +160,9 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
         log_level=e.get("LOCALOCTOP_LOG_LEVEL", "INFO"),
         host=e.get("LOCALOCTOP_HOST", "0.0.0.0"),
         port=_int(e.get("LOCALOCTOP_PORT"), 8080),
+        ssl_port=_int(e.get("LOCALOCTOP_SSL_PORT"), 0),
+        ssl_certfile=e.get("LOCALOCTOP_SSL_CERTFILE", ""),
+        ssl_keyfile=e.get("LOCALOCTOP_SSL_KEYFILE", ""),
         mcp_path=e.get("LOCALOCTOP_MCP_PATH", "/mcp/localoctop/"),
         ws_path=e.get("LOCALOCTOP_WS_PATH", "/mcp/localoctop/ws"),
     )
