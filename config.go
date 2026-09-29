@@ -173,6 +173,15 @@ func (c *Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("config: cannot resolve allowed dir %q: %w", raw, err)
 		}
+		// Normalize roots to their fully-resolved form. Handlers receive
+		// symlink-resolved paths from the guard (ensureInside); if the root
+		// kept its junction form, relDisplay and samePath comparisons would
+		// mismatch (e.g. Windows runner TEMP is a junction, employee dirs
+		// may live behind mount points). Best-effort: non-existent roots
+		// keep their lexical form until they appear.
+		if real, rerr := evalSymlinksBestEffort(abs); rerr == nil {
+			abs = real
+		}
 		if _, dup := seen[abs]; dup {
 			continue
 		}
