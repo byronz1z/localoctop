@@ -36,8 +36,8 @@ func TestConfigValidate_NormalizesHTTPScheme(t *testing.T) {
 	cases := map[string]string{
 		"https://h/ws": "wss://h/ws",
 		"http://h/ws":  "ws://h/ws",
-		"ws://h/ws":   "ws://h/ws",
-		"wss://h/ws":  "wss://h/ws",
+		"ws://h/ws":    "ws://h/ws",
+		"wss://h/ws":   "wss://h/ws",
 	}
 	for in, want := range cases {
 		got, err := normalizeWSScheme(in)
@@ -72,6 +72,12 @@ func TestConfigValidate_RejectsBadScheme(t *testing.T) {
 
 func TestConfigValidate_AbsolutizesAndDedupesRoots(t *testing.T) {
 	dir := t.TempDir()
+	// Validate now canonicalizes roots to their symlink-resolved form (the
+	// guard returns resolved paths, and relDisplay/samePath must agree).
+	want, werr := evalSymlinksBestEffort(dir)
+	if werr != nil {
+		want = dir
+	}
 	c := NewConfig()
 	c.ServerURL = "wss://example.com/ws"
 	c.Token = "t"
@@ -82,8 +88,8 @@ func TestConfigValidate_AbsolutizesAndDedupesRoots(t *testing.T) {
 	if len(c.AllowedDirs) != 1 {
 		t.Fatalf("expected dedupe to 1 root, got %v", c.AllowedDirs)
 	}
-	if c.AllowedDirs[0] != dir {
-		t.Fatalf("expected absolute root %s, got %s", dir, c.AllowedDirs[0])
+	if c.AllowedDirs[0] != want {
+		t.Fatalf("expected canonical root %s, got %s", want, c.AllowedDirs[0])
 	}
 }
 
