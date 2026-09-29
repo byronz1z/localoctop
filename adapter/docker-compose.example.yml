@@ -1,0 +1,42 @@
+# Append this service to the existing Octop docker-compose stack.
+# mcp-localfs runs as its own container — it never enters the octop image.
+services:
+  mcp-localfs:
+    build: .
+    image: mcp-localfs:1.0.0
+    restart: unless-stopped
+    environment:
+      # MCP tokens (Octop connector Bearer) — "userA:tokA,userB:tokB".
+      LOCALFS_TOKENS: ${LOCALFS_TOKENS:-}
+      # Bridge tokens (client WSS dial-in) — "userA:btokA". When unset,
+      # LOCALFS_TOKENS seeds both directions (single-token back-compat).
+      LOCALFS_BRIDGE_TOKENS: ${LOCALFS_BRIDGE_TOKENS:-}
+      # Mint tokens at runtime instead: POST /admin/tokens/issue with
+      # {"user_id": "...", "kind": "mcp"|"bridge"} (loopback or LOCALFS_ADMIN_TOKEN).
+      # Staged rollout: read-only for everyone first; enable per-user later.
+      LOCALFS_ALLOW_WRITE: "false"
+      LOCALFS_WRITE_ALLOWLIST: ${LOCALFS_WRITE_ALLOWLIST:-}
+      # Admin kill-switch (product layer): set "true" to disable all calls.
+      LOCALFS_DISABLED: "false"
+      LOCALFS_AUDIT_LOG: /app/logs/calls.jsonl
+      LOCALFS_LOG_LEVEL: INFO
+    volumes:
+      - mcp-localfs-audit:/app/logs
+    networks:
+      - octop-net
+    # Bind to loopback only when a reverse proxy (Caddy/Nginx/Traefik) fronts
+    # the container and terminates TLS for wss:// and https://.
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+
+volumes:
+  mcp-localfs-audit:
+
+networks:
+  octop-net:
+    external: true

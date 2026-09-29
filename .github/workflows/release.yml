@@ -1,8 +1,15 @@
 name: Release
 
-# Tag pushes (v*) build the single EXE on GitHub's official CI, package it
-# with a sha256 checksum, and publish a GitHub Release. Local builds are
-# self-test evidence only — they are never a deliverable.
+# Tag pushes (v*) build the single EXE on GitHub's official CI and publish a
+# GitHub Release with two assets:
+#
+#   1. octop-local-bridge-<tag>-windows-amd64.zip
+#        bridge.exe + examples/ (Octop connector template + 3-step guide)
+#        — the out-of-the-box desktop package.
+#   2. mcp-localfs-adapter-<tag>.zip
+#        the adapter/ source tree — server-side deployment bundle.
+#
+# Local builds are self-test evidence only — they are never a deliverable.
 
 on:
   push:
@@ -33,15 +40,33 @@ jobs:
       - name: Compile single EXE
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          go build -ldflags "-s -w" -o dist/octop-local-bridge-${{ github.ref_name }}-windows-amd64.exe ./cmd/bridge
+          go build -ldflags "-s -w" -o dist/bridge.exe ./cmd/bridge
 
-      - name: Zip + sha256
+      - name: Package main zip (bridge.exe + examples)
         run: |
           $tag = "${{ github.ref_name }}"
-          $zip = "dist/octop-local-bridge-$tag-windows-amd64.zip"
-          Compress-Archive -Path "dist/octop-local-bridge-$tag-windows-amd64.exe" -DestinationPath $zip
-          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$zip.sha256" -Value "$h  octop-local-bridge-$tag-windows-amd64.zip" -NoNewline
+          New-Item -ItemType Directory -Force dist/pkg/examples | Out-Null
+          Copy-Item dist/bridge.exe dist/pkg/bridge.exe
+          Copy-Item examples/* dist/pkg/examples/ -Recurse
+          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/octop-local-bridge-$tag-windows-amd64.zip"
+
+      - name: Package adapter zip
+        run: |
+          $tag = "${{ github.ref_name }}"
+          # adapter/ is self-contained; stage it without local runtime
+          # artifacts (defensive: a clean CI checkout has none of these).
+          New-Item -ItemType Directory -Force dist/adapter-pkg | Out-Null
+          robocopy adapter dist/adapter-pkg /E /XD .venv __pycache__ .pytest_cache logs /NFL /NDL /NJH /NJS | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $LASTEXITCODE" }
+          Compress-Archive -Path dist/adapter-pkg/* -DestinationPath "dist/mcp-localfs-adapter-$tag.zip"
+
+      - name: sha256 checksums
+        run: |
+          $tag = "${{ github.ref_name }}"
+          foreach ($zip in @("octop-local-bridge-$tag-windows-amd64.zip", "mcp-localfs-adapter-$tag.zip")) {
+            $h = (Get-FileHash "dist/$zip" -Algorithm SHA256).Hash.ToLower()
+            Set-Content -Path "dist/$zip.sha256" -Value "$h  $zip" -NoNewline
+          }
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

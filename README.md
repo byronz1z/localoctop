@@ -14,11 +14,15 @@
 ## 是什么
 
 ```text
-云端 AI 助手
-   |  工具调用（MCP）
+云端 AI 助手（Octop 会话）
+   |  工具调用（MCP：streamable_http + Bearer）
    v
-mcp-localfs 适配器（云端）
+Octop「自定义 MCP 连接器」
+   |  https://<server>/mcp/localfs/
+   v
+mcp-localfs 适配器（云端容器，本仓 adapter/）
    |  WebSocket（由本程序主动拨出，防火墙友好）
+   |  wss://<server>/mcp-localfs/ws + bridge_token
    v
 Octop Local Bridge（本机，单 EXE）
    |  仅限白名单目录
@@ -28,6 +32,23 @@ Octop Local Bridge（本机，单 EXE）
 
 本机不开任何入站服务端口（控制台只监听 `127.0.0.1`），桥**只向外拨号**；
 断线自动指数退避重连（1s→2s→…→60s 封顶）。
+
+## 接入 Octop（三步，开箱即用）
+
+发布包自带 `examples/`（连接器模板 + 图文指南），详见
+[`examples/README.md`](examples/README.md)：
+
+1. **跑适配器容器**：服务器上用本仓 `adapter/`（克隆即得，或下载 Release 资产
+   `mcp-localfs-adapter-*.zip`）`docker build` 后运行，反代出
+   `https://…/mcp/localfs/` 与 `wss://…/mcp-localfs/ws`；
+2. **桥 EXE 引导页填地址**：白名单目录 + `wss://…/mcp-localfs/ws` +
+   **bridge_token** → 保存并连接；
+3. **Octop 后台贴连接器配置**：把 `examples/octop-mcp-connector.example.json`
+   贴入「连接器 → 自定义 MCP」（URL + **mcp_token** Bearer）→ 测试，
+   列出 4 个只读工具即通。
+
+> 两个令牌别混用：桥拨入用 **bridge_token**，Octop 连接器用 **mcp_token**，
+> 由适配器分别签发（`POST /admin/tokens/issue`）。
 
 ## 快速开始
 
@@ -134,8 +155,10 @@ octop-local-bridge.exe --headless \
 ├── internal/console/  # 内嵌单页控制台 + JSON API + SSE
 ├── internal/tray/     # 系统托盘（fyne.io/systray，Windows 无 cgo）
 ├── internal/testserver/  # 开发/联调用 mock 适配器（非交付物，勿部署）
-├── scripts/           # 端到端联调脚本（ps1 / sh）
-└── .github/workflows/ # push=build+test；tag v*=单 EXE zip+sha256 发布
+├── adapter/           # mcp-localfs 云端适配器（Python，自包含，见其 README）
+├── examples/          # Octop 连接器模板 + 三步接入指南（随发布包分发）
+├── scripts/           # 端到端联调脚本（ps1 / sh）+ verify_e2e.ps1 三段验收
+└── .github/workflows/ # push=build+test；tag v*=EXE zip+适配器 zip+sha256 发布
 ```
 
 ### 联调（开发者）
@@ -151,6 +174,13 @@ bash scripts/integration.sh   # Linux/CI 等价
 
 `internal/testserver` 是模拟云端适配器的 mock（`go run ./internal/testserver
 -addr 127.0.0.1:18443 -token dev-token`），仅供本地联调与集成测试。
+
+对**真实**适配器（`adapter/`）的三段端到端验收（起适配器 → 起桥 →
+MCP 探测 + 双侧审计校验）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify_e2e.ps1
+```
 
 ## 致谢
 

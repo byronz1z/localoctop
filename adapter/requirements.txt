@@ -1,0 +1,11 @@
+# Runtime dependencies for the mcp-localfs adapter container.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+# Official MCP SDK: serves the /mcp/localfs/ streamable-HTTP endpoint.
+mcp==2.2.0
+
+# Test dependencies (also listed in requirements-dev.txt; kept here so the
+# task-spec flow `pip install -r requirements.txt && pytest` works directly).
+pytest>=8.0
+pytest-asyncio>=0.23
+httpx>=0.27

@@ -8,6 +8,12 @@ dist/
 audit.log
 audit.jsonl
 
+# Adapter (Python) local artifacts — never part of the source tree
+adapter/.venv/
+adapter/logs/
+**/__pycache__/
+**/.pytest_cache/
+
 # Editor/OS noise
 .DS_Store
 Thumbs.db
