@@ -8,9 +8,9 @@ import os
 
 import pytest
 
-from mcp_localfs.audit import AuditLog
-from mcp_localfs.errors import BridgeProtocolError, CODE_INVALID_PARAMS, CODE_METHOD_NOT_FOUND, CODE_PARSE_ERROR
-from mcp_localfs.protocol import (
+from localoctop.audit import AuditLog
+from localoctop.errors import BridgeProtocolError, CODE_INVALID_PARAMS, CODE_METHOD_NOT_FOUND, CODE_PARSE_ERROR
+from localoctop.protocol import (
     READ_ONLY_TOOLS,
     parse_request,
     tools_list,

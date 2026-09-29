@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_localfs.config import Settings, load_settings
-from mcp_localfs.errors import BridgeProtocolError, CODE_AUTH_FAILED
-from mcp_localfs.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
+from localoctop.config import Settings, load_settings
+from localoctop.errors import BridgeProtocolError, CODE_AUTH_FAILED
+from localoctop.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
 
 
 def _store() -> TokenStore:
@@ -20,14 +20,14 @@ def _store() -> TokenStore:
 
 def test_load_settings_parses_tokens_and_switches():
     env = {
-        "LOCALFS_TOKENS": "alice:tok-a, bob:tok-b ,brokenpair, :empty",
-        "LOCALFS_BRIDGE_TOKENS": "alice:btok-a, bob:btok-b",
-        "LOCALFS_ALLOW_WRITE": "true",
-        "LOCALFS_WRITE_ALLOWLIST": "alice,carol",
-        "LOCALFS_MAX_READ_BYTES": "1048576",
-        "LOCALFS_BRIDGE_TIMEOUT": "12.5",
-        "LOCALFS_PORT": "9999",
-        "LOCALFS_LOG_LEVEL": "debug",
+        "LOCALOCTOP_MCP_TOKENS": "alice:tok-a, bob:tok-b ,brokenpair, :empty",
+        "LOCALOCTOP_CLIENT_TOKENS": "alice:btok-a, bob:btok-b",
+        "LOCALOCTOP_ALLOW_WRITE": "true",
+        "LOCALOCTOP_WRITE_ALLOWLIST": "alice,carol",
+        "LOCALOCTOP_MAX_READ_BYTES": "1048576",
+        "LOCALOCTOP_BRIDGE_TIMEOUT": "12.5",
+        "LOCALOCTOP_PORT": "9999",
+        "LOCALOCTOP_LOG_LEVEL": "debug",
     }
     s = load_settings(env)
     assert s.static_tokens == {"alice": "tok-a", "bob": "tok-b"}
@@ -50,20 +50,20 @@ def test_load_settings_defaults_are_safe():
     assert s.max_write_bytes == 10 * 1024 * 1024
     # 任务书 v1.1 §七 timeout budget: bridge round-trip ≤18s.
     assert s.bridge_timeout == 18.0
-    assert s.mcp_path == "/mcp/localfs/"
-    assert s.ws_path == "/mcp-localfs/ws"
+    assert s.mcp_path == "/mcp/localoctop/"
+    assert s.ws_path == "/mcp/localoctop/ws"
 
 
 def test_load_settings_bad_numbers_fall_back():
-    s = load_settings({"LOCALFS_MAX_READ_BYTES": "abc", "LOCALFS_PORT": "xyz"})
+    s = load_settings({"LOCALOCTOP_MAX_READ_BYTES": "abc", "LOCALOCTOP_PORT": "xyz"})
     assert s.max_read_bytes == 20 * 1024 * 1024
     assert s.port == 8080
 
 
 def test_load_settings_back_compat_single_token_seeds_both():
-    """A deployment that only set LOCALFS_TOKENS keeps working on both
+    """A deployment that only set LOCALOCTOP_MCP_TOKENS keeps working on both
     directions until it rotates to the split scheme."""
-    s = load_settings({"LOCALFS_TOKENS": "alice:tok-a"})
+    s = load_settings({"LOCALOCTOP_MCP_TOKENS": "alice:tok-a"})
     assert s.authenticate_mcp("tok-a") == "alice"
     assert s.authenticate_bridge("tok-a") == "alice"
 

@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// mockAdapter is a minimal in-process stand-in for the octop-local-bridge adapter's
+// mockAdapter is a minimal in-process stand-in for the localoctop adapter's
 // WS endpoint: it accepts a token, reads the register frame, and lets the
 // test push tool calls and read responses.
 type mockAdapter struct {
@@ -35,7 +35,7 @@ func newMockAdapter(t *testing.T, token string) *mockAdapter {
 		conns:    make(chan *WSConn, 8),
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp-localfs/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/mcp/localoctop/ws", func(w http.ResponseWriter, r *http.Request) {
 		// The bridge sends its token as Authorization: Bearer (see
 		// Bridge.runOnce), so the mock must validate the same header the
 		// real adapter does — checking the query string instead let a
@@ -78,7 +78,7 @@ func newMockAdapter(t *testing.T, token string) *mockAdapter {
 }
 
 func (m *mockAdapter) wsURL() string {
-	return "ws" + strings.TrimPrefix(m.srv.URL, "http") + "/mcp-localfs/ws?token=" + m.token
+	return "ws" + strings.TrimPrefix(m.srv.URL, "http") + "/mcp/localoctop/ws?token=" + m.token
 }
 
 // call pushes a tool call to the connected bridge and waits for the response.

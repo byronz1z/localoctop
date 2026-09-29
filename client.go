@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 import (
 	"context"
@@ -12,15 +12,15 @@ import (
 	"time"
 )
 
-// Bridge is the outbound WSS client. It dials the octop-local-bridge adapter,
+// Bridge is the outbound WSS client. It dials the localoctop adapter,
 // registers under its token, and serves tool calls until the context is
 // cancelled. On any disconnect it reconnects with exponential backoff
 // (1s → 2s → … → 60s cap) and re-registers automatically.
 //
 // Typical embedding (this is exactly what cmd/bridge/main.go does):
 //
-//	bridge := octobridge.New(octobridge.Config{
-//	    ServerURL:   "wss://octop.example.com/mcp-localfs/ws",
+//	bridge := localoctop.New(localoctop.Config{
+//	    ServerURL:   "wss://octop.example.com/mcp/localoctop/ws",
 //	    Token:       userToken,
 //	    AllowedDirs: []string{"~/Documents/Octop"},
 //	})
@@ -57,7 +57,7 @@ func New(cfg Config) (*Bridge, error) {
 	}
 	clientID, err := newClientID()
 	if err != nil {
-		return nil, fmt.Errorf("octobridge: generate client id: %w", err)
+		return nil, fmt.Errorf("localoctop: generate client id: %w", err)
 	}
 	guard := newPathGuard(cfg.AllowedDirs, cfg.Logger)
 	audit, err := NewAuditLogger(cfg.AuditLogPath, cfg.AuditMaxBytes, cfg.Logger, cfg.OnAudit)
@@ -165,7 +165,7 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 	start := time.Now()
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+b.cfg.Token)
-	headers.Set("User-Agent", "octobridge/"+Version)
+	headers.Set("User-Agent", "localoctop/"+Version)
 	conn, err := dialWS(dialCtx, b.cfg.ServerURL, headers, b.cfg.DialTimeout, nil, b.cfg.MaxMsgBytes)
 	if err != nil {
 		return err
@@ -389,7 +389,7 @@ func (b *Bridge) Shutdown() {
 func (b *Bridge) HandleRequest(ctx context.Context, raw []byte) ([]byte, error) {
 	var req Request
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return nil, fmt.Errorf("octobridge: malformed request: %w", err)
+		return nil, fmt.Errorf("localoctop: malformed request: %w", err)
 	}
 	start := time.Now()
 	result, berr := b.dispatch(ctx, req.Method, req.Params)

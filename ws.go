@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 // Minimal, dependency-free RFC 6455 WebSocket implementation. Only the
 // subset the bridge needs is covered: text/binary data messages, ping/pong
@@ -48,7 +48,7 @@ const (
 )
 
 // ErrConnClosed is returned by write operations after the connection closed.
-var ErrConnClosed = errors.New("octobridge: websocket connection closed")
+var ErrConnClosed = errors.New("localoctop: websocket connection closed")
 
 // CloseError reports a close frame received from the peer.
 type CloseError struct {
@@ -57,7 +57,7 @@ type CloseError struct {
 }
 
 func (e *CloseError) Error() string {
-	return fmt.Sprintf("octobridge: peer closed websocket (code=%d reason=%q)", e.Code, e.Reason)
+	return fmt.Sprintf("localoctop: peer closed websocket (code=%d reason=%q)", e.Code, e.Reason)
 }
 
 // IsCloseError reports whether err is a peer close frame.
@@ -249,12 +249,12 @@ func (c *WSConn) ReadMessage() ([]byte, error) {
 
 func (c *WSConn) protocolError(msg string) error {
 	c.closeWithCode(closeProtocol, msg)
-	return fmt.Errorf("octobridge: websocket protocol error: %s", msg)
+	return fmt.Errorf("localoctop: websocket protocol error: %s", msg)
 }
 
 func (c *WSConn) tooBigError(n int64) error {
 	c.closeWithCode(closeTooBig, "message too big")
-	return fmt.Errorf("octobridge: websocket message of %d bytes exceeds limit %d", n, c.maxMsg)
+	return fmt.Errorf("localoctop: websocket message of %d bytes exceeds limit %d", n, c.maxMsg)
 }
 
 // ---- writing ----
@@ -300,7 +300,7 @@ func (c *WSConn) writeFrame(fin bool, opcode byte, payload []byte) error {
 	if c.isClient {
 		var key [4]byte
 		if _, err := rand.Read(key[:]); err != nil {
-			return fmt.Errorf("octobridge: mask key: %w", err)
+			return fmt.Errorf("localoctop: mask key: %w", err)
 		}
 		hdr = append(hdr, key[:]...)
 		body = make([]byte, length)
@@ -320,7 +320,7 @@ func (c *WSConn) writeFrame(fin bool, opcode byte, payload []byte) error {
 // WriteMessage writes a complete text message in a single frame.
 func (c *WSConn) WriteMessage(data []byte) error {
 	if int64(len(data)) > c.maxMsg {
-		return fmt.Errorf("octobridge: outbound message of %d bytes exceeds limit %d", len(data), c.maxMsg)
+		return fmt.Errorf("localoctop: outbound message of %d bytes exceeds limit %d", len(data), c.maxMsg)
 	}
 	return c.writeFrame(true, opText, data)
 }
@@ -392,7 +392,7 @@ func (c *WSConn) writeFrameRaw(fin bool, opcode byte, payload []byte) error {
 func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTimeout time.Duration, tlsCfg *tls.Config, maxMsg int64) (*WSConn, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("octobridge: bad ws url: %w", err)
+		return nil, fmt.Errorf("localoctop: bad ws url: %w", err)
 	}
 	var secure bool
 	var defaultPort string
@@ -402,7 +402,7 @@ func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTi
 	case "wss":
 		secure, defaultPort = true, "443"
 	default:
-		return nil, fmt.Errorf("octobridge: unsupported ws scheme %q", u.Scheme)
+		return nil, fmt.Errorf("localoctop: unsupported ws scheme %q", u.Scheme)
 	}
 	host := u.Hostname()
 	port := u.Port()
@@ -413,7 +413,7 @@ func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTi
 	d := &net.Dialer{Timeout: dialTimeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	if err != nil {
-		return nil, fmt.Errorf("octobridge: dial %s: %w", u.Host, err)
+		return nil, fmt.Errorf("localoctop: dial %s: %w", u.Host, err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(dialTimeout))
 
@@ -428,7 +428,7 @@ func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTi
 		tc := tls.Client(conn, cfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			_ = conn.Close()
-			return nil, fmt.Errorf("octobridge: tls handshake: %w", err)
+			return nil, fmt.Errorf("localoctop: tls handshake: %w", err)
 		}
 		conn = tc
 	}
@@ -436,7 +436,7 @@ func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTi
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("octobridge: ws key: %w", err)
+		return nil, fmt.Errorf("localoctop: ws key: %w", err)
 	}
 	key := base64.StdEncoding.EncodeToString(keyBytes)
 
@@ -456,14 +456,14 @@ func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTi
 
 	if _, err := conn.Write([]byte(req.String())); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("octobridge: send handshake: %w", err)
+		return nil, fmt.Errorf("localoctop: send handshake: %w", err)
 	}
 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("octobridge: read handshake: %w", err)
+		return nil, fmt.Errorf("localoctop: read handshake: %w", err)
 	}
 	status := resp.StatusCode
 	upgrade := resp.Header.Get("Upgrade")
@@ -475,15 +475,15 @@ func dialWS(ctx context.Context, rawURL string, extraHeaders http.Header, dialTi
 
 	if status != http.StatusSwitchingProtocols {
 		_ = conn.Close()
-		return nil, fmt.Errorf("octobridge: handshake failed: HTTP %d", status)
+		return nil, fmt.Errorf("localoctop: handshake failed: HTTP %d", status)
 	}
 	if !strings.EqualFold(upgrade, "websocket") {
 		_ = conn.Close()
-		return nil, fmt.Errorf("octobridge: handshake failed: missing Upgrade: websocket")
+		return nil, fmt.Errorf("localoctop: handshake failed: missing Upgrade: websocket")
 	}
 	if accept != acceptKey(key) {
 		_ = conn.Close()
-		return nil, errors.New("octobridge: handshake failed: bad Sec-WebSocket-Accept")
+		return nil, errors.New("localoctop: handshake failed: bad Sec-WebSocket-Accept")
 	}
 
 	_ = conn.SetDeadline(time.Time{}) // clear handshake deadline
@@ -504,26 +504,26 @@ func UpgradeWS(w http.ResponseWriter, r *http.Request, maxMsg int64) (*WSConn, e
 	if !headerContainsToken(r.Header.Get("Connection"), "upgrade") ||
 		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		http.Error(w, "expected websocket upgrade", http.StatusBadRequest)
-		return nil, errors.New("octobridge: not a websocket upgrade request")
+		return nil, errors.New("localoctop: not a websocket upgrade request")
 	}
 	if v := r.Header.Get("Sec-WebSocket-Version"); v != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
 		http.Error(w, "unsupported websocket version", http.StatusUpgradeRequired)
-		return nil, fmt.Errorf("octobridge: unsupported ws version %q", v)
+		return nil, fmt.Errorf("localoctop: unsupported ws version %q", v)
 	}
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
 		http.Error(w, "missing Sec-WebSocket-Key", http.StatusBadRequest)
-		return nil, errors.New("octobridge: missing Sec-WebSocket-Key")
+		return nil, errors.New("localoctop: missing Sec-WebSocket-Key")
 	}
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "server does not support hijacking", http.StatusInternalServerError)
-		return nil, errors.New("octobridge: ResponseWriter is not an http.Hijacker")
+		return nil, errors.New("localoctop: ResponseWriter is not an http.Hijacker")
 	}
 	conn, brw, err := hj.Hijack()
 	if err != nil {
-		return nil, fmt.Errorf("octobridge: hijack: %w", err)
+		return nil, fmt.Errorf("localoctop: hijack: %w", err)
 	}
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
@@ -531,7 +531,7 @@ func UpgradeWS(w http.ResponseWriter, r *http.Request, maxMsg int64) (*WSConn, e
 		"Sec-WebSocket-Accept: " + acceptKey(key) + "\r\n\r\n"
 	if _, err := conn.Write([]byte(resp)); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("octobridge: write handshake: %w", err)
+		return nil, fmt.Errorf("localoctop: write handshake: %w", err)
 	}
 	br := brw.Reader
 	if br == nil {

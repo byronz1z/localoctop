@@ -8,8 +8,8 @@ import asyncio
 
 import pytest
 
-from mcp_localfs.errors import BridgeProtocolError, CODE_NO_BRIDGE, CODE_TIMEOUT
-from mcp_localfs.sessions import BridgeSession, SessionRegistry
+from localoctop.errors import BridgeProtocolError, CODE_NO_BRIDGE, CODE_TIMEOUT
+from localoctop.sessions import BridgeSession, SessionRegistry
 
 from conftest import FakeWebSocket, make_session
 

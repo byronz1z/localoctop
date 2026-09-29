@@ -14,7 +14,7 @@ import os
 import time
 from typing import Any
 
-logger = logging.getLogger("mcp_localfs.audit")
+logger = logging.getLogger("localoctop.audit")
 
 
 class AuditLog:

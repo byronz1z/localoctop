@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MCP client probe — stage 3 of the end-to-end check (scripts/verify_e2e.ps1).
 
-Speaks raw streamable-HTTP JSON-RPC against /mcp/localfs/ exactly the way
+Speaks raw streamable-HTTP JSON-RPC against /mcp/localoctop/ exactly the way
 Octop's custom-MCP connector does (see Octop src/octop/infra/connectors/
 probe.py: initialize -> notifications/initialized -> tools/list -> tools/call,
 Bearer auth, Accept: application/json, text/event-stream).
@@ -39,7 +39,7 @@ def main() -> int:
     ap.add_argument("--expect-content", default="e2e-ok", help="substring expected in read_file")
     args = ap.parse_args()
 
-    url = args.base_url.rstrip("/") + "/mcp/localfs/"
+    url = args.base_url.rstrip("/") + "/mcp/localoctop/"
     base_headers = {
         "Authorization": f"Bearer {args.token}",
         "Accept": "application/json, text/event-stream",
@@ -64,7 +64,7 @@ def main() -> int:
         sid = r.headers.get("mcp-session-id", "")
         check("initialize -> 200 + serverInfo + Mcp-Session-Id",
               r.status_code == 200
-              and body.get("result", {}).get("serverInfo", {}).get("name") == "mcp-localfs"
+              and body.get("result", {}).get("serverInfo", {}).get("name") == "localoctop"
               and bool(sid),
               f"status={r.status_code} body={json.dumps(body)[:160]}")
         headers = {**base_headers, "Mcp-Session-Id": sid}

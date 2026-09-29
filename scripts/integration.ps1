@@ -1,4 +1,4 @@
-# integration.ps1 — octop-local-bridge <-> mock adapter end-to-end smoke test.
+# integration.ps1 — localoctop <-> mock adapter end-to-end smoke test.
 #
 # What it does:
 #   1. go build ./... && go vet ./...
@@ -13,7 +13,7 @@
 #        - audit log records allow+deny decisions
 #   6. kills the server, reconnects a bridge, verifies re-registration
 #
-# Run from the octop-local-bridge directory:
+# Run from the localoctop directory:
 #   powershell -ExecutionPolicy Bypass -File scripts\integration.ps1
 
 $ErrorActionPreference = "Stop"
@@ -45,7 +45,7 @@ try {
     Write-Host "== build =="
     go build -o (Join-Path $bin "testserver.exe") ./internal/testserver
     if ($LASTEXITCODE -ne 0) { throw "go build testserver failed" }
-    go build -o (Join-Path $bin "octop-local-bridge.exe") ./cmd/bridge
+    go build -o (Join-Path $bin "localoctop.exe") ./cmd/bridge
     if ($LASTEXITCODE -ne 0) { throw "go build bridge failed" }
     Check "go build" $true
 
@@ -62,8 +62,8 @@ try {
 
     Write-Host "== start bridge client =="
     $auditLog = Join-Path $tmp "audit.log"
-    $bridge = Start-Process -FilePath (Join-Path $bin "octop-local-bridge.exe") `
-        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
+    $bridge = Start-Process -FilePath (Join-Path $bin "localoctop.exe") `
+        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp/localoctop/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge.log")
     $deadline = (Get-Date).AddSeconds(10)
     $registered = $false
@@ -111,8 +111,8 @@ try {
     Start-Sleep -Milliseconds 500
     $s = (Invoke-WebRequest -Uri "$base/sessions" -UseBasicParsing -TimeoutSec 2).Content | ConvertFrom-Json
     Check "session dropped after kill" ($s.sessions.Count -eq 0)
-    $bridge = Start-Process -FilePath (Join-Path $bin "octop-local-bridge.exe") `
-        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
+    $bridge = Start-Process -FilePath (Join-Path $bin "localoctop.exe") `
+        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp/localoctop/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge2.log")
     $deadline = (Get-Date).AddSeconds(10)
     $reback = $false
@@ -126,8 +126,8 @@ try {
     Check "call works after reconnect" ($r.result.text -eq "integration-ok")
 
     Write-Host "== bad token =="
-    $bad = Start-Process -FilePath (Join-Path $bin "octop-local-bridge.exe") `
-        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "wrong", "-dir", $tmp `
+    $bad = Start-Process -FilePath (Join-Path $bin "localoctop.exe") `
+        -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp/localoctop/ws", "-token", "wrong", "-dir", $tmp `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge-bad.log")
     Start-Sleep -Seconds 2
     Check "bad-token bridge not connected" (-not $bad.HasExited)  # keeps retrying, never registers

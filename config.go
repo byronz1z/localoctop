@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 import (
 	"errors"
@@ -31,7 +31,7 @@ const (
 // Use NewConfig to get sensible defaults, then override fields as needed.
 type Config struct {
 	// ServerURL is the bridge WebSocket endpoint, e.g.
-	// "wss://example.com/mcp-localfs/ws". http(s) schemes are accepted and
+	// "wss://example.com/mcp/localoctop/ws". http(s) schemes are accepted and
 	// translated to ws(s).
 	ServerURL string
 

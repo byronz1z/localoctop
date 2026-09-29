@@ -26,10 +26,10 @@ from .errors import (
 
 # Protocol identity reported during the MCP handshake.
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_NAME = "mcp-localfs"
+SERVER_NAME = "localoctop"
 SERVER_VERSION = "1.0.0"
 
-# Bridge method names — kept identical to localfsbridge/protocol.go.
+# Bridge method names — kept identical to localoctop/protocol.go.
 M_LIST_DIRECTORY = "list_directory"
 M_READ_FILE = "read_file"
 M_SEARCH_FILES = "search_files"

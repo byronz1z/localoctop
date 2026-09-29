@@ -1,6 +1,6 @@
-"""Wire error codes shared with the Go client (localfsbridge/errors.go).
+"""Wire error codes shared with the Go client (localoctop/errors.go).
 
-Codes >= 4000 are localfs-bridge domain errors; negative codes follow
+Codes >= 4000 are localoctop-bridge domain errors; negative codes follow
 JSON-RPC 2.0 conventions. Both sides must agree on these values so an
 error raised on the employee machine is rendered correctly inside Octop.
 """

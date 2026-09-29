@@ -12,36 +12,36 @@
 ## 第 1 步：跑起云端适配器容器
 
 在服务器上（本仓 `adapter/` 目录，克隆仓库或下载 Release 资产
-`octop-local-bridge-server-*.zip` 即得）：
+`localoctop-server-*.zip` 即得）：
 
 ```bash
-docker build -t octop-local-bridge-server:1.0.0 .
-docker run -d --name octop-local-bridge-server -p 127.0.0.1:8080:8080 \
-  -e LOCALFS_TOKENS="你的用户名:CHANGE_ME_MCP_TOKEN" \
-  -e LOCALFS_BRIDGE_TOKENS="你的用户名:CHANGE_ME_BRIDGE_TOKEN" \
-  -e LOCALFS_AUDIT_LOG=/app/logs/calls.jsonl \
-  -v octop-local-bridge-audit:/app/logs \
-  octop-local-bridge-server:1.0.0
+docker build -t localoctop-server:1.0.0 .
+docker run -d --name localoctop-server -p 127.0.0.1:8080:8080 \
+  -e LOCALOCTOP_MCP_TOKENS="你的用户名:CHANGE_ME_MCP_TOKEN" \
+  -e LOCALOCTOP_CLIENT_TOKENS="你的用户名:CHANGE_ME_BRIDGE_TOKEN" \
+  -e LOCALOCTOP_AUDIT_LOG=/app/logs/calls.jsonl \
+  -v localoctop-audit:/app/logs \
+  localoctop-server:1.0.0
 ```
 
 放在反向代理（Caddy/Nginx/Traefik）之后，对外提供
-`https://你的域名/mcp/localfs/` 与 `wss://你的域名/mcp-localfs/ws`。
+`https://你的域名/mcp/localoctop/` 与 `wss://你的域名/mcp/localoctop/ws`。
 详细配置见 `adapter/README.md` 与 `adapter/docker-compose.example.yml`。
 
 ## 第 2 步：桥 EXE 引导页填地址
 
-双击运行本包中的 `octop-local-bridge.exe`（或已安装版本的桌面模式），浏览器自动打开
+双击运行本包中的 `localoctop.exe`（或已安装版本的桌面模式），浏览器自动打开
 控制台引导页：
 
 1. 选择白名单目录（AI 只能看到这些目录）；
-2. 服务器地址填 `wss://你的域名/mcp-localfs/ws`；
+2. 服务器地址填 `wss://你的域名/mcp/localoctop/ws`；
 3. 令牌填 **bridge_token**（`CHANGE_ME_BRIDGE_TOKEN` 换成的那个）；
 4. 「保存并连接」，状态页显示「已连接」即成功。
 
 无人值守环境可用 headless 模式：
 
 ```powershell
-.\octop-local-bridge.exe --headless -server "wss://你的域名/mcp-localfs/ws" `
+.\localoctop.exe --headless -server "wss://你的域名/mcp/localoctop/ws" `
   -token CHANGE_ME_BRIDGE_TOKEN -dir "D:\我的资料"
 ```
 
@@ -50,7 +50,7 @@ docker run -d --name octop-local-bridge-server -p 127.0.0.1:8080:8080 \
 把 `octop-mcp-connector.example.json` 的内容贴入 Octop 后台
 「连接器 → 自定义 MCP」保存（对应接口 `PUT /api/connectors/custom-mcp`）：
 
-- `url`：`https://你的域名/mcp/localfs/`（公网必须 https；回环/内网可 http）；
+- `url`：`https://你的域名/mcp/localoctop/`（公网必须 https；回环/内网可 http）；
 - `headers.Authorization`：`Bearer ` + **mcp_token**（不是第 2 步那个！）；
 - 保存后点「测试」：Octop 会做 `initialize` + `tools/list` 探测，
   成功时列出 4 个只读工具（`list_directory` / `read_file` /

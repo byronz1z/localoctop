@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/byronz1z/octop-local-bridge/internal/appcfg"
+	"github.com/byronz1z/localoctop/internal/appcfg"
 )
 
 // withPicker installs a fake native dialog for the duration of a test so no

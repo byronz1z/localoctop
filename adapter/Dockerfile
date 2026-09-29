@@ -1,4 +1,4 @@
-# octop-local-bridge adapter — standalone container image.
+# localoctop adapter — standalone container image.
 # Self-contained: copies only this directory; no Octop code enters the image.
 FROM python:3.12-slim
 
@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code.
-COPY mcp_localfs ./mcp_localfs
+COPY localoctop ./localoctop
 
 # Non-root runtime user; audit log directory must be writable.
 RUN useradd --create-home --uid 10001 adapter \
@@ -17,14 +17,14 @@ RUN useradd --create-home --uid 10001 adapter \
     && chown -R adapter:adapter /app
 USER adapter
 
-ENV LOCALFS_HOST=0.0.0.0 \
-    LOCALFS_PORT=8080 \
-    LOCALFS_AUDIT_LOG=/app/logs/calls.jsonl \
-    LOCALFS_LOG_LEVEL=INFO
+ENV LOCALOCTOP_HOST=0.0.0.0 \
+    LOCALOCTOP_PORT=8080 \
+    LOCALOCTOP_AUDIT_LOG=/app/logs/calls.jsonl \
+    LOCALOCTOP_LOG_LEVEL=INFO
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"
 
-CMD ["python", "-m", "mcp_localfs.main"]
+CMD ["python", "-m", "localoctop.main"]

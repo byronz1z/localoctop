@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	octobridge "github.com/byronz1z/octop-local-bridge"
-	"github.com/byronz1z/octop-local-bridge/internal/appcfg"
+	localoctop "github.com/byronz1z/localoctop"
+	"github.com/byronz1z/localoctop/internal/appcfg"
 )
 
 // startTestServer runs a console Server on a random loopback port.
@@ -97,7 +97,7 @@ func TestConfigPostAppliesAndReflects(t *testing.T) {
 		return nil
 	})
 
-	body := `{"server_url":"wss://example.com/mcp-localfs/ws","token":"t0",
+	body := `{"server_url":"wss://example.com/mcp/localoctop/ws","token":"t0",
 	  "allowed_dirs":[{"path":"C:/tmp/x","enabled":true},{"path":"C:/tmp/off","enabled":false}],
 	  "allow_write":false,"console_port":19881,"open_browser":false}`
 	resp, err := http.Post(base+"/api/config", "application/json", strings.NewReader(body))
@@ -111,7 +111,7 @@ func TestConfigPostAppliesAndReflects(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("apply called %d times, want 1", calls)
 	}
-	if applied.ServerURL != "wss://example.com/mcp-localfs/ws" || applied.Token != "t0" {
+	if applied.ServerURL != "wss://example.com/mcp/localoctop/ws" || applied.Token != "t0" {
 		t.Errorf("apply got url=%q token=%q", applied.ServerURL, applied.Token)
 	}
 	// AuditLogPath must survive a save the UI does not know about.
@@ -256,7 +256,7 @@ func TestSSEInitialStatusThenPushes(t *testing.T) {
 	// Give the subscriber a moment to attach before pushing.
 	time.Sleep(200 * time.Millisecond)
 	srv.PushStatus(true, "")
-	srv.PushAudit(octobridge.AuditEvent{
+	srv.PushAudit(localoctop.AuditEvent{
 		Time:     "2026-09-29T00:00:00Z",
 		Method:   "read_file",
 		Path:     "C:/tmp/x/a.txt",
@@ -283,7 +283,7 @@ func TestSSEInitialStatusThenPushes(t *testing.T) {
 	if f[1].name != "status" || !st.Connected {
 		t.Errorf("frame 1 = %q %+v, want connected status", f[1].name, st)
 	}
-	var ev octobridge.AuditEvent
+	var ev localoctop.AuditEvent
 	if err := json.Unmarshal([]byte(f[2].data), &ev); err != nil {
 		t.Fatalf("frame 2 data: %v", err)
 	}

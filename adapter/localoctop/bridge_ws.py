@@ -1,4 +1,4 @@
-"""The /mcp-localfs/ws endpoint that employee bridges dial into.
+"""The /mcp/localoctop/ws endpoint that employee bridges dial into.
 
 Flow:
   1. Accept the WebSocket; extract the token from ?token= or the
@@ -27,7 +27,7 @@ from .config import Settings
 from .errors import BridgeProtocolError, CODE_AUTH_FAILED
 from .sessions import BridgeSession, SessionRegistry
 
-logger = logging.getLogger("mcp_localfs.bridge_ws")
+logger = logging.getLogger("localoctop.bridge_ws")
 
 CLOSE_AUTH_FAILED = 4401
 CLOSE_BAD_REGISTER = 4403

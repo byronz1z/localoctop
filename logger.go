@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 import (
 	"fmt"
@@ -25,7 +25,7 @@ type StderrLogger struct {
 // Debugf lines.
 func NewStderrLogger(debug bool) *StderrLogger {
 	return &StderrLogger{
-		l:     log.New(os.Stderr, "[octobridge] ", log.LstdFlags),
+		l:     log.New(os.Stderr, "[localoctop] ", log.LstdFlags),
 		debug: debug,
 	}
 }

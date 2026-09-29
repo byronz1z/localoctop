@@ -1,13 +1,13 @@
 # Octop Local Bridge
 
 本地文件访问桥：运行在员工本机的**出站** WSS 客户端。它主动连接云端
-`octop-local-bridge` 适配器，把云端 AI 助手（经 Octop「自定义 MCP 连接器」）发来的
+`localoctop` 适配器，把云端 AI 助手（经 Octop「自定义 MCP 连接器」）发来的
 文件工具调用，落地成对**白名单目录**的受控访问，并把每一次访问记入本地审计日志。
 
 交付形态是**单个 EXE**：桥核心 + 内嵌本地 Web 控制台 + 系统托盘，同一进程，
 `go build` 即得，无 node 构建链。
 
-- 模块名：`github.com/byronz1z/octop-local-bridge`
+- 模块名：`github.com/byronz1z/localoctop`
 - 许可证：Apache-2.0
 - 版本：v0.2.2（预览期）
 
@@ -23,11 +23,11 @@
    |  工具调用（MCP：streamable_http + Bearer）
    v
 Octop「自定义 MCP 连接器」
-   |  https://<server>/mcp/localfs/
+   |  https://<server>/mcp/localoctop/
    v
-octop-local-bridge 适配器（云端容器，本仓 adapter/）
+localoctop 适配器（云端容器，本仓 adapter/）
    |  WebSocket（由本程序主动拨出，防火墙友好）
-   |  wss://<server>/mcp-localfs/ws + bridge_token
+   |  wss://<server>/mcp/localoctop/ws + bridge_token
    v
 Octop Local Bridge（本机，单 EXE）
    |  仅限白名单目录
@@ -44,9 +44,9 @@ Octop Local Bridge（本机，单 EXE）
 [`examples/README.md`](examples/README.md)：
 
 1. **跑适配器容器**：服务器上用本仓 `adapter/`（克隆即得，或下载 Release 资产
-   `octop-local-bridge-server-*.zip`）`docker build` 后运行，反代出
-   `https://…/mcp/localfs/` 与 `wss://…/mcp-localfs/ws`；
-2. **桥 EXE 引导页填地址**：白名单目录 + `wss://…/mcp-localfs/ws` +
+   `localoctop-server-*.zip`）`docker build` 后运行，反代出
+   `https://…/mcp/localoctop/` 与 `wss://…/mcp/localoctop/ws`；
+2. **桥 EXE 引导页填地址**：白名单目录 + `wss://…/mcp/localoctop/ws` +
    **bridge_token** → 保存并连接；
 3. **Octop 后台贴连接器配置**：把 `examples/octop-mcp-connector.example.json`
    贴入「连接器 → 自定义 MCP」（URL + **mcp_token** Bearer）→ 测试，
@@ -59,18 +59,18 @@ Octop Local Bridge（本机，单 EXE）
 
 ### 下载
 
-从 [GitHub Releases](../../releases) 下载 `octop-local-bridge-vX.Y.Z-windows-amd64.zip`
-（含 `sha256` 校验文件），解压得到 `octop-local-bridge-*.exe`。
+从 [GitHub Releases](../../releases) 下载 `localoctop-vX.Y.Z-windows-amd64.zip`
+（含 `sha256` 校验文件），解压得到 `localoctop-*.exe`。
 
 > EXE 只由 GitHub 官方 CI（tag `v*` 触发的 windows-latest workflow）构建发布；
 > 任何"本地编译的 EXE"都不是交付物。
 
 ### 首次运行
 
-双击运行（或命令行 `octop-local-bridge-*.exe`）：
+双击运行（或命令行 `localoctop-*.exe`）：
 
 1. 系统托盘出现桥图标；浏览器自动打开控制台 `http://127.0.0.1:19880`；
-2. 首次启动进入**引导页**：选择白名单目录 → 填写服务器地址（`wss://…/mcp-localfs/ws`）
+2. 首次启动进入**引导页**：选择白名单目录 → 填写服务器地址（`wss://…/mcp/localoctop/ws`）
    与访问令牌 → 「保存并连接」；
 3. 状态页显示「已连接」，审计活动开始实时滚动。
 
@@ -82,7 +82,7 @@ go vet ./...            # 静态检查
 go test ./...           # 单元测试
 
 # 产出单 EXE（与 CI 发布同参数）
-go build -ldflags "-s -w" -o dist/octop-local-bridge.exe ./cmd/bridge
+go build -ldflags "-s -w" -o dist/localoctop.exe ./cmd/bridge
 ```
 
 Go 1.22+（CI 使用 1.23）。前端是手写单页 HTML + 原生 JS，经 `go:embed`
@@ -104,13 +104,13 @@ Go 1.22+（CI 使用 1.23）。前端是手写单页 HTML + 原生 JS，经 `go:
 
 配置文件位置（JSON）：
 
-- Windows: `%AppData%\octop-local-bridge\config.json`
-- Linux: `$XDG_CONFIG_HOME/octop-local-bridge/config.json`
-- macOS: `$HOME/Library/Application Support/octop-local-bridge/config.json`
+- Windows: `%AppData%\localoctop\config.json`
+- Linux: `$XDG_CONFIG_HOME/localoctop/config.json`
+- macOS: `$HOME/Library/Application Support/localoctop/config.json`
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `server_url` | — | 适配器 WebSocket URL，`wss://…/mcp-localfs/ws`（接受 `https://`，自动转 `wss://`） |
+| `server_url` | — | 适配器 WebSocket URL，`wss://…/mcp/localoctop/ws`（接受 `https://`，自动转 `wss://`） |
 | `token` | — | 适配器签发的用户令牌 |
 | `allowed_dirs` | — | 白名单目录列表，`[{path, enabled}]`；`enabled:false` 保留但不服务 |
 | `allow_write` | `false` | 是否开启预留写工具（`write_file`/`create_directory`） |
@@ -123,15 +123,15 @@ Go 1.22+（CI 使用 1.23）。前端是手写单页 HTML + 原生 JS，经 `go:
 不带控制台与托盘的纯桥模式，行为等价于早期 `cmd/bridge` CLI：
 
 ```bash
-octop-local-bridge.exe --headless \
-  -server "wss://octop.example.com/mcp-localfs/ws" \
+localoctop.exe --headless \
+  -server "wss://octop.example.com/mcp/localoctop/ws" \
   -token  <token> \
   -dir    "D:/projects/docs" \
   -audit  "./audit.jsonl"
 ```
 
 标志留空时自动回退读取配置文件；也支持环境变量
-`LOCALFS_SERVER_URL` / `LOCALFS_TOKEN` / `LOCALFS_DIRS` / `LOCALFS_ALLOW_WRITE` / `LOCALFS_AUDIT`。
+`LOCALOCTOP_SERVER_URL` / `LOCALOCTOP_TOKEN` / `LOCALOCTOP_DIRS` / `LOCALOCTOP_ALLOW_WRITE` / `LOCALOCTOP_AUDIT`。
 
 ## 安全模型
 
@@ -160,7 +160,7 @@ octop-local-bridge.exe --headless \
 ├── internal/console/  # 内嵌单页控制台 + JSON API + SSE
 ├── internal/tray/     # 系统托盘（fyne.io/systray，Windows 无 cgo）
 ├── internal/testserver/  # 开发/联调用 mock 适配器（非交付物，勿部署）
-├── adapter/           # octop-local-bridge 云端适配器（Python，自包含，见其 README）
+├── adapter/           # localoctop 云端适配器（Python，自包含，见其 README）
 ├── examples/          # Octop 连接器模板 + 三步接入指南（随发布包分发）
 ├── scripts/           # 端到端联调脚本（ps1 / sh）+ verify_e2e.ps1 三段验收
 └── .github/workflows/ # push=build+test；tag v*=EXE zip+适配器 zip+sha256 发布

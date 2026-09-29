@@ -1,10 +1,10 @@
-package octobridge
+package localoctop
 
 import "encoding/json"
 
-// Wire protocol between the bridge client (Go) and the octop-local-bridge
+// Wire protocol between the bridge client (Go) and the localoctop
 // adapter (Python). JSON-RPC-flavored envelopes over a single WebSocket connection.
-// The same shapes are mirrored in mcp_localfs/protocol.py — keep both in sync.
+// The same shapes are mirrored in localoctop/protocol.py — keep both in sync.
 
 // Request is an inbound call from the adapter: {id, method, params}.
 type Request struct {
@@ -49,7 +49,7 @@ const (
 
 // Version is the product version, reported in register frames and shown on
 // the console's about page. Preview releases start at v0.1.0.
-const Version = "0.2.2"
+const Version = "0.3.0"
 
 // ---- Tool result shapes (mirrored by the adapter's MCP content blocks) ----
 

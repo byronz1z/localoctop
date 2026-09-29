@@ -9,10 +9,10 @@
 //	bridge --headless # pure bridge, no console, no tray: settings file or
 //	                  # flags/env, stdout logging — the original CLI runner
 //
-// Headless flags (also honored via LOCALFS_* env vars):
+// Headless flags (also honored via LOCALOCTOP_* env vars):
 //
 //	bridge --headless \
-//	    -server "ws://127.0.0.1:18443/mcp-localfs/ws" \
+//	    -server "ws://127.0.0.1:18443/mcp/localoctop/ws" \
 //	    -token  dev-token \
 //	    -dir    "~/Documents/Octop" \
 //	    -audit  "./audit.log"
@@ -28,19 +28,19 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/byronz1z/octop-local-bridge"
-	"github.com/byronz1z/octop-local-bridge/internal/appcfg"
-	"github.com/byronz1z/octop-local-bridge/internal/console"
-	"github.com/byronz1z/octop-local-bridge/internal/tray"
+	"github.com/byronz1z/localoctop"
+	"github.com/byronz1z/localoctop/internal/appcfg"
+	"github.com/byronz1z/localoctop/internal/console"
+	"github.com/byronz1z/localoctop/internal/tray"
 )
 
 func main() {
 	headless := flag.Bool("headless", false, "pure bridge mode: no console, no tray (flags/env config)")
-	server := flag.String("server", envOr("LOCALFS_SERVER_URL", ""), "headless: adapter WebSocket URL")
-	token := flag.String("token", envOr("LOCALFS_TOKEN", ""), "headless: user token issued by the adapter")
-	dirs := flag.String("dir", envOr("LOCALFS_DIRS", ""), "headless: comma-separated whitelist directories")
-	allowWrite := flag.Bool("write", envOr("LOCALFS_ALLOW_WRITE", "") == "1", "headless: enable reserved write tools (default off)")
-	audit := flag.String("audit", envOr("LOCALFS_AUDIT", ""), "headless: audit log path (empty = stderr hook only)")
+	server := flag.String("server", envOr("LOCALOCTOP_SERVER_URL", ""), "headless: adapter WebSocket URL")
+	token := flag.String("token", envOr("LOCALOCTOP_TOKEN", ""), "headless: user token issued by the adapter")
+	dirs := flag.String("dir", envOr("LOCALOCTOP_DIRS", ""), "headless: comma-separated whitelist directories")
+	allowWrite := flag.Bool("write", envOr("LOCALOCTOP_ALLOW_WRITE", "") == "1", "headless: enable reserved write tools (default off)")
+	audit := flag.String("audit", envOr("LOCALOCTOP_AUDIT", ""), "headless: audit log path (empty = stderr hook only)")
 	verbose := flag.Bool("v", false, "debug logging")
 	flag.Parse()
 
@@ -59,7 +59,7 @@ func main() {
 type appState struct {
 	mu     sync.Mutex
 	cfg    appcfg.File
-	bridge *octobridge.Bridge
+	bridge *localoctop.Bridge
 	cancel context.CancelFunc // stops the current bridge's Run
 }
 
@@ -90,8 +90,8 @@ func runDesktop(verbose bool) {
 
 	// wire attaches the console/tray feeds to a bridge config. cid points at
 	// the client id of the bridge being built; it is filled right after
-	// octobridge.New and only read from OnStatus afterwards.
-	var wire func(bc *octobridge.Config, cid *string)
+	// localoctop.New and only read from OnStatus afterwards.
+	var wire func(bc *localoctop.Config, cid *string)
 	var srv *console.Server
 
 	srv = console.New(cfg, func(next appcfg.File) error {
@@ -103,7 +103,7 @@ func runDesktop(verbose bool) {
 		app.cfg = next
 		return rebuildLocked(ctx, app, verbose, wire, srv)
 	})
-	wire = func(bc *octobridge.Config, cid *string) {
+	wire = func(bc *localoctop.Config, cid *string) {
 		bc.OnStatus = func(connected bool, err error) {
 			msg := ""
 			if err != nil {
@@ -115,14 +115,14 @@ func runDesktop(verbose bool) {
 				fmt.Fprintln(os.Stderr, "[status] disconnected")
 			}
 			srv.PushStatus(connected, msg)
-			tray.SetStatus(consoleURL, octobridge.Version, connected, *cid)
+			tray.SetStatus(consoleURL, localoctop.Version, connected, *cid)
 		}
-		bc.OnAudit = func(ev octobridge.AuditEvent) {
+		bc.OnAudit = func(ev localoctop.AuditEvent) {
 			srv.PushAudit(ev)
 		}
 	}
 	srv.SetAbout(console.About{
-		Version:    octobridge.Version,
+		Version:    localoctop.Version,
 		ConsoleURL: consoleURL,
 		ConfigPath: mustPath(appcfg.Path),
 		AuditPath:  cfg.AuditLogPath,
@@ -148,12 +148,12 @@ func runDesktop(verbose bool) {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "octop-local-bridge %s: console on %s (tray icon active; Ctrl+C to quit)\n",
-		octobridge.Version, consoleURL)
+	fmt.Fprintf(os.Stderr, "localoctop %s: console on %s (tray icon active; Ctrl+C to quit)\n",
+		localoctop.Version, consoleURL)
 
 	// Tray on the main goroutine (systray requirement on Windows); it blocks
 	// until the tray "quit" item fires. Ctrl+C is handled after it returns.
-	tray.Run(consoleURL, octobridge.Version, tray.Actions{
+	tray.Run(consoleURL, localoctop.Version, tray.Actions{
 		OpenConsole: func() {
 			if err := console.OpenBrowser(consoleURL); err != nil {
 				fmt.Fprintf(os.Stderr, "console: %v\n", err)
@@ -169,14 +169,14 @@ func runDesktop(verbose bool) {
 	}
 	app.mu.Unlock()
 	srv.Shutdown()
-	fmt.Fprintln(os.Stderr, "octop-local-bridge stopped")
+	fmt.Fprintln(os.Stderr, "localoctop stopped")
 }
 
 // rebuildLocked builds a Bridge from app.cfg and swaps it in, cancelling the
 // previous one. Callers hold app.mu. A config that does not validate (e.g.
 // the unconfigured first run) leaves the previous bridge running and
 // returns the error so the console can surface it to the user.
-func rebuildLocked(ctx context.Context, app *appState, verbose bool, wire func(*octobridge.Config, *string), srv *console.Server) error {
+func rebuildLocked(ctx context.Context, app *appState, verbose bool, wire func(*localoctop.Config, *string), srv *console.Server) error {
 	bc, err := bridgeConfig(app.cfg, verbose)
 	if err != nil {
 		return err
@@ -185,7 +185,7 @@ func rebuildLocked(ctx context.Context, app *appState, verbose bool, wire func(*
 	if wire != nil {
 		wire(&bc, &cid)
 	}
-	b, err := octobridge.New(bc)
+	b, err := localoctop.New(bc)
 	if err != nil {
 		return err
 	}
@@ -204,14 +204,14 @@ func rebuildLocked(ctx context.Context, app *appState, verbose bool, wire func(*
 
 // bridgeConfig maps the settings file onto the bridge core's Config, wiring
 // the console's status/audit feeds.
-func bridgeConfig(cfg appcfg.File, verbose bool) (octobridge.Config, error) {
-	bc := octobridge.NewConfig()
+func bridgeConfig(cfg appcfg.File, verbose bool) (localoctop.Config, error) {
+	bc := localoctop.NewConfig()
 	bc.ServerURL = cfg.ServerURL
 	bc.Token = cfg.Token
 	bc.AllowedDirs = cfg.EnabledDirs()
 	bc.AllowWrite = cfg.AllowWrite
 	bc.AuditLogPath = cfg.AuditLogPath
-	bc.Logger = octobridge.NewStderrLogger(verbose)
+	bc.Logger = localoctop.NewStderrLogger(verbose)
 	return bc, nil
 }
 
@@ -237,7 +237,7 @@ func runHeadless(server, token, dirs string, allowWrite bool, audit string, verb
 		}
 	}
 
-	cfg := octobridge.NewConfig()
+	cfg := localoctop.NewConfig()
 	cfg.ServerURL = server
 	cfg.Token = token
 	for _, d := range strings.Split(dirs, ",") {
@@ -247,7 +247,7 @@ func runHeadless(server, token, dirs string, allowWrite bool, audit string, verb
 	}
 	cfg.AllowWrite = allowWrite
 	cfg.AuditLogPath = audit
-	cfg.Logger = octobridge.NewStderrLogger(verbose)
+	cfg.Logger = localoctop.NewStderrLogger(verbose)
 	cfg.OnStatus = func(connected bool, err error) {
 		if connected {
 			fmt.Fprintln(os.Stderr, "[status] connected")
@@ -258,7 +258,7 @@ func runHeadless(server, token, dirs string, allowWrite bool, audit string, verb
 		}
 	}
 
-	bridge, err := octobridge.New(cfg)
+	bridge, err := localoctop.New(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		os.Exit(2)
@@ -267,8 +267,8 @@ func runHeadless(server, token, dirs string, allowWrite bool, audit string, verb
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "octobridge %s starting (client_id=%s, write=%v, dirs=%v)\n",
-		octobridge.Version, bridge.ClientID(), allowWrite, cfg.AllowedDirs)
+	fmt.Fprintf(os.Stderr, "localoctop %s starting (client_id=%s, write=%v, dirs=%v)\n",
+		localoctop.Version, bridge.ClientID(), allowWrite, cfg.AllowedDirs)
 	if err := bridge.Run(ctx); err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "bridge stopped with error: %v\n", err)
 		os.Exit(1)

@@ -1,4 +1,4 @@
-"""The /mcp/localfs/ streamable_http MCP endpoint consumed by Octop's
+"""The /mcp/localoctop/ streamable_http MCP endpoint consumed by Octop's
 "custom MCP connector" (transport=streamable_http, Bearer auth).
 
 Built on the official MCP SDK: a lowlevel `mcp.server.Server` served through
@@ -44,14 +44,14 @@ from .protocol import SERVER_NAME, SERVER_VERSION, jsonrpc_error, tools_list
 from .sessions import SessionRegistry
 from .tools import ToolService
 
-logger = logging.getLogger("mcp_localfs.mcp")
+logger = logging.getLogger("localoctop.mcp")
 
 # Scope key under which the authenticated user id travels to the SDK handlers.
-SCOPE_USER_KEY = "localfs_user"
+SCOPE_USER_KEY = "localoctop_user"
 
 SERVER_INSTRUCTIONS = (
     "Read-only access to the user's whitelisted local directories via the "
-    "octop-local-bridge client running on the user's machine."
+    "localoctop client running on the user's machine."
 )
 
 
@@ -189,7 +189,7 @@ class MCPEndpoint:
         # session can never be used with a different token.
         scope[SCOPE_USER_KEY] = user_id
         scope["user"] = AuthenticatedUser(
-            AccessToken(token=token or "", client_id=f"localfs:{user_id}", scopes=[])
+            AccessToken(token=token or "", client_id=f"localoctop:{user_id}", scopes=[])
         )
 
         await self._ensure_manager()
@@ -241,5 +241,5 @@ def build_router(settings: Settings, registry: SessionRegistry, audit: AuditLog,
         # which starlette's Route detects and mounts without request/response
         # wrapping — required so the SDK can own the HTTP exchange.
         r.add_route(p, endpoint, methods=["POST", "GET", "DELETE"])
-    r.localfs_endpoint = endpoint  # type: ignore[attr-defined]  # lifespan shutdown hook
+    r.localoctop_endpoint = endpoint  # type: ignore[attr-defined]  # lifespan shutdown hook
     return r

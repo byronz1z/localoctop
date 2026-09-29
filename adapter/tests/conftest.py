@@ -14,10 +14,10 @@ from typing import Any
 import pytest
 from fastapi import WebSocketDisconnect
 
-from mcp_localfs.audit import AuditLog
-from mcp_localfs.config import Settings
-from mcp_localfs.sessions import SessionRegistry
-from mcp_localfs.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
+from localoctop.audit import AuditLog
+from localoctop.config import Settings
+from localoctop.sessions import SessionRegistry
+from localoctop.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
 
 
 def make_token_store() -> TokenStore:
@@ -130,7 +130,7 @@ def collecting_audit() -> tuple[AuditLog, list[dict]]:
 
 def make_session(user_id: str, ws: FakeWebSocket, client_id: str = "c1",
                  write_enabled: bool = False) -> Any:
-    from mcp_localfs.sessions import BridgeSession
+    from localoctop.sessions import BridgeSession
 
     return BridgeSession(
         user_id=user_id,

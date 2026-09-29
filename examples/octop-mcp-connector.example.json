@@ -1,12 +1,12 @@
 {
   "servers": {
-    "localfs": {
+    "localoctop": {
       "transport": "streamable_http",
-      "url": "https://CHANGE_ME_SERVER/mcp/localfs/",
+      "url": "https://CHANGE_ME_SERVER/mcp/localoctop/",
       "headers": {
         "Authorization": "Bearer CHANGE_ME_MCP_TOKEN"
       },
-      "display_name": "本地文件（octop-local-bridge）",
+      "display_name": "本地文件（localoctop）",
       "enabled": true
     }
   }

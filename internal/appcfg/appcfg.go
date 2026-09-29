@@ -1,7 +1,7 @@
 // Package appcfg persists the desktop shell's user-editable settings as JSON
 // in the OS config directory. It is deliberately separate from the bridge
 // core's Config (an in-memory struct with its own validation): the shell loads
-// AppConfig, maps it into octobridge.Config, and rebuilds the Bridge whenever
+// AppConfig, maps it into localoctop.Config, and rebuilds the Bridge whenever
 // settings change. Tokens are written to disk only — never logged.
 package appcfg
 
@@ -75,7 +75,7 @@ func Default() File {
 }
 
 // EnabledDirs returns the paths of enabled entries, suitable for
-// octobridge.Config.AllowedDirs.
+// localoctop.Config.AllowedDirs.
 func (f File) EnabledDirs() []string {
 	var out []string
 	for _, d := range f.AllowedDirs {
@@ -127,15 +127,15 @@ func (d *Dir) UnmarshalJSON(data []byte) error {
 
 // Path returns the config file location:
 //
-//	Windows: %AppData%\octop-local-bridge\config.json
-//	Linux:   $XDG_CONFIG_HOME/octop-local-bridge/config.json
-//	macOS:   $HOME/Library/Application Support/octop-local-bridge/config.json
+//	Windows: %AppData%\localoctop\config.json
+//	Linux:   $XDG_CONFIG_HOME/localoctop/config.json
+//	macOS:   $HOME/Library/Application Support/localoctop/config.json
 func Path() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("appcfg: locate config dir: %w", err)
 	}
-	return filepath.Join(base, "octop-local-bridge", "config.json"), nil
+	return filepath.Join(base, "localoctop", "config.json"), nil
 }
 
 // AuditPath returns the default audit log location in the same base dir.
@@ -144,7 +144,7 @@ func AuditPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("appcfg: locate data dir: %w", err)
 	}
-	return filepath.Join(base, "octop-local-bridge", "audit.jsonl"), nil
+	return filepath.Join(base, "localoctop", "audit.jsonl"), nil
 }
 
 // Load reads the config file. A missing file is not an error: it returns

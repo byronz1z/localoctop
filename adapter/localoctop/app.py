@@ -27,7 +27,7 @@ from .errors import BridgeProtocolError, CODE_AUTH_FAILED
 from .mcp_app import build_router as build_mcp_router
 from .sessions import SessionRegistry
 
-logger = logging.getLogger("mcp_localfs")
+logger = logging.getLogger("localoctop")
 
 
 def configure_logging(level: str) -> None:
@@ -53,12 +53,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # ASGITransport in tests — still work); the lifespan only owns the
         # orderly shutdown.
         yield
-        endpoint = getattr(mcp_router, "localfs_endpoint", None)
+        endpoint = getattr(mcp_router, "localoctop_endpoint", None)
         if endpoint is not None:
             await endpoint.shutdown()
 
     app = FastAPI(
-        title="mcp-localfs adapter",
+        title="localoctop adapter",
         version=__version__,
         docs_url=None,       # no interactive docs in production
         redoc_url=None,
@@ -179,4 +179,4 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def _env_admin_token() -> str:
     import os
 
-    return os.environ.get("LOCALFS_ADMIN_TOKEN", "")
+    return os.environ.get("LOCALOCTOP_ADMIN_TOKEN", "")

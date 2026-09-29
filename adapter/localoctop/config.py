@@ -4,17 +4,17 @@ Tokens bind an Octop user to their bridge session. 任务书 v1.1 §七评审补
 splits the former single token into two independent namespaces (see
 tokens.py):
 
-  * mcp_token    — Octop connector Bearer auth on /mcp/localfs/
-  * bridge_token — client WSS auth on /mcp-localfs/ws
+  * mcp_token    — Octop connector Bearer auth on /mcp/localoctop/
+  * bridge_token — client WSS auth on /mcp/localoctop/ws
 
 Each direction verifies only its own kind; either can be revoked on its own.
 Only SHA-256 hashes are retained — plaintexts are shown exactly once by the
 issuing admin endpoint.
 
 Bootstrap (dev / single-tenant) via environment:
-  * LOCALFS_TOKENS="userA:tokA,..."          seeds MCP tokens
-  * LOCALFS_BRIDGE_TOKENS="userA:btokA,..."  seeds bridge tokens
-    (when unset, LOCALFS_TOKENS also seeds bridge tokens so existing
+  * LOCALOCTOP_MCP_TOKENS="userA:tokA,..."          seeds MCP tokens
+  * LOCALOCTOP_CLIENT_TOKENS="userA:btokA,..."  seeds bridge tokens
+    (when unset, LOCALOCTOP_MCP_TOKENS also seeds bridge tokens so existing
     single-token deployments keep working until they rotate)
 
 Everything is read once at startup into a Settings dataclass; tests build a
@@ -41,8 +41,8 @@ DEFAULT_IDLE_TIMEOUT = 120.0                # drop a bridge with no traffic
 class Settings:
     # --- auth ---
     # Split-token store: mcp_tokens (Octop Bearer) and bridge_tokens (client
-    # WSS), held as SHA-256 hashes. Seeded from LOCALFS_TOKENS /
-    # LOCALFS_BRIDGE_TOKENS at startup; extended at runtime via the admin
+    # WSS), held as SHA-256 hashes. Seeded from LOCALOCTOP_MCP_TOKENS /
+    # LOCALOCTOP_CLIENT_TOKENS at startup; extended at runtime via the admin
     # issuing endpoint.
     token_store: TokenStore = field(default_factory=TokenStore)
     # Legacy static map, kept only as the source the store is seeded from
@@ -73,8 +73,8 @@ class Settings:
     host: str = "0.0.0.0"  # noqa: S104 — container bind, fronted by a proxy
     port: int = 8080
     # Public base path prefix, kept configurable for reverse-proxy mounting.
-    mcp_path: str = "/mcp/localfs/"
-    ws_path: str = "/mcp-localfs/ws"
+    mcp_path: str = "/mcp/localoctop/"
+    ws_path: str = "/mcp/localoctop/ws"
 
     # ------------------------------------------------------------------ auth
     def authenticate_mcp(self, token: str | None) -> str:
@@ -100,7 +100,7 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
     e = env if env is not None else os.environ
 
     static: dict[str, str] = {}
-    raw_tokens = e.get("LOCALFS_TOKENS", "")
+    raw_tokens = e.get("LOCALOCTOP_MCP_TOKENS", "")
     for pair in raw_tokens.split(","):
         pair = pair.strip()
         if not pair or ":" not in pair:
@@ -111,7 +111,7 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
             static[user_id] = tok
 
     bridge_static: dict[str, str] = {}
-    raw_bridge = e.get("LOCALFS_BRIDGE_TOKENS", "")
+    raw_bridge = e.get("LOCALOCTOP_CLIENT_TOKENS", "")
     for pair in raw_bridge.split(","):
         pair = pair.strip()
         if not pair or ":" not in pair:
@@ -128,13 +128,13 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
         for user_id, tok in bridge_static.items():
             store.seed(KIND_BRIDGE, user_id, tok)
     else:
-        # Back-compat: a deployment that only set LOCALFS_TOKENS keeps its
+        # Back-compat: a deployment that only set LOCALOCTOP_MCP_TOKENS keeps its
         # clients connected until tokens are rotated to the split scheme.
         for user_id, tok in static.items():
             store.seed(KIND_BRIDGE, user_id, tok)
 
     write_allow: set[str] = set()
-    for u in e.get("LOCALFS_WRITE_ALLOWLIST", "").split(","):
+    for u in e.get("LOCALOCTOP_WRITE_ALLOWLIST", "").split(","):
         u = u.strip()
         if u:
             write_allow.add(u)
@@ -142,19 +142,19 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
     return Settings(
         token_store=store,
         static_tokens=static,
-        allow_write=_env_flag(e.get("LOCALFS_ALLOW_WRITE"), False),
+        allow_write=_env_flag(e.get("LOCALOCTOP_ALLOW_WRITE"), False),
         write_allowlist=write_allow,
-        disabled=_env_flag(e.get("LOCALFS_DISABLED"), False),
-        max_read_bytes=_int(e.get("LOCALFS_MAX_READ_BYTES"), DEFAULT_MAX_READ_BYTES),
-        max_write_bytes=_int(e.get("LOCALFS_MAX_WRITE_BYTES"), DEFAULT_MAX_WRITE_BYTES),
-        bridge_timeout=_float(e.get("LOCALFS_BRIDGE_TIMEOUT"), DEFAULT_BRIDGE_TIMEOUT),
-        idle_timeout=_float(e.get("LOCALFS_IDLE_TIMEOUT"), DEFAULT_IDLE_TIMEOUT),
-        audit_log_path=e.get("LOCALFS_AUDIT_LOG", "logs/calls.jsonl"),
-        log_level=e.get("LOCALFS_LOG_LEVEL", "INFO"),
-        host=e.get("LOCALFS_HOST", "0.0.0.0"),
-        port=_int(e.get("LOCALFS_PORT"), 8080),
-        mcp_path=e.get("LOCALFS_MCP_PATH", "/mcp/localfs/"),
-        ws_path=e.get("LOCALFS_WS_PATH", "/mcp-localfs/ws"),
+        disabled=_env_flag(e.get("LOCALOCTOP_DISABLED"), False),
+        max_read_bytes=_int(e.get("LOCALOCTOP_MAX_READ_BYTES"), DEFAULT_MAX_READ_BYTES),
+        max_write_bytes=_int(e.get("LOCALOCTOP_MAX_WRITE_BYTES"), DEFAULT_MAX_WRITE_BYTES),
+        bridge_timeout=_float(e.get("LOCALOCTOP_BRIDGE_TIMEOUT"), DEFAULT_BRIDGE_TIMEOUT),
+        idle_timeout=_float(e.get("LOCALOCTOP_IDLE_TIMEOUT"), DEFAULT_IDLE_TIMEOUT),
+        audit_log_path=e.get("LOCALOCTOP_AUDIT_LOG", "logs/calls.jsonl"),
+        log_level=e.get("LOCALOCTOP_LOG_LEVEL", "INFO"),
+        host=e.get("LOCALOCTOP_HOST", "0.0.0.0"),
+        port=_int(e.get("LOCALOCTOP_PORT"), 8080),
+        mcp_path=e.get("LOCALOCTOP_MCP_PATH", "/mcp/localoctop/"),
+        ws_path=e.get("LOCALOCTOP_WS_PATH", "/mcp/localoctop/ws"),
     )
 
 

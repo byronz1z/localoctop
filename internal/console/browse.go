@@ -75,7 +75,7 @@ func pickDirNative(ctx context.Context) (string, bool, error) {
 	if runtime.GOOS != "windows" {
 		return "", false, errors.New("browse: the native directory picker is Windows-only; type the path manually")
 	}
-	script := filepath.Join(os.TempDir(), "octop-local-bridge-pickdir.ps1")
+	script := filepath.Join(os.TempDir(), "localoctop-pickdir.ps1")
 	if err := os.WriteFile(script, []byte(pickDirPS), 0o600); err != nil {
 		return "", false, fmt.Errorf("browse: write picker script: %w", err)
 	}
@@ -105,7 +105,7 @@ func pickDirNative(ctx context.Context) (string, bool, error) {
 }
 
 // minimalEnv strips the child's environment down to what a Windows GUI
-// subprocess needs, so LOCALFS_* tokens or config-like variables never leak
+// subprocess needs, so LOCALOCTOP_* tokens or config-like variables never leak
 // into it (task constraint: 子进程不得继承 token/配置).
 func minimalEnv() []string {
 	keep := map[string]bool{

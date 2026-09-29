@@ -39,7 +39,7 @@ from .protocol import (
 )
 from .sessions import SessionRegistry
 
-logger = logging.getLogger("mcp_localfs.tools")
+logger = logging.getLogger("localoctop.tools")
 
 # Hard ceiling on a rendered MCP text block, independent of client config, so
 # a compromised/buggy client cannot make us relay arbitrarily large payloads.
@@ -76,7 +76,7 @@ class ToolService:
         if self.settings.disabled:
             await self._audit(user_id, name, req_path, "deny", CODE_NOT_ALLOWED,
                               "connector disabled by administrator", started)
-            raise BridgeProtocolError(CODE_NOT_ALLOWED, "localfs connector is disabled by the administrator")
+            raise BridgeProtocolError(CODE_NOT_ALLOWED, "localoctop connector is disabled by the administrator")
 
         write_enabled = self.settings.user_can_write(user_id)
         try:

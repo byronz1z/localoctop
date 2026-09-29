@@ -14,10 +14,10 @@ import asyncio
 import pytest
 from fastapi import WebSocketDisconnect
 
-from mcp_localfs.bridge_ws import BridgeWSEndpoint
-from mcp_localfs.config import Settings
-from mcp_localfs.sessions import SessionRegistry
-from mcp_localfs.tokens import KIND_BRIDGE
+from localoctop.bridge_ws import BridgeWSEndpoint
+from localoctop.config import Settings
+from localoctop.sessions import SessionRegistry
+from localoctop.tokens import KIND_BRIDGE
 
 from conftest import FakeWebSocket
 

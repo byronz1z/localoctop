@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 import (
 	"encoding/base64"
@@ -22,7 +22,7 @@ func newTestTools(t *testing.T, allowWrite bool, maxRead int64) (*tools, string)
 	// The tool handlers never dial, but Validate() requires the connection
 	// fields (ServerURL/Token are mandatory in production), so supply valid
 	// dummy values — same pattern as TestHandleRequest_Direct.
-	cfg.ServerURL = "wss://adapter.example.com/mcp-localfs/ws"
+	cfg.ServerURL = "wss://adapter.example.com/mcp/localoctop/ws"
 	cfg.Token = "test-token"
 	cfg.AllowedDirs = []string{root}
 	cfg.AllowWrite = allowWrite

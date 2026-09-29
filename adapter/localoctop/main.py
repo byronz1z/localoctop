@@ -1,6 +1,6 @@
 """uvicorn entrypoint.
 
-    python -m mcp_localfs.main
+    python -m localoctop.main
 
 All configuration comes from environment variables — see config.py and the
 README for the full list.

@@ -1,9 +1,9 @@
-package octobridge
+package localoctop
 
 import "fmt"
 
-// Wire error codes shared with the octop-local-bridge adapter. Keep in sync with
-// mcp_localfs/protocol.py on the server side.
+// Wire error codes shared with the localoctop adapter. Keep in sync with
+// localoctop/protocol.py on the server side.
 const (
 	CodeOK             = 0
 	CodeInvalidParams  = -32602 // JSON-RPC: malformed / missing params

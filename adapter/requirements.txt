@@ -1,7 +1,7 @@
-# Runtime dependencies for the octop-local-bridge adapter container.
+# Runtime dependencies for the localoctop adapter container.
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
-# Official MCP SDK: serves the /mcp/localfs/ streamable-HTTP endpoint.
+# Official MCP SDK: serves the /mcp/localoctop/ streamable-HTTP endpoint.
 mcp==2.2.0
 
 # Test dependencies (also listed in requirements-dev.txt; kept here so the

@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/byronz1z/octop-local-bridge"
-	"github.com/byronz1z/octop-local-bridge/internal/appcfg"
+	"github.com/byronz1z/localoctop"
+	"github.com/byronz1z/localoctop/internal/appcfg"
 )
 
 // Status is the live snapshot the status page renders. It is fed by the
@@ -209,7 +209,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		// Remember this connection (deduped, capped) so the console can offer
 		// it in the server dropdown next time.
 		cfg.RememberServer(in.ServerURL, in.Token)
-		// apply validates via octobridge.Config.Validate, persists, and
+		// apply validates via localoctop.Config.Validate, persists, and
 		// rebuilds the bridge; the returned error is user-actionable.
 		if err := s.apply(cfg); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -296,7 +296,7 @@ func (s *Server) PushStatus(connected bool, errMsg string) {
 }
 
 // PushAudit is called by main from the bridge's OnAudit callback.
-func (s *Server) PushAudit(ev octobridge.AuditEvent) {
+func (s *Server) PushAudit(ev localoctop.AuditEvent) {
 	s.st.update(func(x *Status) {
 		x.LastAuditTS = ev.Time
 	})

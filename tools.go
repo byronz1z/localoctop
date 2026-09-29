@@ -1,4 +1,4 @@
-package octobridge
+package localoctop
 
 import (
 	"encoding/base64"

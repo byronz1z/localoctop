@@ -3,10 +3,10 @@ name: Release
 # Tag pushes (v*) build the single EXE on GitHub's official CI and publish a
 # GitHub Release with two assets:
 #
-#   1. octop-local-bridge-<tag>-windows-amd64.zip
-#        octop-local-bridge.exe + examples/ (Octop connector template + 3-step guide)
+#   1. localoctop-<tag>-windows-amd64.zip
+#        localoctop.exe + examples/ (Octop connector template + 3-step guide)
 #        — the out-of-the-box desktop package.
-#   2. octop-local-bridge-server-<tag>.zip
+#   2. localoctop-server-<tag>.zip
 #        the adapter/ source tree — server-side deployment bundle.
 #
 # Local builds are self-test evidence only — they are never a deliverable.
@@ -40,27 +40,27 @@ jobs:
       - name: Compile single EXE
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          go build -ldflags "-s -w" -o dist/octop-local-bridge.exe ./cmd/bridge
+          go build -ldflags "-s -w" -o dist/localoctop.exe ./cmd/bridge
 
-      - name: Package main zip (octop-local-bridge.exe + examples)
+      - name: Package main zip (localoctop.exe + examples)
         run: |
           $tag = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force dist/pkg/examples | Out-Null
-          Copy-Item dist/octop-local-bridge.exe dist/pkg/octop-local-bridge.exe
+          Copy-Item dist/localoctop.exe dist/pkg/localoctop.exe
           Copy-Item examples/* dist/pkg/examples/ -Recurse
-          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/octop-local-bridge-$tag-windows-amd64.zip"
+          Compress-Archive -Path dist/pkg/* -DestinationPath "dist/localoctop-$tag-windows-amd64.zip"
 
       - name: Package adapter zip
         run: |
           $tag = "${{ github.ref_name }}"
           # Clean CI checkout has no runtime artifacts under adapter/ (all gitignored),
           # so zip the tracked directory directly; -Force keeps re-runs idempotent.
-          Compress-Archive -Path adapter -DestinationPath "dist/octop-local-bridge-server-$tag.zip" -Force
+          Compress-Archive -Path adapter -DestinationPath "dist/localoctop-server-$tag.zip" -Force
 
       - name: sha256 checksums
         run: |
           $tag = "${{ github.ref_name }}"
-          foreach ($zip in @("octop-local-bridge-$tag-windows-amd64.zip", "octop-local-bridge-server-$tag.zip")) {
+          foreach ($zip in @("localoctop-$tag-windows-amd64.zip", "localoctop-server-$tag.zip")) {
             $h = (Get-FileHash "dist/$zip" -Algorithm SHA256).Hash.ToLower()
             Set-Content -Path "dist/$zip.sha256" -Value "$h  $zip" -NoNewline
           }

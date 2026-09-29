@@ -1,4 +1,4 @@
-module github.com/byronz1z/octop-local-bridge
+module github.com/byronz1z/localoctop
 
 go 1.22
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal self-verification for the octop-local-bridge adapter — runs without pytest.
+"""Minimal self-verification for the localoctop adapter — runs without pytest.
 
 Covers acceptance criteria #1 and #3 at smoke level:
   * app assembles and /healthz answers
@@ -45,12 +45,12 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 async def main() -> int:
     import httpx
 
-    from mcp_localfs.app import create_app
-    from mcp_localfs.audit import AuditLog
-    from mcp_localfs.config import Settings
-    from mcp_localfs.sessions import BridgeSession, SessionRegistry
-    from mcp_localfs.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
-    from mcp_localfs.tools import ToolService
+    from localoctop.app import create_app
+    from localoctop.audit import AuditLog
+    from localoctop.config import Settings
+    from localoctop.sessions import BridgeSession, SessionRegistry
+    from localoctop.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
+    from localoctop.tools import ToolService
 
     tmp = Path(tempfile.mkdtemp(prefix="lfsb-verify-"))
     audit_path = tmp / "calls.jsonl"
@@ -80,19 +80,19 @@ async def main() -> int:
         check("healthz 200", r.status_code == 200 and r.json()["status"] == "ok", str(r.status_code))
 
         # 2) initialize handshake (SDK transport mints the Mcp-Session-Id)
-        r = await client.post("/mcp/localfs/", headers=auth, json={
+        r = await client.post("/mcp/localoctop/", headers=auth, json={
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05",
                        "capabilities": {}, "clientInfo": {"name": "verify", "version": "1"}}})
         body = r.json() if r.status_code == 200 else {}
         sid = r.headers.get("mcp-session-id", "")
         check("initialize handshake",
-              r.status_code == 200 and body.get("result", {}).get("serverInfo", {}).get("name") == "mcp-localfs" and sid,
+              r.status_code == 200 and body.get("result", {}).get("serverInfo", {}).get("name") == "localoctop" and sid,
               json.dumps(body)[:200])
         session_headers = {**auth, "Mcp-Session-Id": sid}
 
         # 3) tools/list -> exactly 4 read-only tools
-        r = await client.post("/mcp/localfs/", headers=session_headers, json={
+        r = await client.post("/mcp/localoctop/", headers=session_headers, json={
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         names = sorted(t["name"] for t in r.json().get("result", {}).get("tools", []))
         check("tools/list = 4 read-only tools",
@@ -100,14 +100,14 @@ async def main() -> int:
               str(names))
 
         # 4) auth enforced
-        r = await client.post("/mcp/localfs/", json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        r = await client.post("/mcp/localoctop/", json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         check("auth required (401)", r.status_code == 401, str(r.status_code))
-        r = await client.post("/mcp/localfs/", headers={"Authorization": "Bearer nope"},
+        r = await client.post("/mcp/localoctop/", headers={"Authorization": "Bearer nope"},
                               json={"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         check("bad token rejected (401)", r.status_code == 401, str(r.status_code))
 
         # 5) no bridge connected -> 4101
-        r = await client.post("/mcp/localfs/", headers=session_headers, json={
+        r = await client.post("/mcp/localoctop/", headers=session_headers, json={
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": {"name": "read_file", "arguments": {"path": "a.txt"}}})
         check("no-bridge error 4101", r.json().get("error", {}).get("code") == 4101, json.dumps(r.json())[:200])

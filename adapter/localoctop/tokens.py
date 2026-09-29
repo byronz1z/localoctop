@@ -4,7 +4,7 @@
 independent token kinds:
 
   * **mcp_token**    — presented by Octop's connector as `Authorization:
-                       Bearer` on the /mcp/localfs/ endpoint.
+                       Bearer` on the /mcp/localoctop/ endpoint.
   * **bridge_token** — presented by the employee's client on the outbound
                        WSS bridge (?token= or Authorization header).
 

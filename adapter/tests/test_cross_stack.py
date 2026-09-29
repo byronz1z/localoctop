@@ -1,9 +1,9 @@
 """Cross-stack integration test: the *real* Go bridge binary (built from
-../localfsbridge) talks over a real WebSocket to the *real* Python adapter,
+../localoctop) talks over a real WebSocket to the *real* Python adapter,
 driven through httpx against the assembled FastAPI app.
 
 This proves the interface contract in 任务书 §三 holds on both sides:
-  * client dials ws://.../mcp-localfs/ws?token=...
+  * client dials ws://.../mcp/localoctop/ws?token=...
   * register frame authenticates and binds the session
   * MCP initialize / tools/list / tools/call round-trip
   * traversal is denied end-to-end with code 4001
@@ -28,14 +28,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from mcp_localfs.app import create_app
-from mcp_localfs.config import Settings
-from mcp_localfs.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
+from localoctop.app import create_app
+from localoctop.config import Settings
+from localoctop.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# The bridge source lives at the octop-local-bridge repo root (adapter/ is a
-# subdirectory of it); LOCALFSBRIDGE_DIR overrides for unusual layouts.
-BRIDGE_DIR = Path(os.environ.get("LOCALFSBRIDGE_DIR", str(REPO_ROOT.parent)))
+# The bridge source lives at the localoctop repo root (adapter/ is a
+# subdirectory of it); LOCALOCTOP_BRIDGE_DIR overrides for unusual layouts.
+BRIDGE_DIR = Path(os.environ.get("LOCALOCTOP_BRIDGE_DIR", str(REPO_ROOT.parent)))
 
 
 def _it_token_store() -> TokenStore:
@@ -55,7 +55,7 @@ def _go_available() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not (_go_available() and BRIDGE_DIR.is_dir()),
-    reason="go toolchain or ../localfsbridge source not available",
+    reason="go toolchain or ../localoctop source not available",
 )
 
 
@@ -129,7 +129,7 @@ async def test_full_stack_read_and_traversal_denial(bridge_binary, tmp_path):
         # The published cmd/bridge serves tool calls from flags only in
         # --headless mode (default mode is the desktop console+tray app).
         "-headless",
-        "-server", f"ws://127.0.0.1:{port}/mcp-localfs/ws",
+        "-server", f"ws://127.0.0.1:{port}/mcp/localoctop/ws",
         "-token", "it-token",
         "-dir", str(workdir),
         "-audit", str(audit_path),
@@ -156,28 +156,28 @@ async def test_full_stack_read_and_traversal_denial(bridge_binary, tmp_path):
 
             # MCP handshake (SDK transport: initialize -> Mcp-Session-Id ->
             # notifications/initialized).
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                     "protocolVersion": "2024-11-05", "capabilities": {},
                     "clientInfo": {"name": "octop-it", "version": "1"}}})
             assert r.status_code == 200
-            assert r.json()["result"]["serverInfo"]["name"] == "mcp-localfs"
+            assert r.json()["result"]["serverInfo"]["name"] == "localoctop"
             sid = r.headers.get("mcp-session-id")
             assert sid, "initialize must return Mcp-Session-Id"
             auth = {**auth, "Mcp-Session-Id": sid}
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "method": "notifications/initialized"})
             assert r.status_code == 202
 
             # tools/list -> exactly 4 read-only tools.
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
             tools = r.json()["result"]["tools"]
             assert sorted(t["name"] for t in tools) == [
                 "get_file_info", "list_directory", "read_file", "search_files"]
 
             # read_file through the whole stack.
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
                 "params": {"name": "read_file", "arguments": {"path": "hello.txt"}}})
             body = r.json()
@@ -187,14 +187,14 @@ async def test_full_stack_read_and_traversal_denial(bridge_binary, tmp_path):
             assert body["result"]["isError"] is False
 
             # list_directory.
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": {"name": "list_directory", "arguments": {"path": "."}}})
             listing = json.dumps(r.json()["result"]["content"][0]["text"])
             assert "hello.txt" in listing
 
             # search_files.
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 5, "method": "tools/call",
                 "params": {"name": "search_files",
                            "arguments": {"path": ".", "pattern": "*.md"}}})
@@ -202,7 +202,7 @@ async def test_full_stack_read_and_traversal_denial(bridge_binary, tmp_path):
 
             # Traversal denial must travel the full stack as an isError tool
             # result carrying the client's 4001 message.
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 6, "method": "tools/call",
                 "params": {"name": "read_file",
                            "arguments": {"path": "../../../etc/passwd"}}})
@@ -214,14 +214,14 @@ async def test_full_stack_read_and_traversal_denial(bridge_binary, tmp_path):
 
             # Absolute path outside the whitelist.
             outside = str(Path(sys.executable))
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 7, "method": "tools/call",
                 "params": {"name": "read_file", "arguments": {"path": outside}}})
             body = r.json()
             assert body["result"]["isError"] is True
 
             # write_file denied while the switch is off.
-            r = await client.post("/mcp/localfs/", headers=auth, json={
+            r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 8, "method": "tools/call",
                 "params": {"name": "write_file",
                            "arguments": {"path": "x.txt", "content": "no"}}})

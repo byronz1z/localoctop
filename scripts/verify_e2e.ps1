@@ -1,8 +1,8 @@
 # verify_e2e.ps1 — end-to-end acceptance for T-06 (adapter <-> bridge <-> MCP probe).
 #
 # Three stages, all real processes on this machine:
-#   1. start the octop-local-bridge adapter (uvicorn, from adapter/.venv)
-#   2. start the real bridge EXE (dist/octop-local-bridge.exe --headless) dialing into it
+#   1. start the localoctop adapter (uvicorn, from adapter/.venv)
+#   2. start the real bridge EXE (dist/localoctop.exe --headless) dialing into it
 #   3. probe the MCP endpoint exactly like Octop's custom-MCP connector
 #      (initialize / tools/list / tools/call), then verify audit trails on
 #      BOTH sides (bridge JSONL + adapter JSONL).
@@ -11,7 +11,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\verify_e2e.ps1
 # Optional overrides:
 #   -Port 18080            adapter listen port
-#   -BridgeExe dist\octop-local-bridge.exe
+#   -BridgeExe dist\localoctop.exe
 #
 # Exits 0 only when every stage and every audit check passes.
 
@@ -27,11 +27,11 @@ $Py = Join-Path $AdapterDir ".venv\Scripts\python.exe"
 
 # --- locate the bridge EXE (dist artifact first; build it when missing) ----
 if (-not $BridgeExe) {
-    $BridgeExe = Join-Path $RepoRoot "dist\octop-local-bridge.exe"
+    $BridgeExe = Join-Path $RepoRoot "dist\localoctop.exe"
     if (-not (Test-Path $BridgeExe)) {
-        Write-Host "[e2e] dist\octop-local-bridge.exe not found — building from source (go build)"
+        Write-Host "[e2e] dist\localoctop.exe not found — building from source (go build)"
         Push-Location $RepoRoot
-        try { go build -o dist\octop-local-bridge.exe .\cmd\bridge } finally { Pop-Location }
+        try { go build -o dist\localoctop.exe .\cmd\bridge } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { throw "go build failed" }
     }
 }
@@ -61,17 +61,17 @@ $failed = $false
 function Step([string]$name) { Write-Host "" ; Write-Host "== $name" }
 
 try {
-    Step "stage 1: start octop-local-bridge adapter on port $Port"
+    Step "stage 1: start localoctop adapter on port $Port"
     # Children of this script inherit the environment — the adapter reads all
-    # of its configuration from LOCALFS_* variables.
-    $env:LOCALFS_HOST = "127.0.0.1"
-    $env:LOCALFS_PORT = "$Port"
-    $env:LOCALFS_TOKENS = "e2e-user:$McpToken"
-    $env:LOCALFS_BRIDGE_TOKENS = "e2e-user:$BridgeToken"
-    $env:LOCALFS_AUDIT_LOG = $AdapterAudit
-    $env:LOCALFS_LOG_LEVEL = "INFO"
+    # of its configuration from LOCALOCTOP_* variables.
+    $env:LOCALOCTOP_HOST = "127.0.0.1"
+    $env:LOCALOCTOP_PORT = "$Port"
+    $env:LOCALOCTOP_MCP_TOKENS = "e2e-user:$McpToken"
+    $env:LOCALOCTOP_CLIENT_TOKENS = "e2e-user:$BridgeToken"
+    $env:LOCALOCTOP_AUDIT_LOG = $AdapterAudit
+    $env:LOCALOCTOP_LOG_LEVEL = "INFO"
 
-    $adapterProc = Start-Process -FilePath $Py -ArgumentList "-m", "mcp_localfs.main" `
+    $adapterProc = Start-Process -FilePath $Py -ArgumentList "-m", "localoctop.main" `
         -WorkingDirectory $AdapterDir `
         -RedirectStandardOutput $AdapterLog -RedirectStandardError (Join-Path $Work "adapter.err.log") `
         -PassThru -WindowStyle Hidden
@@ -87,9 +87,9 @@ try {
     if (-not $ok) { throw "adapter did not become healthy within 30s (see $AdapterLog)" }
     Write-Host "  adapter healthy: $BaseUrl/healthz"
 
-    Step "stage 2: start bridge EXE (headless) dialing ws://127.0.0.1:$Port/mcp-localfs/ws"
+    Step "stage 2: start bridge EXE (headless) dialing ws://127.0.0.1:$Port/mcp/localoctop/ws"
     $bridgeProc = Start-Process -FilePath $BridgeExe `
-        -ArgumentList "-headless", "-server", "ws://127.0.0.1:$Port/mcp-localfs/ws", `
+        -ArgumentList "-headless", "-server", "ws://127.0.0.1:$Port/mcp/localoctop/ws", `
                       "-token", $BridgeToken, "-dir", $DataDir, "-audit", $BridgeAudit `
         -RedirectStandardOutput (Join-Path $Work "bridge.out.log") -RedirectStandardError $BridgeLog `
         -PassThru -WindowStyle Hidden

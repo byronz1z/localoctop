@@ -18,7 +18,7 @@ from typing import Any
 
 from .errors import BridgeProtocolError, CODE_NO_BRIDGE, CODE_TIMEOUT
 
-logger = logging.getLogger("mcp_localfs.sessions")
+logger = logging.getLogger("localoctop.sessions")
 
 
 @dataclass

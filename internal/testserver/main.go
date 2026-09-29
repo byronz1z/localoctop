@@ -1,7 +1,7 @@
-// Command testserver is the local integration partner for the octobridge (development-only)
-// client. It emulates the octop-local-bridge adapter's WebSocket side:
+// Command testserver is the local integration partner for the localoctop (development-only)
+// client. It emulates the localoctop adapter's WebSocket side:
 //
-//   - Accepts outbound client connections on /mcp-localfs/ws?token=...
+//   - Accepts outbound client connections on /mcp/localoctop/ws?token=...
 //   - Validates the token against a configured map (default: "dev-token")
 //   - Expects a {"type":"register",...} frame right after the handshake
 //   - Serves a tiny HTTP console on / that lets a human fire tool calls at
@@ -13,7 +13,7 @@
 //
 //	go run ./internal/testserver -addr 127.0.0.1:18443 -token dev-token
 //
-// Then start the bridge against ws://127.0.0.1:18443/mcp-localfs/ws?token=dev-token
+// Then start the bridge against ws://127.0.0.1:18443/mcp/localoctop/ws?token=dev-token
 // and exercise it:
 //
 //	curl -s -X POST http://127.0.0.1:18443/call \
@@ -35,14 +35,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/byronz1z/octop-local-bridge"
+	"github.com/byronz1z/localoctop"
 )
 
 // session is one connected bridge client.
 type session struct {
 	token     string
 	clientID  string
-	conn      *octobridge.WSConn
+	conn      *localoctop.WSConn
 	connected time.Time
 
 	mu      sync.Mutex
@@ -77,7 +77,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp-localfs/ws", s.handleWS)
+	mux.HandleFunc("/mcp/localoctop/ws", s.handleWS)
 	mux.HandleFunc("/call", s.handleCall)
 	mux.HandleFunc("/sessions", s.handleSessions)
 	mux.HandleFunc("/", s.handleIndex)
@@ -93,7 +93,7 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	logger.Printf("mock adapter listening on http://%s (ws path: /mcp-localfs/ws)", *addr)
+	logger.Printf("mock adapter listening on http://%s (ws path: /mcp/localoctop/ws)", *addr)
 	if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Fatalf("listen: %v", err)
 	}
@@ -116,7 +116,7 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := octobridge.UpgradeWS(w, r, 24<<20)
+	conn, err := localoctop.UpgradeWS(w, r, 24<<20)
 	if err != nil {
 		s.log.Printf("ws upgrade failed: %v", err)
 		return
@@ -274,11 +274,11 @@ func (s *server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, `octobridge mock adapter
+	fmt.Fprint(w, `localoctop mock adapter
 --------------------------
 GET  /sessions   list connected bridge sessions
 POST /call       {"token","method","params"} -> proxy a tool call to the bridge
-WS   /mcp-localfs/ws?token=...   bridge client endpoint
+WS   /mcp/localoctop/ws?token=...   bridge client endpoint
 `)
 }
 

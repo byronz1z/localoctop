@@ -36,7 +36,7 @@ func TestLoadMissingReturnsDefault(t *testing.T) {
 func TestSaveLoadRoundTrip(t *testing.T) {
 	withTempConfigDir(t)
 	in := File{
-		ServerURL:   "wss://example.com/mcp-localfs/ws",
+		ServerURL:   "wss://example.com/mcp/localoctop/ws",
 		Token:       "secret-token",
 		AllowedDirs: []Dir{{Path: "~/Documents", Enabled: true}, {Path: "D:/tmp", Enabled: false}},
 		AllowWrite:  true,
