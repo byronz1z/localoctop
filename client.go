@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Bridge is the outbound WSS client. It dials the mcp-localfs adapter,
+// Bridge is the outbound WSS client. It dials the octop-local-bridge adapter,
 // registers under its token, and serves tool calls until the context is
 // cancelled. On any disconnect it reconnects with exponential backoff
 // (1s → 2s → … → 60s cap) and re-registers automatically.

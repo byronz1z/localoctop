@@ -1,9 +1,9 @@
 # Append this service to the existing Octop docker-compose stack.
-# mcp-localfs runs as its own container — it never enters the octop image.
+# The octop-local-bridge adapter runs as its own container — it never enters the octop image.
 services:
-  mcp-localfs:
+  octop-local-bridge-server:
     build: .
-    image: mcp-localfs:1.0.0
+    image: octop-local-bridge-server:1.0.0
     restart: unless-stopped
     environment:
       # MCP tokens (Octop connector Bearer) — "userA:tokA,userB:tokB".
@@ -21,7 +21,7 @@ services:
       LOCALFS_AUDIT_LOG: /app/logs/calls.jsonl
       LOCALFS_LOG_LEVEL: INFO
     volumes:
-      - mcp-localfs-audit:/app/logs
+      - octop-local-bridge-audit:/app/logs
     networks:
       - octop-net
     # Bind to loopback only when a reverse proxy (Caddy/Nginx/Traefik) fronts
@@ -35,7 +35,7 @@ services:
       start_period: 10s
 
 volumes:
-  mcp-localfs-audit:
+  octop-local-bridge-audit:
 
 networks:
   octop-net:

@@ -1,4 +1,4 @@
-# mcp-localfs adapter — standalone container image.
+# octop-local-bridge adapter — standalone container image.
 # Self-contained: copies only this directory; no Octop code enters the image.
 FROM python:3.12-slim
 

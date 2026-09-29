@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// mockAdapter is a minimal in-process stand-in for the mcp-localfs adapter's
+// mockAdapter is a minimal in-process stand-in for the octop-local-bridge adapter's
 // WS endpoint: it accepts a token, reads the register frame, and lets the
 // test push tool calls and read responses.
 type mockAdapter struct {

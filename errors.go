@@ -2,7 +2,7 @@ package octobridge
 
 import "fmt"
 
-// Wire error codes shared with the mcp-localfs adapter. Keep in sync with
+// Wire error codes shared with the octop-local-bridge adapter. Keep in sync with
 // mcp_localfs/protocol.py on the server side.
 const (
 	CodeOK             = 0

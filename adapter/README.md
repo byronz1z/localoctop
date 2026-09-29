@@ -1,4 +1,4 @@
-# mcp-localfs 适配器（Python / FastAPI）
+# octop-local-bridge 适配器（Python / FastAPI）
 
 独立容器，部署在云端。两个职责：
 
@@ -117,7 +117,7 @@ python scripts/verify.py
 powershell -ExecutionPolicy Bypass -File scripts\verify_e2e.ps1
 ```
 
-三段全真实进程：起适配器 → 起 `dist/bridge.exe --headless` 拨入 →
+三段全真实进程：起适配器 → 起 `dist/octop-local-bridge.exe --headless` 拨入 →
 按 Octop 自定义 MCP 连接器行为探测（`initialize` / `tools/list` /
 `tools/call`，含穿越拒绝与写门控断言）→ 校验**两侧**审计日志
 （桥 JSONL + 适配器 JSONL 均有 allow/deny 记录）。
@@ -125,17 +125,17 @@ powershell -ExecutionPolicy Bypass -File scripts\verify_e2e.ps1
 ## Docker 部署（独立容器，不进 octop 主镜像）
 
 ```bash
-docker build -t mcp-localfs:1.0.0 .
-docker run -d --name mcp-localfs \
+docker build -t octop-local-bridge-server:1.0.0 .
+docker run -d --name octop-local-bridge-server \
   -p 127.0.0.1:8080:8080 \
   -e LOCALFS_TOKENS="alice:$(openssl rand -hex 24)" \
   -e LOCALFS_BRIDGE_TOKENS="alice:$(openssl rand -hex 24)" \
   -e LOCALFS_AUDIT_LOG=/app/logs/calls.jsonl \
-  -v mcp-localfs-audit:/app/logs \
-  mcp-localfs:1.0.0
+  -v octop-local-bridge-audit:/app/logs \
+  octop-local-bridge-server:1.0.0
 ```
 
-或把 `docker-compose.example.yml` 里的 `mcp-localfs` service 追加进现有
+或把 `docker-compose.example.yml` 里的 `octop-local-bridge-server` service 追加进现有
 compose。放在反向代理（Caddy/Nginx/Traefik）之后，对外提供
 `https://<server>/mcp/localfs/` 与 `wss://<server>/mcp-localfs/ws`，
 并终结 TLS。
@@ -176,7 +176,7 @@ Octop `src/octop/infra/connectors/custom_mcp.py` 支持 `transport=streamable_ht
    `serverInfo.name=mcp-localfs` 与 4 个只读工具。
 4. **调用链**：Octop `tools/call` → 适配器按 mcp_token 找到该用户的桥会话 →
    经 WSS 下发到员工本机 → 桥在白名单内执行并回传 → 适配器渲染成 MCP content。
-5. **员工侧**：运行本仓 `bridge.exe`，用 **bridge_token** 拨入
+5. **员工侧**：运行本仓 `octop-local-bridge.exe`，用 **bridge_token** 拨入
    `wss://<server>/mcp-localfs/ws`。未连接时 tools/call 返回错误码 `4101`。
 
 ### 安全边界（服务端层）

@@ -12,16 +12,16 @@
 ## 第 1 步：跑起云端适配器容器
 
 在服务器上（本仓 `adapter/` 目录，克隆仓库或下载 Release 资产
-`mcp-localfs-adapter-*.zip` 即得）：
+`octop-local-bridge-server-*.zip` 即得）：
 
 ```bash
-docker build -t mcp-localfs:1.0.0 .
-docker run -d --name mcp-localfs -p 127.0.0.1:8080:8080 \
+docker build -t octop-local-bridge-server:1.0.0 .
+docker run -d --name octop-local-bridge-server -p 127.0.0.1:8080:8080 \
   -e LOCALFS_TOKENS="你的用户名:CHANGE_ME_MCP_TOKEN" \
   -e LOCALFS_BRIDGE_TOKENS="你的用户名:CHANGE_ME_BRIDGE_TOKEN" \
   -e LOCALFS_AUDIT_LOG=/app/logs/calls.jsonl \
-  -v mcp-localfs-audit:/app/logs \
-  mcp-localfs:1.0.0
+  -v octop-local-bridge-audit:/app/logs \
+  octop-local-bridge-server:1.0.0
 ```
 
 放在反向代理（Caddy/Nginx/Traefik）之后，对外提供
@@ -30,7 +30,7 @@ docker run -d --name mcp-localfs -p 127.0.0.1:8080:8080 \
 
 ## 第 2 步：桥 EXE 引导页填地址
 
-双击运行本包中的 `bridge.exe`（或已安装版本的桌面模式），浏览器自动打开
+双击运行本包中的 `octop-local-bridge.exe`（或已安装版本的桌面模式），浏览器自动打开
 控制台引导页：
 
 1. 选择白名单目录（AI 只能看到这些目录）；
@@ -41,7 +41,7 @@ docker run -d --name mcp-localfs -p 127.0.0.1:8080:8080 \
 无人值守环境可用 headless 模式：
 
 ```powershell
-.\bridge.exe --headless -server "wss://你的域名/mcp-localfs/ws" `
+.\octop-local-bridge.exe --headless -server "wss://你的域名/mcp-localfs/ws" `
   -token CHANGE_ME_BRIDGE_TOKEN -dir "D:\我的资料"
 ```
 

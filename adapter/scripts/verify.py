@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal self-verification for mcp-localfs — runs without pytest.
+"""Minimal self-verification for the octop-local-bridge adapter — runs without pytest.
 
 Covers acceptance criteria #1 and #3 at smoke level:
   * app assembles and /healthz answers

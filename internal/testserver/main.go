@@ -1,5 +1,5 @@
 // Command testserver is the local integration partner for the octobridge (development-only)
-// client. It emulates the mcp-localfs adapter's WebSocket side:
+// client. It emulates the octop-local-bridge adapter's WebSocket side:
 //
 //   - Accepts outbound client connections on /mcp-localfs/ws?token=...
 //   - Validates the token against a configured map (default: "dev-token")

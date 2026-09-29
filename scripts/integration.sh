@@ -32,7 +32,7 @@ post_call() {
 
 echo "== build =="
 go build -o "${BIN}/testserver" ./internal/testserver
-go build -o "${BIN}/bridge" ./cmd/bridge
+go build -o "${BIN}/octop-local-bridge" ./cmd/bridge
 check "go build" 0
 
 echo "== start mock adapter =="
@@ -43,7 +43,7 @@ curl -sS -m 2 "${BASE}/sessions" >/dev/null; check "mock adapter up" 0
 
 echo "== start bridge client =="
 AUDIT="${TMP}/audit.log"
-"${BIN}/bridge" --headless -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >"${TMP}/bridge.log" 2>&1 &
+"${BIN}/octop-local-bridge" --headless -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >"${TMP}/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 for _ in $(seq 1 40); do
   n=$(curl -sS -m 2 "${BASE}/sessions" | grep -o '"client_id"' | wc -l)
@@ -87,7 +87,7 @@ echo "== reconnect =="
 kill "${BRIDGE_PID}"; sleep 1
 n=$(curl -sS -m 2 "${BASE}/sessions" | grep -o '"client_id"' | wc -l)
 [ "${n:-0}" -eq 0 ]; check "session dropped after kill" $?
-"${BIN}/bridge" --headless -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >>"${TMP}/bridge.log" 2>&1 &
+"${BIN}/octop-local-bridge" --headless -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token it-token -dir "${TMP}" -audit "${AUDIT}" >>"${TMP}/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 for _ in $(seq 1 40); do
   n=$(curl -sS -m 2 "${BASE}/sessions" | grep -o '"client_id"' | wc -l)
@@ -98,7 +98,7 @@ R=$(post_call '{"token":"it-token","method":"read_file","params":{"path":"hello.
 echo "$R" | grep -q 'integration-ok'; check "call works after reconnect" $?
 
 echo "== bad token =="
-"${BIN}/bridge" -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token wrong -dir "${TMP}" >"${TMP}/bridge-bad.log" 2>&1 &
+"${BIN}/octop-local-bridge" -server "ws://127.0.0.1:${PORT}/mcp-localfs/ws" -token wrong -dir "${TMP}" >"${TMP}/bridge-bad.log" 2>&1 &
 BAD_PID=$!
 sleep 2
 kill -0 "${BAD_PID}" 2>/dev/null; check "bad-token bridge keeps retrying" $?

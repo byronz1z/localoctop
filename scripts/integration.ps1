@@ -45,7 +45,7 @@ try {
     Write-Host "== build =="
     go build -o (Join-Path $bin "testserver.exe") ./internal/testserver
     if ($LASTEXITCODE -ne 0) { throw "go build testserver failed" }
-    go build -o (Join-Path $bin "bridge.exe") ./cmd/bridge
+    go build -o (Join-Path $bin "octop-local-bridge.exe") ./cmd/bridge
     if ($LASTEXITCODE -ne 0) { throw "go build bridge failed" }
     Check "go build" $true
 
@@ -62,7 +62,7 @@ try {
 
     Write-Host "== start bridge client =="
     $auditLog = Join-Path $tmp "audit.log"
-    $bridge = Start-Process -FilePath (Join-Path $bin "bridge.exe") `
+    $bridge = Start-Process -FilePath (Join-Path $bin "octop-local-bridge.exe") `
         -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge.log")
     $deadline = (Get-Date).AddSeconds(10)
@@ -111,7 +111,7 @@ try {
     Start-Sleep -Milliseconds 500
     $s = (Invoke-WebRequest -Uri "$base/sessions" -UseBasicParsing -TimeoutSec 2).Content | ConvertFrom-Json
     Check "session dropped after kill" ($s.sessions.Count -eq 0)
-    $bridge = Start-Process -FilePath (Join-Path $bin "bridge.exe") `
+    $bridge = Start-Process -FilePath (Join-Path $bin "octop-local-bridge.exe") `
         -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "it-token", "-dir", $tmp, "-audit", $auditLog `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge2.log")
     $deadline = (Get-Date).AddSeconds(10)
@@ -126,7 +126,7 @@ try {
     Check "call works after reconnect" ($r.result.text -eq "integration-ok")
 
     Write-Host "== bad token =="
-    $bad = Start-Process -FilePath (Join-Path $bin "bridge.exe") `
+    $bad = Start-Process -FilePath (Join-Path $bin "octop-local-bridge.exe") `
         -ArgumentList "--headless", "-server", "ws://127.0.0.1:$port/mcp-localfs/ws", "-token", "wrong", "-dir", $tmp `
         -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $tmp "bridge-bad.log")
     Start-Sleep -Seconds 2

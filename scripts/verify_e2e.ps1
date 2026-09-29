@@ -1,8 +1,8 @@
 # verify_e2e.ps1 — end-to-end acceptance for T-06 (adapter <-> bridge <-> MCP probe).
 #
 # Three stages, all real processes on this machine:
-#   1. start the mcp-localfs adapter (uvicorn, from adapter/.venv)
-#   2. start the real bridge EXE (dist/bridge.exe --headless) dialing into it
+#   1. start the octop-local-bridge adapter (uvicorn, from adapter/.venv)
+#   2. start the real bridge EXE (dist/octop-local-bridge.exe --headless) dialing into it
 #   3. probe the MCP endpoint exactly like Octop's custom-MCP connector
 #      (initialize / tools/list / tools/call), then verify audit trails on
 #      BOTH sides (bridge JSONL + adapter JSONL).
@@ -11,7 +11,7 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\verify_e2e.ps1
 # Optional overrides:
 #   -Port 18080            adapter listen port
-#   -BridgeExe dist\bridge.exe
+#   -BridgeExe dist\octop-local-bridge.exe
 #
 # Exits 0 only when every stage and every audit check passes.
 
@@ -27,11 +27,11 @@ $Py = Join-Path $AdapterDir ".venv\Scripts\python.exe"
 
 # --- locate the bridge EXE (dist artifact first; build it when missing) ----
 if (-not $BridgeExe) {
-    $BridgeExe = Join-Path $RepoRoot "dist\bridge.exe"
+    $BridgeExe = Join-Path $RepoRoot "dist\octop-local-bridge.exe"
     if (-not (Test-Path $BridgeExe)) {
-        Write-Host "[e2e] dist\bridge.exe not found — building from source (go build)"
+        Write-Host "[e2e] dist\octop-local-bridge.exe not found — building from source (go build)"
         Push-Location $RepoRoot
-        try { go build -o dist\bridge.exe .\cmd\bridge } finally { Pop-Location }
+        try { go build -o dist\octop-local-bridge.exe .\cmd\bridge } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { throw "go build failed" }
     }
 }
@@ -61,7 +61,7 @@ $failed = $false
 function Step([string]$name) { Write-Host "" ; Write-Host "== $name" }
 
 try {
-    Step "stage 1: start mcp-localfs adapter on port $Port"
+    Step "stage 1: start octop-local-bridge adapter on port $Port"
     # Children of this script inherit the environment — the adapter reads all
     # of its configuration from LOCALFS_* variables.
     $env:LOCALFS_HOST = "127.0.0.1"

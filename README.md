@@ -1,7 +1,7 @@
 # Octop Local Bridge
 
 本地文件访问桥：运行在员工本机的**出站** WSS 客户端。它主动连接云端
-`mcp-localfs` 适配器，把云端 AI 助手（经 Octop「自定义 MCP 连接器」）发来的
+`octop-local-bridge` 适配器，把云端 AI 助手（经 Octop「自定义 MCP 连接器」）发来的
 文件工具调用，落地成对**白名单目录**的受控访问，并把每一次访问记入本地审计日志。
 
 交付形态是**单个 EXE**：桥核心 + 内嵌本地 Web 控制台 + 系统托盘，同一进程，
@@ -9,7 +9,12 @@
 
 - 模块名：`github.com/byronz1z/octop-local-bridge`
 - 许可证：Apache-2.0
-- 版本：v0.2.1（预览期）
+- 版本：v0.2.2（预览期）
+
+## 版本锁线
+
+同仓库单 tag 双资产发布：客户端与服务端版本号永远一致，升级两侧一起升；
+同 minor 版本协议互容承诺；协议破坏性变更才升 major。
 
 ## 是什么
 
@@ -20,7 +25,7 @@
 Octop「自定义 MCP 连接器」
    |  https://<server>/mcp/localfs/
    v
-mcp-localfs 适配器（云端容器，本仓 adapter/）
+octop-local-bridge 适配器（云端容器，本仓 adapter/）
    |  WebSocket（由本程序主动拨出，防火墙友好）
    |  wss://<server>/mcp-localfs/ws + bridge_token
    v
@@ -39,7 +44,7 @@ Octop Local Bridge（本机，单 EXE）
 [`examples/README.md`](examples/README.md)：
 
 1. **跑适配器容器**：服务器上用本仓 `adapter/`（克隆即得，或下载 Release 资产
-   `mcp-localfs-adapter-*.zip`）`docker build` 后运行，反代出
+   `octop-local-bridge-server-*.zip`）`docker build` 后运行，反代出
    `https://…/mcp/localfs/` 与 `wss://…/mcp-localfs/ws`；
 2. **桥 EXE 引导页填地址**：白名单目录 + `wss://…/mcp-localfs/ws` +
    **bridge_token** → 保存并连接；
@@ -77,7 +82,7 @@ go vet ./...            # 静态检查
 go test ./...           # 单元测试
 
 # 产出单 EXE（与 CI 发布同参数）
-go build -ldflags "-s -w" -o dist/bridge.exe ./cmd/bridge
+go build -ldflags "-s -w" -o dist/octop-local-bridge.exe ./cmd/bridge
 ```
 
 Go 1.22+（CI 使用 1.23）。前端是手写单页 HTML + 原生 JS，经 `go:embed`
@@ -155,7 +160,7 @@ octop-local-bridge.exe --headless \
 ├── internal/console/  # 内嵌单页控制台 + JSON API + SSE
 ├── internal/tray/     # 系统托盘（fyne.io/systray，Windows 无 cgo）
 ├── internal/testserver/  # 开发/联调用 mock 适配器（非交付物，勿部署）
-├── adapter/           # mcp-localfs 云端适配器（Python，自包含，见其 README）
+├── adapter/           # octop-local-bridge 云端适配器（Python，自包含，见其 README）
 ├── examples/          # Octop 连接器模板 + 三步接入指南（随发布包分发）
 ├── scripts/           # 端到端联调脚本（ps1 / sh）+ verify_e2e.ps1 三段验收
 └── .github/workflows/ # push=build+test；tag v*=EXE zip+适配器 zip+sha256 发布
