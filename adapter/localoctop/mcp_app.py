@@ -50,8 +50,10 @@ logger = logging.getLogger("localoctop.mcp")
 SCOPE_USER_KEY = "localoctop_user"
 
 SERVER_INSTRUCTIONS = (
-    "Read-only access to the user's whitelisted local directories via the "
-    "localoctop client running on the user's machine."
+    "Access to the user's whitelisted local directories via the localoctop "
+    "client running on the user's machine. Read tools are always available; "
+    "write tools appear only when write access is enabled (server-side switch "
+    "and the employee's client-side toggle)."
 )
 
 
