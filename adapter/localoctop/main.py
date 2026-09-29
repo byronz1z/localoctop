@@ -44,6 +44,10 @@ def _build_server(app, settings, *, host: str, port: int, tls: bool, drive_lifes
         # client's own pings and the idle-timeout sweep.
         "ws_ping_interval": 20,
         "ws_ping_timeout": 20,
+        # v0.5.0: bridge media/zip responses arrive as one WS frame (30 MB
+        # raw -> ~40 MB base64 + JSON). The 16 MB websockets default would
+        # close 1009; 50 MiB matches the client's 48 MiB frame ceiling.
+        "ws_max_size": 50 * 1024 * 1024,
         "lifespan": "auto" if drive_lifespan else "off",
     }
     if tls:

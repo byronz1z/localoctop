@@ -341,13 +341,35 @@ func (b *Bridge) dispatch(ctx context.Context, method string, params map[string]
 	case MethodReadFile:
 		return b.tools.readFile(params)
 	case MethodSearchFiles:
-		return b.tools.searchFiles(params)
+		return b.tools.searchFilesV05(params)
 	case MethodGetFileInfo:
 		return b.tools.getFileInfo(params)
 	case MethodWriteFile:
 		return b.tools.writeFile(params)
 	case MethodCreateDir:
 		return b.tools.createDirectory(params)
+	case MethodReadMediaFile:
+		return b.tools.readMediaFile(params)
+	case MethodReadMultipleFiles:
+		return b.tools.readMultipleFiles(params)
+	case MethodEditFile:
+		return b.tools.editFile(params)
+	case MethodListDirWithSizes:
+		return b.tools.listDirWithSizes(params)
+	case MethodDirectoryTree:
+		return b.tools.directoryTree(params)
+	case MethodMoveFile:
+		return b.tools.moveFile(params)
+	case MethodDeleteFile:
+		return b.tools.deleteFile(params)
+	case MethodRemoveDirectory:
+		return b.tools.removeDirectory(params)
+	case MethodZipFiles:
+		return b.tools.zipFiles(params)
+	case MethodUnzipFile:
+		return b.tools.unzipFile(params)
+	case MethodListAllowedDirectories:
+		return b.tools.listAllowedDirectories(params)
 	default:
 		return nil, errMethodNotFound(method)
 	}

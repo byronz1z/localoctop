@@ -52,8 +52,10 @@ SCOPE_USER_KEY = "localoctop_user"
 SERVER_INSTRUCTIONS = (
     "Access to the user's whitelisted local directories via the localoctop "
     "client running on the user's machine. Read tools are always available; "
-    "write tools appear only when write access is enabled (server-side switch "
-    "and the employee's client-side toggle)."
+    "write tools (edit/move/delete/remove/unzip) appear only when write access "
+    "is enabled (server-side switch and the employee's client-side toggle). "
+    "Deletions go to the recycle bin by default; permanent=true is irreversible. "
+    "Every path outside the whitelist roots is refused."
 )
 
 
@@ -207,6 +209,8 @@ class MCPEndpoint:
                     name=schema["name"],
                     description=schema["description"],
                     inputSchema=dict(schema["inputSchema"]),
+                    annotations=(mcp_types.ToolAnnotations(**schema["annotations"])
+                                 if "annotations" in schema else None),
                 )
                 for schema in tools_list(write_enabled)
             ]

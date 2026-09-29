@@ -28,11 +28,22 @@ from .errors import (
 )
 from .protocol import (
     M_CREATE_DIRECTORY,
+    M_DELETE_FILE,
+    M_EDIT_FILE,
     M_GET_FILE_INFO,
+    M_LIST_ALLOWED_DIRECTORIES,
     M_LIST_DIRECTORY,
+    M_LIST_DIRECTORY_WITH_SIZES,
+    M_DIRECTORY_TREE,
+    M_MOVE_FILE,
     M_READ_FILE,
+    M_READ_MEDIA_FILE,
+    M_READ_MULTIPLE_FILES,
+    M_REMOVE_DIRECTORY,
     M_SEARCH_FILES,
+    M_UNZIP_FILE,
     M_WRITE_FILE,
+    M_ZIP_FILES,
     READ_ONLY_TOOLS,
     WRITE_TOOLS,
     validate_tool_name,
@@ -43,13 +54,34 @@ logger = logging.getLogger("localoctop.tools")
 
 # Hard ceiling on a rendered MCP text block, independent of client config, so
 # a compromised/buggy client cannot make us relay arbitrarily large payloads.
-SERVER_MAX_RESULT_BYTES = 24 * 1024 * 1024
+# v0.5.0: raised to 48 MiB to match the frame ceiling so one-shot media/zip
+# transfers (30 MB raw -> ~40 MB base64) survive the relay; per-tool caps still
+# apply on the client (MaxReadBytes/MaxMediaBytes), this is the outer bound.
+SERVER_MAX_RESULT_BYTES = 48 * 1024 * 1024
 
 # 任务书 v1.1 §七 timeout budget: the adapter's overall response to one
 # tools/call must land within 20s. The bridge round-trip itself is capped at
 # settings.bridge_timeout (≤18s); this outer bound also covers validation,
 # rendering and audit overhead, so the connector never waits past the budget.
 ADAPTER_RESPONSE_BUDGET = 20.0
+
+
+def _req_path(arguments: dict[str, Any]) -> str:
+    """Pick the most meaningful path-ish value for audit logging across the
+    v0.5.0 tool parameter names (path/source/archive/paths[0]/pattern)."""
+    for key in ("path", "source", "archive"):
+        v = arguments.get(key)
+        if isinstance(v, str) and v:
+            return v
+    paths = arguments.get("paths")
+    if isinstance(paths, list) and paths:
+        first = paths[0]
+        if isinstance(first, str):
+            return first
+    v = arguments.get("pattern")
+    if isinstance(v, str):
+        return v
+    return ""
 
 
 class ToolService:
@@ -70,7 +102,7 @@ class ToolService:
         """
         started = time.monotonic()
         arguments = arguments if isinstance(arguments, dict) else {}
-        req_path = str(arguments.get("path", "") or arguments.get("pattern", ""))[:512]
+        req_path = _req_path(arguments)[:512]
 
         # --- server-side gates -------------------------------------------
         if self.settings.disabled:
@@ -131,9 +163,105 @@ class ToolService:
 
         if name == M_READ_FILE:
             return self._render_read(result)
-        if name in (M_LIST_DIRECTORY, M_SEARCH_FILES, M_GET_FILE_INFO, M_WRITE_FILE, M_CREATE_DIRECTORY):
-            return self._render_json(result)
+        if name == M_READ_MEDIA_FILE:
+            return self._render_media(result)
+        if name == M_ZIP_FILES:
+            return self._render_zip(result)
+        if name == M_READ_MULTIPLE_FILES:
+            return self._render_multi(result)
+        if name == M_EDIT_FILE:
+            return self._render_edit(result)
         return self._render_json(result)
+
+    def _b64_blob(self, result: dict[str, Any], field: str = "base64") -> str:
+        b64 = result.get(field, "")
+        if not isinstance(b64, str):
+            raise BridgeProtocolError(CODE_INTERNAL, f"bad {field} field from bridge")
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise BridgeProtocolError(CODE_INTERNAL, f"bridge sent invalid base64: {exc}") from exc
+        if len(raw) > SERVER_MAX_RESULT_BYTES:
+            raise BridgeProtocolError(CODE_TOO_LARGE, "bridge result exceeds server size ceiling")
+        return b64
+
+    def _render_media(self, result: dict[str, Any]) -> dict[str, Any]:
+        """read_media_file: base64 + MIME go back as an embedded resource."""
+        b64 = self._b64_blob(result)
+        mime = str(result.get("mime") or "application/octet-stream")
+        uri = "file:///" + str(result.get("path", "blob")).lstrip("/")
+        return {
+            "content": [
+                {"type": "resource", "resource": {"uri": uri, "mimeType": mime, "blob": b64}},
+                {"type": "text", "text": f"media file: {result.get('path', '')} ({result.get('size', 0)} bytes, {mime})"},
+            ],
+            "isError": False,
+        }
+
+    def _render_zip(self, result: dict[str, Any]) -> dict[str, Any]:
+        """zip_files: the archive comes back base64'd as a resource blob."""
+        b64 = self._b64_blob(result)
+        note = f"zip archive: {result.get('entries', 0)} entries, {result.get('size', 0)} bytes"
+        if result.get("skipped"):
+            note += f", {result['skipped']} skipped"
+        if result.get("truncated"):
+            note += " (truncated by caps)"
+        archive = str(result.get("archive") or "").strip("/")
+        if not archive:
+            archive = "bundle.zip"
+        uri = "file:///" + archive
+        return {
+            "content": [
+                {"type": "resource", "resource": {"uri": uri, "mimeType": "application/zip", "blob": b64}},
+                {"type": "text", "text": note},
+            ],
+            "isError": False,
+        }
+
+    def _render_multi(self, result: dict[str, Any]) -> dict[str, Any]:
+        """read_multiple_files: one text block per file (official style),
+        failures and truncation summarised at the end."""
+        blocks: list[dict[str, Any]] = []
+        for f in result.get("files", []):
+            if not isinstance(f, dict):
+                continue
+            if f.get("error"):
+                blocks.append({"type": "text", "text": f"== {f.get('path', '')} — ERROR: {f['error']} =="})
+                continue
+            if f.get("encoding") == "base64":
+                b64 = str(f.get("base64", ""))
+                if len(base64.b64decode(b64, validate=False) or b"") > SERVER_MAX_RESULT_BYTES:
+                    raise BridgeProtocolError(CODE_TOO_LARGE, "bridge result exceeds server size ceiling")
+                blocks.append({"type": "resource", "resource": {
+                    "uri": "file:///" + str(f.get("path", "blob")).lstrip("/"),
+                    "mimeType": "application/octet-stream", "blob": b64}})
+            else:
+                text = str(f.get("text", ""))
+                if len(text.encode("utf-8", "replace")) > SERVER_MAX_RESULT_BYTES:
+                    raise BridgeProtocolError(CODE_TOO_LARGE, "bridge result exceeds server size ceiling")
+                blocks.append({"type": "text", "text": f"== {f.get('path', '')} ==\n{text}"})
+        tail = []
+        if result.get("failed"):
+            tail.append(f"{result['failed']} file(s) failed")
+        if result.get("truncated"):
+            tail.append("combined size cap reached — remaining files omitted")
+        if tail:
+            blocks.append({"type": "text", "text": "note: " + "; ".join(tail)})
+        if not blocks:
+            blocks.append({"type": "text", "text": "(no files returned)"})
+        return {"content": blocks, "isError": False}
+
+    def _render_edit(self, result: dict[str, Any]) -> dict[str, Any]:
+        """edit_file: the unified diff is the human-consumable core."""
+        head = ("[dry run] " if result.get("dry_run") else "") + \
+               f"edit_file {result.get('path', '')}: " + \
+               f"{result.get('edits_applied', 0)} edit(s), {result.get('matches', 0)} match(es), " + \
+               f"{result.get('size_before', 0)} -> {result.get('size_after', 0)} bytes"
+        diff = str(result.get("diff", ""))
+        text = head + "\n" + diff
+        if len(text.encode("utf-8", "replace")) > SERVER_MAX_RESULT_BYTES:
+            raise BridgeProtocolError(CODE_TOO_LARGE, "bridge result exceeds server size ceiling")
+        return {"content": [{"type": "text", "text": text}], "isError": False}
 
     def _render_read(self, result: dict[str, Any]) -> dict[str, Any]:
         encoding = str(result.get("encoding", "utf-8"))

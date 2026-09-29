@@ -13,6 +13,7 @@ from localoctop.audit import AuditLog
 from localoctop.errors import BridgeProtocolError, CODE_INVALID_PARAMS, CODE_METHOD_NOT_FOUND, CODE_PARSE_ERROR
 from localoctop.protocol import (
     READ_ONLY_TOOLS,
+    WRITE_TOOLS,
     parse_request,
     tools_list,
     validate_tool_name,
@@ -99,7 +100,7 @@ def test_tools_list_readonly_contract():
     tools = tools_list(write_enabled=False)
     names = [t["name"] for t in tools]
     assert names == list(READ_ONLY_TOOLS)
-    assert len(tools) == 4
+    assert len(tools) == 10
     for t in tools:
         assert t["inputSchema"]["type"] == "object"
         assert "properties" in t["inputSchema"]
@@ -108,7 +109,8 @@ def test_tools_list_readonly_contract():
 
 def test_tools_list_write_enabled():
     names = {t["name"] for t in tools_list(write_enabled=True)}
-    assert names == set(READ_ONLY_TOOLS) | {"write_file", "create_directory"}
+    assert names == set(READ_ONLY_TOOLS) | set(WRITE_TOOLS)
+    assert len(names) == 17
 
 
 def test_validate_tool_name():

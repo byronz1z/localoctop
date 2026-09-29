@@ -113,7 +113,7 @@ Go 1.22+（CI 使用 1.23）。前端是手写单页 HTML + 原生 JS，经 `go:
 | `server_url` | — | 适配器 WebSocket URL，`wss://…/mcp/localoctop/ws`（接受 `https://`，自动转 `wss://`） |
 | `token` | — | 适配器签发的用户令牌 |
 | `allowed_dirs` | — | 白名单目录列表，`[{path, enabled}]`；`enabled:false` 保留但不服务 |
-| `allow_write` | `false` | 是否开启预留写工具（`write_file`/`create_directory`） |
+| `allow_write` | `true` | 是否开启写工具（write/edit/move/delete/remove/unzip）；产品默认开，可手动关 |
 | `console_port` | `19880` | 控制台首选端口；被占用时自动向上探测（最多 20 个） |
 | `open_browser` | `true` | 启动时自动打开控制台页面 |
 | `audit_log_path` | 数据目录下 `audit.jsonl` | 审计日志位置 |

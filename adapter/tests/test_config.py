@@ -42,9 +42,12 @@ def test_load_settings_parses_tokens_and_switches():
     assert s.authenticate_bridge("btok-a") == "alice"
 
 
-def test_load_settings_defaults_are_safe():
+def test_load_settings_defaults_match_ruling():
+    # User ruling 2026-09-29: write switch kept but DEFAULT ON (server env
+    # unset -> writes allowed; opt out with LOCALOCTOP_ALLOW_WRITE=0).
     s = load_settings({})
-    assert s.allow_write is False, "write must default OFF"
+    assert s.allow_write is True, "write must default ON per ruling"
+    assert load_settings({"LOCALOCTOP_ALLOW_WRITE": "0"}).allow_write is False
     assert s.disabled is False
     assert s.max_read_bytes == 20 * 1024 * 1024
     assert s.max_write_bytes == 10 * 1024 * 1024

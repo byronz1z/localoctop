@@ -59,9 +59,11 @@ docker run -d --name localoctop-server -p 127.0.0.1:8080:8080 \
 - `headers.Authorization`：`Bearer ` + **mcp_token**（不是第 2 步那个！）；
 - 保存后点「测试」：Octop 会做 `initialize` + `tools/list` 探测。
   探测时桥不在线也通过（initialize/tools/list 不依赖客户端）；
-  服务器写开关开时列出 6 个工具（4 读 + `write_file` /
-  `create_directory`），只读状态下只列出 4 个只读工具。实际执行写还取决于
-  员工机侧「允许写入」开关——双侧任一侧关，写调用即被拒。
+  服务器写开关开时列出 17 个工具（10 读 + 7 写：`write_file` /
+  `create_directory` / `edit_file` / `move_file` / `delete_file` /
+  `remove_directory` / `unzip_file`），只读状态下只列出 10 个只读工具。
+  实际执行写还取决于员工机侧「允许写入」开关（默认勾选）——双侧任一侧关，
+  写调用即被拒。
 
 字段依据：Octop `src/octop/infra/connectors/custom_mcp.py` 的
 `normalize_server_spec`（transport/url/headers/display_name/enabled）与

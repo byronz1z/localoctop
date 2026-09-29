@@ -14,6 +14,12 @@ const (
 	DefaultMaxReadBytes = 20 << 20
 	// DefaultMaxWriteBytes caps a single write_file payload (task spec: 10 MB).
 	DefaultMaxWriteBytes = 10 << 20
+	// DefaultMaxMediaBytes caps one-shot binary transfers (read_media_file /
+	// zip_files). v0.5.0 ruling: text stays windowed at MaxReadBytes (context
+	// limits), binaries get a generous single-shot cap because multimodal
+	// consumers use them directly. 30 MB raw -> ~40 MB base64 -> one ~41 MB
+	// JSON frame, inside the 48 MiB frame ceiling below.
+	DefaultMaxMediaBytes = 30 << 20
 
 	// Default reconnect backoff ladder: 1s, 2s, 4s ... capped at 60s.
 	DefaultMinBackoff    = 1 * time.Second
@@ -22,7 +28,7 @@ const (
 	DefaultDialTimeout   = 10 * time.Second
 	DefaultPingInterval  = 25 * time.Second
 	DefaultPongWait      = 60 * time.Second
-	DefaultMaxMsgBytes   = 24 << 20 // inbound frame ceiling: a bit above the write cap.
+	DefaultMaxMsgBytes   = 48 << 20 // inbound frame ceiling: fits a 30 MB media/zip frame base64'd + JSON overhead.
 	DefaultAuditMaxBytes = 8 << 20  // per-file audit log size before rotation.
 )
 
@@ -44,13 +50,19 @@ type Config struct {
 	// use ~ for the home directory.
 	AllowedDirs []string
 
-	// AllowWrite enables the reserved write_file / create_directory tools.
-	// Defaults to false: the bridge is read-only unless explicitly opened.
+	// AllowWrite enables the write-class tools (write/create/edit/move/delete/
+	// remove/zip/unzip). Library zero-value is false (conservative for
+	// embedders); the product default is ON — the desktop shell seeds it from
+	// appcfg (AllowWrite=true default) and headless from LOCALOCTOP_ALLOW_WRITE
+	// (user ruling 2026-09-29: switch kept, default on).
 	AllowWrite bool
 
 	// MaxReadBytes / MaxWriteBytes bound single-operation payload sizes.
 	MaxReadBytes  int64
 	MaxWriteBytes int64
+	// MaxMediaBytes bounds one-shot binary transfers (read_media_file,
+	// zip_files archive). v0.5.0.
+	MaxMediaBytes int64
 
 	// AuditLogPath is where JSON-lines audit records are appended. Empty
 	// disables file auditing (events still reach OnAudit / StderrLogger).
@@ -86,6 +98,7 @@ func NewConfig() Config {
 	return Config{
 		MaxReadBytes:  DefaultMaxReadBytes,
 		MaxWriteBytes: DefaultMaxWriteBytes,
+		MaxMediaBytes: DefaultMaxMediaBytes,
 		RequestWait:   DefaultRequestWait,
 		DialTimeout:   DefaultDialTimeout,
 		MinBackoff:    DefaultMinBackoff,
@@ -120,6 +133,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxWriteBytes <= 0 {
 		c.MaxWriteBytes = DefaultMaxWriteBytes
+	}
+	if c.MaxMediaBytes <= 0 {
+		c.MaxMediaBytes = DefaultMaxMediaBytes
 	}
 	if c.RequestWait <= 0 {
 		c.RequestWait = DefaultRequestWait

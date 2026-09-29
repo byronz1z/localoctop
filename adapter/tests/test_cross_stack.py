@@ -169,12 +169,16 @@ async def test_full_stack_read_and_traversal_denial(bridge_binary, tmp_path):
                 "jsonrpc": "2.0", "method": "notifications/initialized"})
             assert r.status_code == 202
 
-            # tools/list -> exactly 4 read-only tools.
+            # tools/list -> the 10 read-only tools (v0.5.0 catalog; writes
+            # off on the server side hides the 7 write tools).
             r = await client.post("/mcp/localoctop/", headers=auth, json={
                 "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
             tools = r.json()["result"]["tools"]
             assert sorted(t["name"] for t in tools) == [
-                "get_file_info", "list_directory", "read_file", "search_files"]
+                "directory_tree", "get_file_info", "list_allowed_directories",
+                "list_directory", "list_directory_with_sizes", "read_file",
+                "read_media_file", "read_multiple_files", "search_files",
+                "zip_files"]
 
             # read_file through the whole stack.
             r = await client.post("/mcp/localoctop/", headers=auth, json={

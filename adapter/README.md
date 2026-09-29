@@ -10,8 +10,9 @@
    `tools/call`，Bearer 认证）。**上游零改动。**
 
 - 自包含：不 import Octop 任何包，不引用本目录外的路径。
-- 首期只读：`list_directory` / `read_file` / `search_files` / `get_file_info`；
-  `write_file` / `create_directory` 预留，配置开关默认关。
+- v0.5.0 全工具集：对齐官方 MCP filesystem 规范 12 工具 + zip/unzip/list-allowed
+  扩展；读 10 + 写 7，写工具按服务器开关下发（服务器侧 `LOCALOCTOP_ALLOW_WRITE`
+  默认开，员工机侧另有手动开关，双侧串联）。
 
 ## 目录结构
 
@@ -50,7 +51,7 @@ adapter/
 | 认证 | 握手头 `Authorization: Bearer <bridge_token>` | `authenticate_bridge()`（只认 bridge 命名空间） |
 | 首帧 | `{"type":"register", token, client_id, hostname, allowed_dirs, write_enabled, version}` | 首帧必须 register，否则 4403；token 与握手不一致 4401 |
 | 请求/响应 | `{id, method, params}` / `{id, result|error}` | `SessionRegistry.call` / `deliver` |
-| 方法名 | 6 个工具方法 1:1 | `protocol.py` 同名常量 |
+| 方法名 | 17 个工具方法 1:1（10 读 + 7 写） | `protocol.py` 同名常量 |
 | 错误码 | 0 / -32602 / -32601 / -32000 / 4001–4005 | `errors.py` 同值（另加纯服务端 4101/4102） |
 | 活性 | 25s RFC6455 协议级 ping | uvicorn 自动回 pong；120s 空闲才断（数据帧刷新） |
 

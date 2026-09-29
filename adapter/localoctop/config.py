@@ -50,10 +50,14 @@ class Settings:
     static_tokens: dict[str, str] = field(default_factory=dict)
 
     # --- behavior switches ---
-    # Master switch for the reserved write tools. Default OFF (read-only).
+    # Master switch for the write tools. User ruling 2026-09-29: write is
+    # enabled BY DEFAULT (checkbox pre-ticked on the employee console);
+    # the flag exists to allow opting out. The dataclass default stays
+    # False for explicit test construction; load_settings (the production
+    # path) defaults ON.
     allow_write: bool = False
     # Per-user override: user ids allowed to write even when allow_write is
-    # globally off (staged rollout: "先 1 人只读 → 放开写权限 → 全员").
+    # globally off (escape hatch; kept for staged rollout or per-user lock).
     write_allowlist: set[str] = field(default_factory=set)
     # Admin kill-switch: when True, every tools/call is refused. Models the
     # product-layer "管理员可整体停用" control.
@@ -149,7 +153,7 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
     return Settings(
         token_store=store,
         static_tokens=static,
-        allow_write=_env_flag(e.get("LOCALOCTOP_ALLOW_WRITE"), False),
+        allow_write=_env_flag(e.get("LOCALOCTOP_ALLOW_WRITE"), True),
         write_allowlist=write_allow,
         disabled=_env_flag(e.get("LOCALOCTOP_DISABLED"), False),
         max_read_bytes=_int(e.get("LOCALOCTOP_MAX_READ_BYTES"), DEFAULT_MAX_READ_BYTES),

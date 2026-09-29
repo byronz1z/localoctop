@@ -117,7 +117,7 @@ async def test_initialize_without_trailing_slash():
 
 
 @pytest.mark.asyncio
-async def test_tools_list_returns_four_readonly_tools():
+async def test_tools_list_returns_readonly_tools():
     client, _ = await _mk(_settings())
     async with client:
         headers = await _handshake(client, "tok-alice")
@@ -127,9 +127,15 @@ async def test_tools_list_returns_four_readonly_tools():
         assert r.status_code == 200
         tools = r.json()["result"]["tools"]
         names = sorted(t["name"] for t in tools)
-        assert names == ["get_file_info", "list_directory", "read_file", "search_files"]
+        assert names == sorted([
+            "get_file_info", "list_allowed_directories", "list_directory",
+            "list_directory_with_sizes", "directory_tree", "read_file",
+            "read_media_file", "read_multiple_files", "search_files", "zip_files",
+        ])
         for t in tools:
             assert "inputSchema" in t and t["inputSchema"]["type"] == "object"
+            # v0.5.0: annotations ride to the model per the MCP spec.
+            assert t.get("annotations", {}).get("openWorldHint") is False
 
 
 @pytest.mark.asyncio
@@ -141,8 +147,9 @@ async def test_tools_list_includes_write_when_enabled():
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {},
         })
         names = {t["name"] for t in r.json()["result"]["tools"]}
-        assert {"write_file", "create_directory"} <= names
-        assert len(names) == 6
+        assert {"write_file", "create_directory", "edit_file", "move_file",
+                "delete_file", "remove_directory", "unzip_file"} <= names
+        assert len(names) == 17
 
 
 @pytest.mark.asyncio
@@ -490,3 +497,178 @@ async def test_bridge_timeout_surfaces_as_error_result():
         # Timeout is a tool-level failure: isError result with code 4005 detail.
         assert body["result"]["isError"] is True
         assert "within" in body["result"]["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# v0.5.0 render + gating tests
+# ---------------------------------------------------------------------------
+
+async def _call_tool(client, headers, req_id, name, arguments):
+    r = await client.post("/mcp/localoctop/", headers=headers, json={
+        "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    return r.json()
+
+
+@pytest.mark.asyncio
+async def test_read_media_file_rendered_as_typed_resource():
+    client, app = await _mk(_settings())
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        assert req["method"] == "read_media_file"
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "path": "photo.jpg", "base64": "aGk=", "mime": "image/jpeg", "size": 2,
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        body = await _call_tool(client, headers, 20, "read_media_file", {"path": "photo.jpg"})
+        await task
+        blocks = body["result"]["content"]
+        res = next(b for b in blocks if b["type"] == "resource")
+        assert res["resource"]["mimeType"] == "image/jpeg"
+        assert res["resource"]["blob"] == "aGk="
+
+
+@pytest.mark.asyncio
+async def test_zip_files_rendered_as_zip_resource():
+    client, app = await _mk(_settings())
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "archive": "docs", "base64": "UEsDBA==", "size": 123, "entries": 2, "skipped": 1,
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        body = await _call_tool(client, headers, 21, "zip_files", {"paths": ["docs"]})
+        await task
+        blocks = body["result"]["content"]
+        res = next(b for b in blocks if b["type"] == "resource")
+        assert res["resource"]["mimeType"] == "application/zip"
+        note = next(b for b in blocks if b["type"] == "text")
+        assert "2 entries" in note["text"] and "1 skipped" in note["text"]
+
+
+@pytest.mark.asyncio
+async def test_read_multiple_files_mixed_success_and_failure():
+    client, app = await _mk(_settings())
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "files": [
+                {"path": "ok.txt", "text": "contents here", "encoding": "utf-8"},
+                {"path": "missing.txt", "error": "not found"},
+            ],
+            "failed": 1, "truncated": False,
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        body = await _call_tool(client, headers, 22, "read_multiple_files", {"paths": ["ok.txt", "missing.txt"]})
+        await task
+        texts = [b["text"] for b in body["result"]["content"] if b["type"] == "text"]
+        assert any("contents here" in t for t in texts)
+        assert any("ERROR" in t for t in texts)
+        assert any("1 file(s) failed" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_edit_file_rendered_with_diff():
+    client, app = await _mk(_settings(allow_write=True))
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws, write_enabled=True))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        assert req["method"] == "edit_file"
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "path": "a.txt", "applied": True, "dry_run": False,
+            "edits_applied": 1, "matches": 1, "diff": "-old\n+new\n",
+            "size_before": 3, "size_after": 3,
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        body = await _call_tool(client, headers, 23, "edit_file", {
+            "path": "a.txt", "edits": [{"oldText": "old", "newText": "new"}],
+        })
+        await task
+        text = body["result"]["content"][0]["text"]
+        assert "-old" in text and "+new" in text and "edit_file a.txt" in text
+
+
+@pytest.mark.asyncio
+async def test_delete_file_refused_when_client_write_off():
+    # Server allows writes, but the employee's client registered with the
+    # write toggle OFF -> write-class tools must be refused before fan-out.
+    client, app = await _mk(_settings(allow_write=True))
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws, write_enabled=False))
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        body = await _call_tool(client, headers, 24, "delete_file", {"path": "x.txt"})
+        assert body["result"]["isError"] is True
+        assert "write switch off" in body["result"]["content"][0]["text"]
+        assert ws.outbox == []  # never forwarded to the machine
+
+
+@pytest.mark.asyncio
+async def test_unzip_file_routes_when_writes_on():
+    client, app = await _mk(_settings(allow_write=True))
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws, write_enabled=True))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "archive": "b.zip", "dest": "out", "extracted": 3, "total_bytes": 900,
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        body = await _call_tool(client, headers, 25, "unzip_file", {"archive": "b.zip", "dest": "out"})
+        await task
+        assert body["result"]["isError"] is False
+        assert "extracted" in body["result"]["content"][0]["text"]
