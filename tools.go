@@ -2,6 +2,7 @@ package localoctop
 
 import (
 	"encoding/base64"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,6 +30,15 @@ const (
 	maxListEntries = 5000
 	maxSearchHits  = 1000
 	maxWalkNodes   = 200000
+
+	// Tool-contract defaults per task spec v1.1 §7.2: list_directory limit
+	// (default 500, max 2000), depth (default 1, max 3); search_files limit
+	// (default 200). Hard caps above remain as the transport guard.
+	defaultListLimit   = 500
+	maxListLimit       = 2000
+	defaultListDepth   = 1
+	maxListDepth       = 3
+	defaultSearchLimit = 200
 )
 
 // getString pulls a string param, applying a default when absent/empty.
@@ -46,13 +56,11 @@ func getString(params map[string]any, key, def string) string {
 
 // getInt pulls an integer param (JSON numbers decode to float64).
 func getInt(params map[string]any, key string, def int) int {
-	if params == nil {
-		return def
-	}
-	v, ok := params[key]
-	if !ok {
-		return def
-	}
+	return toInt(params[key], def)
+}
+
+// toInt coerces a decoded-JSON value to int; returns def when absent/wrong type.
+func toInt(v any, def int) int {
 	switch n := v.(type) {
 	case float64:
 		return int(n)
@@ -105,36 +113,84 @@ func (t *tools) listDirectory(params map[string]any) (*ListDirectoryResult, *Bri
 		return nil, errInvalidParams("path is not a directory")
 	}
 
-	entries, err := os.ReadDir(abs)
+	// depth: 1..3, default 1 (§7.2). limit: 1..2000, default 500 (§7.2);
+	// the hard cap maxListEntries stays as a defensive backstop.
+	depth := getInt(params, "depth", defaultListDepth)
+	if depth < 1 {
+		depth = 1
+	}
+	if depth > maxListDepth {
+		depth = maxListDepth
+	}
+	limit := getInt(params, "limit", defaultListLimit)
+	if limit < 1 || limit > maxListLimit {
+		limit = maxListLimit
+	}
+
+	entries, err := collectDirEntries(abs, abs, 1, depth, limit)
 	if err != nil {
 		return nil, errInternal("read dir failed", err)
 	}
-	out := make([]DirEntry, 0, len(entries))
-	for i, e := range entries {
-		if i >= maxListEntries {
-			break
+	return &ListDirectoryResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Entries: entries}, nil
+}
+
+// collectDirEntries walks from dir up to maxDepth levels below root (inclusive,
+// 1 = immediate children only). Entry names are paths relative to dir so that
+// nested results stay unambiguous. limit is a hard cap across all levels;
+// hitting it stops the walk (deeper siblings beyond maxWalkNodes are skipped).
+func collectDirEntries(root, dir string, level, maxDepth, limit int) ([]DirEntry, error) {
+	out := make([]DirEntry, 0, limit)
+	var walk func(d string, lvl int) error
+	walk = func(d string, lvl int) error {
+		ents, err := os.ReadDir(d)
+		if err != nil {
+			if lvl == 1 {
+				return err
+			}
+			return nil // unreadable nested dir: skip, don't abort
 		}
-		info, ierr := e.Info()
-		var size int64
-		var mt time.Time
-		if ierr == nil {
-			size = info.Size()
-			mt = info.ModTime()
+		for _, e := range ents {
+			if len(out) >= limit {
+				return nil
+			}
+			p := filepath.Join(d, e.Name())
+			info, ierr := e.Info()
+			var size int64
+			var mt time.Time
+			if ierr == nil {
+				size = info.Size()
+				mt = info.ModTime()
+			}
+			typ := "file"
+			if e.IsDir() {
+				typ = "dir"
+			} else if e.Type()&fs.ModeSymlink != 0 {
+				typ = "symlink"
+			}
+			name, rerr := filepath.Rel(root, p)
+			if rerr != nil {
+				name = e.Name()
+			}
+			out = append(out, DirEntry{
+				Name:  name,
+				Type:  typ,
+				Size:  size,
+				MTime: mt.UTC().Format(time.RFC3339),
+			})
+			// Recurse only into real dirs (never follow symlinks) and only
+			// while levels remain.
+			if e.IsDir() && lvl < maxDepth {
+				if err := walk(p, lvl+1); err != nil {
+					return err
+				}
+			}
 		}
-		typ := "file"
-		if e.IsDir() {
-			typ = "dir"
-		} else if e.Type()&fs.ModeSymlink != 0 {
-			typ = "symlink"
-		}
-		out = append(out, DirEntry{
-			Name:  e.Name(),
-			Type:  typ,
-			Size:  size,
-			MTime: mt.UTC().Format(time.RFC3339),
-		})
+		return nil
 	}
-	return &ListDirectoryResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Entries: out}, nil
+	if err := walk(dir, 1); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ---- read_file ----
@@ -158,19 +214,52 @@ func (t *tools) readFile(params map[string]any) (*ReadFileResult, *BridgeError) 
 	if st.IsDir() {
 		return nil, errInvalidParams("path is a directory; use list_directory")
 	}
-	if st.Size() > t.cfg.MaxReadBytes {
+
+	// offset/length per §7.2: byte-window read, total returned ≤ MaxReadBytes.
+	offset := getInt(params, "offset", 0)
+	if offset < 0 {
+		offset = 0
+	}
+	if int64(offset) > st.Size() {
+		offset = int(st.Size())
+	}
+	// length default = whole file from offset; caller-supplied length is
+	// honoured but capped at MaxReadBytes so a single read stays bounded.
+	length := getInt(params, "length", 0)
+	want := st.Size() - int64(offset)
+	if length > 0 && int64(length) < want {
+		want = int64(length)
+	}
+	if want > t.cfg.MaxReadBytes {
+		want = t.cfg.MaxReadBytes
+	}
+	// Reading a window is always within the per-file cap (want ≤ MaxReadBytes),
+	// but a whole-file read of an oversized file is rejected as before.
+	if length <= 0 && st.Size() > t.cfg.MaxReadBytes {
 		return nil, errTooLarge(sprintf("file is %d bytes, exceeds read limit %d", st.Size(), t.cfg.MaxReadBytes))
 	}
 
-	data, err := os.ReadFile(abs) // #nosec G304 - path is validated by guard
+	f, oerr := os.Open(abs) // #nosec G304 - path is validated by guard
+	if oerr != nil {
+		return nil, errInternal("read failed", oerr)
+	}
+	defer f.Close()
+	if _, serr := f.Seek(int64(offset), io.SeekStart); serr != nil {
+		return nil, errInternal("seek failed", serr)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, want))
 	if err != nil {
 		return nil, errInternal("read failed", err)
 	}
+	truncated := int64(len(data)) < st.Size()-int64(offset)
 
 	res := &ReadFileResult{
-		Path:     relDisplay(t.cfg.AllowedDirs, abs),
-		Size:     int64(len(data)),
-		Encoding: "utf-8",
+		Path:      relDisplay(t.cfg.AllowedDirs, abs),
+		Size:      st.Size(),
+		Offset:    int64(offset),
+		Bytes:     int64(len(data)),
+		Encoding:  "utf-8",
+		Truncated: truncated,
 	}
 	if utf8.Valid(data) && !hasBinaryMarker(data) {
 		res.Text = string(data)
@@ -209,8 +298,15 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 		}
 		rawPath = t.cfg.AllowedDirs[0]
 	}
-	maxResults := getInt(params, "max_results", maxSearchHits)
-	if maxResults <= 0 || maxResults > maxSearchHits {
+	// §7.2 names the cap "limit" (default 200); legacy clients send
+	// "max_results". Accept both; hard cap stays maxSearchHits.
+	maxResults := defaultSearchLimit
+	if v, ok := params["limit"]; ok && toInt(v, -1) > 0 {
+		maxResults = toInt(v, defaultSearchLimit)
+	} else if v := getInt(params, "max_results", -1); v > 0 {
+		maxResults = v
+	}
+	if maxResults > maxSearchHits {
 		maxResults = maxSearchHits
 	}
 	matchContent := getBool(params, "match_content", false)
@@ -233,6 +329,8 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 	res := &SearchResult{Pattern: pattern, Path: relDisplay(t.cfg.AllowedDirs, abs), Matches: []SearchHit{}}
 	truncated := false
 	walked := 0
+	recursive := getBool(params, "recursive", true)
+	skipDirs := getBool(params, "skip_vcs_dirs", true)
 	// filepath.Match uses the platform separator; normalize pattern to OS form.
 	osPattern := filepath.FromSlash(pattern)
 
@@ -248,6 +346,22 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 		}
 		if p == abs {
 			return nil
+		}
+		// §7.5/§7.2: prune .git / node_modules subtrees (VCS noise, huge trees).
+		if d.IsDir() && skipDirs {
+			if n := d.Name(); n == ".git" || n == ".svn" || n == "node_modules" || n == "__pycache__" {
+				return fs.SkipDir
+			}
+		}
+		// Non-recursive: only immediate children of the search root.
+		if !recursive {
+			rel0, rerr0 := filepath.Rel(abs, p)
+			if rerr0 == nil && strings.Contains(rel0, string(filepath.Separator)) {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
 		}
 		rel, rerr := filepath.Rel(abs, p)
 		if rerr != nil {

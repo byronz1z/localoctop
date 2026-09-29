@@ -27,7 +27,7 @@ from .errors import (
 # Protocol identity reported during the MCP handshake.
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "localoctop"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 
 # Bridge method names — kept identical to localoctop/protocol.go.
 M_LIST_DIRECTORY = "list_directory"
@@ -67,17 +67,38 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "Directory path, relative to the whitelist root (e.g. \".\" or \"docs\"). "
                     "Absolute paths are accepted only if inside the whitelist. Defaults to the root."
                 ),
+                "depth": {
+                    "type": "integer",
+                    "description": "Directory levels to include (1 = immediate children only). Default 1, max 3.",
+                    "minimum": 1, "maximum": 3, "default": 1,
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Cap on returned entries across all levels. Default 500, max 2000.",
+                    "minimum": 1, "maximum": 2000, "default": 500,
+                },
             },
         },
     },
     M_READ_FILE: {
         "name": M_READ_FILE,
         "description": "Read a text (or small binary) file from the employee's whitelisted directory. "
-                       "Text is returned inline; binary is base64-encoded. Enforces a per-file size cap.",
+                       "Text is returned inline; binary is base64-encoded. Supports byte-window reads "
+                       "(offset/length); a whole-file read enforces a per-file size cap.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": _path_prop("File path relative to the whitelist root, or absolute inside it."),
+                "offset": {
+                    "type": "integer",
+                    "description": "Byte offset to start reading from (default 0).",
+                    "minimum": 0, "default": 0,
+                },
+                "length": {
+                    "type": "integer",
+                    "description": "Bytes to read from offset; 0/omitted = whole file (capped at 20 MB).",
+                    "minimum": 0, "default": 0,
+                },
             },
             "required": ["path"],
         },
@@ -85,15 +106,21 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     M_SEARCH_FILES: {
         "name": M_SEARCH_FILES,
         "description": "Search a whitelisted directory tree by filename glob (e.g. \"*.md\") or substring. "
-                       "Optionally match file contents.",
+                       "Optionally match file contents. Skips .git/node_modules subtrees by default.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Glob (\"*.md\") or substring to match against names."},
                 "path": _path_prop("Directory to search within. Defaults to the whitelist root."),
-                "max_results": {"type": "integer", "description": "Cap on returned matches (default 1000).", "minimum": 1},
+                "limit": {
+                    "type": "integer",
+                    "description": "Cap on returned matches (default 200, max 1000).",
+                    "minimum": 1, "maximum": 1000, "default": 200,
+                },
+                "max_results": {"type": "integer", "description": "Deprecated alias of limit.", "minimum": 1},
                 "match_content": {"type": "boolean", "description": "If true, also match file text content (default false)."},
                 "include_dirs": {"type": "boolean", "description": "Include directories in results (default true)."},
+                "recursive": {"type": "boolean", "description": "Walk sub-directories (default true)."},
             },
             "required": ["pattern"],
         },
@@ -111,7 +138,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     M_WRITE_FILE: {
         "name": M_WRITE_FILE,
-        "description": "RESERVED (write access off by default). Write text or base64 content to a whitelisted path.",
+        "description": "Write text or base64 content to a whitelisted path on the employee's machine. "
+                       "Requires write access enabled on both server and client.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -124,7 +152,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     M_CREATE_DIRECTORY: {
         "name": M_CREATE_DIRECTORY,
-        "description": "RESERVED (write access off by default). Create a directory under a whitelisted path.",
+        "description": "Create a directory under a whitelisted path on the employee's machine. "
+                       "Requires write access enabled on both server and client.",
         "inputSchema": {
             "type": "object",
             "properties": {

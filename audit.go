@@ -26,7 +26,9 @@ type AuditEvent struct {
 }
 
 // AuditLogger appends audit events as JSON lines. It is safe for concurrent
-// use and rotates the file (path -> path.1) once it exceeds maxBytes.
+// use and rotates the file (path -> path.1, shifting older generations up)
+// once it exceeds maxBytes; rotated files beyond 30 days or 30 generations
+// are deleted.
 type AuditLogger struct {
 	mu       sync.Mutex
 	path     string
@@ -98,20 +100,59 @@ func (a *AuditLogger) Record(ev AuditEvent) {
 	}
 }
 
-// rotateLocked renames path -> path.1 (discarding any previous .1) and
-// reopens a fresh file. Best-effort: on error the old handle stays open.
+// Audit retention per task spec v1.1 §7.5: size rotation keeps bounded
+// generations (path.1 newest ... path.<maxGenerations> oldest) and any
+// rotated generation older than auditRetentionDays is deleted.
+const (
+	auditMaxGenerations = 30
+	auditRetentionDays  = 30
+)
+
+// rotateLocked shifts existing generations up by one (path.N -> path.N+1),
+// renames path -> path.1, drops generations beyond the cap, prunes rotated
+// files older than the retention window, then reopens a fresh file.
+// Best-effort: on error the old handle stays closed and the next Record reopens.
 func (a *AuditLogger) rotateLocked() {
 	_ = a.f.Close()
 	a.f = nil
-	rotated := a.path + ".1"
-	_ = os.Remove(rotated)
-	if err := os.Rename(a.path, rotated); err != nil {
+
+	_ = os.Remove(fmt.Sprintf("%s.%d", a.path, auditMaxGenerations+1))
+	for i := auditMaxGenerations - 1; i >= 1; i-- {
+		old := fmt.Sprintf("%s.%d", a.path, i)
+		if _, err := os.Stat(old); err != nil {
+			continue
+		}
+		if rerr := os.Rename(old, fmt.Sprintf("%s.%d", a.path, i+1)); rerr != nil {
+			a.log.Warnf("audit: rotate shift %s: %v", old, rerr)
+		}
+	}
+	if err := os.Rename(a.path, a.path+".1"); err != nil {
 		a.log.Warnf("audit: rotate rename: %v", err)
 	}
+
+	// Prune rotated generations past the retention window. Generation order
+	// matches age order (N+1 is never newer than N), so stop at the first
+	// file inside the window.
+	cutoff := a.now().UTC().AddDate(0, 0, -auditRetentionDays)
+	for i := auditMaxGenerations; i >= 2; i-- {
+		p := fmt.Sprintf("%s.%d", a.path, i)
+		st, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if st.ModTime().UTC().Before(cutoff) {
+			if rerr := os.Remove(p); rerr == nil {
+				a.log.Infof("audit: pruned %s (older than %d days)", p, auditRetentionDays)
+			}
+		} else {
+			break
+		}
+	}
+
 	if err := a.open(); err != nil {
 		a.log.Errorf("audit: reopen after rotate: %v", err)
 	} else {
-		a.log.Infof("audit log rotated to %s", rotated)
+		a.log.Infof("audit log rotated to %s.1", a.path)
 	}
 }
 

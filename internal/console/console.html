@@ -93,6 +93,13 @@
         <datalist id="obURLList"></datalist>
         <label>访问令牌（由服务器管理员签发）</label>
         <input type="password" id="obToken" placeholder="token" required autocomplete="off">
+        <div class="chk" style="margin-top:14px; padding:10px 12px; border:1px solid var(--color-border-secondary,#ccc); border-radius:8px; display:flex; gap:8px; align-items:flex-start">
+          <input type="checkbox" id="obWrite" style="margin-top:2px">
+          <label for="obWrite" style="margin:0; font-weight:normal">
+            <strong>允许云端 AI 写入以上目录</strong><br>
+            <span class="muted">不勾选 = 只读访问（AI 只能列出/读取/搜索/看属性）；勾选后 AI 才能创建、修改文件与目录。可随时在「连接配置」页改。</span>
+          </label>
+        </div>
         <div style="margin-top:16px"><button class="btn" type="submit">保存并连接</button></div>
         <div class="msg" id="obMsg"></div>
       </form>
@@ -309,6 +316,7 @@ $("onboardForm").addEventListener("submit", async e => {
   cfg.token = $("obToken").value;
   if (state.dirs.length === 0 && $("obDir").value.trim()) state.dirs.push({ path: $("obDir").value.trim(), enabled: true });
   cfg.allowed_dirs = state.dirs;
+  cfg.allow_write = $("obWrite").checked;
   try {
     await api("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
     refreshRecent();

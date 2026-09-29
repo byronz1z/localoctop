@@ -16,6 +16,12 @@ from typing import Any
 
 logger = logging.getLogger("localoctop.audit")
 
+# Retention per task spec v1.1 §7.5: size rotation keeps bounded generations
+# (path.1 newest ... path.<MAX_GENERATIONS> oldest); any rotated generation
+# older than RETENTION_DAYS is deleted.
+MAX_GENERATIONS = 30
+RETENTION_DAYS = 30
+
 
 class AuditLog:
     """Appends JSON-line audit records to a file.
@@ -73,11 +79,34 @@ class AuditLog:
     def _rotate_if_needed(self) -> None:
         try:
             if self._max_bytes > 0 and os.path.getsize(self._path) >= self._max_bytes:
-                rotated = self._path + ".1"
-                if os.path.exists(rotated):
-                    os.remove(rotated)
-                os.replace(self._path, rotated)
+                self._rotate_locked()
         except FileNotFoundError:
             pass
         except OSError as exc:
             logger.warning("audit rotation failed: %s", exc)
+
+    def _rotate_locked(self) -> None:
+        """Size rotation with 30-generation cap and 30-day retention
+        (task spec v1.1 §7.5):         path.N shifts to path.N+1, path becomes
+        path.1, stale generations are pruned by mtime."""
+        oldest = f"{self._path}.{MAX_GENERATIONS + 1}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(MAX_GENERATIONS - 1, 0, -1):
+            src = f"{self._path}.{i}"
+            if os.path.exists(src):
+                os.replace(src, f"{self._path}.{i + 1}")
+        os.replace(self._path, f"{self._path}.1")
+        # Prune rotated generations older than the retention window;
+        # generation order matches age order, so stop at the first fresh one.
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        for i in range(MAX_GENERATIONS, 1, -1):
+            p = f"{self._path}.{i}"
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    logger.info("audit: pruned %s (older than %d days)", p, RETENTION_DAYS)
+                else:
+                    break
+            except FileNotFoundError:
+                continue

@@ -8,9 +8,9 @@ import "encoding/json"
 
 // Request is an inbound call from the adapter: {id, method, params}.
 type Request struct {
-	ID     json.RawMessage          `json:"id"`
-	Method string                   `json:"method"`
-	Params map[string]any           `json:"params,omitempty"`
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params map[string]any  `json:"params,omitempty"`
 	// FrameType lets the adapter send control messages ("ping"/"register")
 	// that are not tool calls. Empty means a tool call.
 	FrameType string `json:"type,omitempty"`
@@ -49,7 +49,7 @@ const (
 
 // Version is the product version, reported in register frames and shown on
 // the console's about page. Preview releases start at v0.1.0.
-const Version = "0.3.1"
+const Version = "0.4.0"
 
 // ---- Tool result shapes (mirrored by the adapter's MCP content blocks) ----
 
@@ -75,7 +75,9 @@ type ReadFileResult struct {
 	Text      string `json:"text,omitempty"`
 	Base64    string `json:"base64,omitempty"`
 	Encoding  string `json:"encoding"` // "utf-8" | "base64"
-	Size      int64  `json:"size"`
+	Size      int64  `json:"size"`     // total file size on disk
+	Offset    int64  `json:"offset"`   // byte window start (0 = whole file)
+	Bytes     int64  `json:"bytes"`    // bytes actually returned
 	Truncated bool   `json:"truncated"`
 }
 

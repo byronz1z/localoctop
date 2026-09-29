@@ -2,6 +2,7 @@ package localoctop
 
 import (
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -257,4 +258,147 @@ func TestWriteFile_Base64(t *testing.T) {
 	if err != nil || len(data) != 3 || data[1] != 0xff {
 		t.Fatalf("bad base64 write: %v %v", data, err)
 	}
+}
+
+// ---- §7.2 contract params ----
+
+func TestListDirectory_Depth(t *testing.T) {
+	tl, _ := newTestTools(t, false, 0)
+	// depth 1 (default): docs/a.md must NOT appear.
+	res, berr := tl.listDirectory(map[string]any{"path": "."})
+	if berr != nil {
+		t.Fatalf("depth1 failed: %v", berr)
+	}
+	for _, e := range res.Entries {
+		if strings.ContainsRune(e.Name, filepath.Separator) || strings.Contains(e.Name, "/") {
+			t.Fatalf("depth1 leaked nested entry %q", e.Name)
+		}
+	}
+	// depth 2: docs/a.md appears with relative path.
+	res2, berr := tl.listDirectory(map[string]any{"path": ".", "depth": 2})
+	if berr != nil {
+		t.Fatalf("depth2 failed: %v", berr)
+	}
+	var sawNested bool
+	sep := string(filepath.Separator)
+	for _, e := range res2.Entries {
+		if e.Name == filepath.Join("docs", "a.md") || strings.ReplaceAll(e.Name, "/", sep) == filepath.Join("docs", "a.md") {
+			sawNested = true
+		}
+	}
+	if !sawNested {
+		t.Fatalf("depth2 missing nested entry; got %v", namesOf(res2.Entries))
+	}
+	// depth clamped to max 3.
+	res3, berr := tl.listDirectory(map[string]any{"path": ".", "depth": 99})
+	if berr != nil {
+		t.Fatalf("depth clamp failed: %v", berr)
+	}
+	_ = res3
+}
+
+func TestListDirectory_Limit(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	for i := 0; i < 10; i++ {
+		must(t, os.WriteFile(filepath.Join(root, fmt.Sprintf("f%02d.txt", i)), []byte("x"), 0o644))
+	}
+	res, berr := tl.listDirectory(map[string]any{"path": ".", "limit": 3})
+	if berr != nil {
+		t.Fatalf("limit failed: %v", berr)
+	}
+	if len(res.Entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(res.Entries))
+	}
+	// limit over contract cap clamps to 2000 (not rejected).
+	res2, berr := tl.listDirectory(map[string]any{"path": ".", "limit": 999999})
+	if berr != nil {
+		t.Fatalf("big limit failed: %v", berr)
+	}
+	_ = res2
+}
+
+func TestReadFile_OffsetLength(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	must(t, os.WriteFile(filepath.Join(root, "window.txt"), []byte("0123456789abcdef"), 0o644))
+	res, berr := tl.readFile(map[string]any{"path": "window.txt", "offset": 4, "length": 4})
+	if berr != nil {
+		t.Fatalf("offset/length failed: %v", berr)
+	}
+	if res.Text != "4567" {
+		t.Fatalf("expected 4567, got %q", res.Text)
+	}
+	if res.Size != 16 || res.Offset != 4 || res.Bytes != 4 || !res.Truncated {
+		t.Fatalf("window metadata wrong: size=%d off=%d bytes=%d trunc=%v", res.Size, res.Offset, res.Bytes, res.Truncated)
+	}
+	// offset beyond EOF -> empty window, no error.
+	res2, berr := tl.readFile(map[string]any{"path": "window.txt", "offset": 99})
+	if berr != nil {
+		t.Fatalf("offset clamping failed: %v", berr)
+	}
+	if res2.Bytes != 0 {
+		t.Fatalf("expected 0 bytes, got %d", res2.Bytes)
+	}
+	// offset+length lets a big file through while whole-file read stays capped.
+	tl2, root2 := newTestTools(t, false, 8)
+	must(t, os.WriteFile(filepath.Join(root2, "big.txt"), []byte("0123456789"), 0o644))
+	res3, berr := tl2.readFile(map[string]any{"path": "big.txt", "offset": 0, "length": 4})
+	if berr != nil {
+		t.Fatalf("windowed read of oversized file failed: %v", berr)
+	}
+	if res3.Text != "0123" {
+		t.Fatalf("expected 0123, got %q", res3.Text)
+	}
+	if _, berr := tl2.readFile(map[string]any{"path": "big.txt"}); berr == nil {
+		t.Fatal("whole-file oversized read should still fail")
+	}
+}
+
+func TestSearchFiles_LimitParam(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	for i := 0; i < 5; i++ {
+		must(t, os.WriteFile(filepath.Join(root, fmt.Sprintf("hit%d.md", i)), []byte("x"), 0o644))
+	}
+	res, berr := tl.searchFiles(map[string]any{"pattern": "hit*.md", "limit": 2})
+	if berr != nil {
+		t.Fatalf("limit param failed: %v", berr)
+	}
+	if len(res.Matches) != 2 || !res.Truncated {
+		t.Fatalf("expected 2 truncated, got %d trunc=%v", len(res.Matches), res.Truncated)
+	}
+}
+
+func TestSearchFiles_SkipsVCSAndNonRecursive(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	must(t, os.MkdirAll(filepath.Join(root, ".git"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, ".git", "config.md"), []byte("x"), 0o644))
+	must(t, os.MkdirAll(filepath.Join(root, "deep"), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, "deep", "nested.md"), []byte("x"), 0o644))
+	// .git contents never surface.
+	res, berr := tl.searchFiles(map[string]any{"pattern": "*.md"})
+	if berr != nil {
+		t.Fatalf("vcs skip failed: %v", berr)
+	}
+	for _, m := range res.Matches {
+		if strings.Contains(m.Path, ".git") {
+			t.Fatalf("search leaked .git entry %q", m.Path)
+		}
+	}
+	// recursive=false -> only immediate children.
+	res2, berr := tl.searchFiles(map[string]any{"pattern": "*.md", "recursive": false})
+	if berr != nil {
+		t.Fatalf("non-recursive failed: %v", berr)
+	}
+	for _, m := range res2.Matches {
+		if strings.ContainsAny(m.Path, `/\`) {
+			t.Fatalf("non-recursive leaked nested %q", m.Path)
+		}
+	}
+}
+
+func namesOf(entries []DirEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Name)
+	}
+	return out
 }

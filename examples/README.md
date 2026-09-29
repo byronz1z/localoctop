@@ -36,7 +36,8 @@ docker run -d --name localoctop-server -p 127.0.0.1:8080:8080 \
 1. 选择白名单目录（AI 只能看到这些目录）；
 2. 服务器地址填 `wss://你的域名/mcp/localoctop/ws`；
 3. 令牌填 **bridge_token**（`CHANGE_ME_BRIDGE_TOKEN` 换成的那个）；
-4. 「保存并连接」，状态页显示「已连接」即成功。
+4. 需要云端 AI 写文件时勾选「允许云端 AI 写入」；不勾选 = 只读；
+5. 「保存并连接」，状态页显示「已连接」即成功。
 
 无人值守环境可用 headless 模式：
 
@@ -48,13 +49,19 @@ docker run -d --name localoctop-server -p 127.0.0.1:8080:8080 \
 ## 第 3 步：Octop 后台贴连接器配置
 
 把 `octop-mcp-connector.example.json` 的内容贴入 Octop 后台
-「连接器 → 自定义 MCP」保存（对应接口 `PUT /api/connectors/custom-mcp`）：
+「连接器 → 自定义 MCP」保存（对应接口 `PUT /api/connectors/custom-mcp`）。
+
+> ⚠ 文件内容本身就是「服务器名 → 配置」的内层映射，**整文件原样粘贴即可**。
+> 不要再在外面包一层 `"servers": { ... }`——粘贴框提交时会自动作为 `servers`
+> 字段发送，多包一层会被当成名为 `servers` 的服务器校验，报「连接器凭证无效」。
 
 - `url`：`https://你的域名/mcp/localoctop/`（公网必须 https；回环/内网可 http）；
 - `headers.Authorization`：`Bearer ` + **mcp_token**（不是第 2 步那个！）；
-- 保存后点「测试」：Octop 会做 `initialize` + `tools/list` 探测，
-  成功时列出 4 个只读工具（`list_directory` / `read_file` /
-  `search_files` / `get_file_info`）。
+- 保存后点「测试」：Octop 会做 `initialize` + `tools/list` 探测。
+  探测时桥不在线也通过（initialize/tools/list 不依赖客户端）；
+  服务器写开关开时列出 6 个工具（4 读 + `write_file` /
+  `create_directory`），只读状态下只列出 4 个只读工具。实际执行写还取决于
+  员工机侧「允许写入」开关——双侧任一侧关，写调用即被拒。
 
 字段依据：Octop `src/octop/infra/connectors/custom_mcp.py` 的
 `normalize_server_spec`（transport/url/headers/display_name/enabled）与

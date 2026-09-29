@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 
 import pytest
 
@@ -119,3 +120,33 @@ def test_validate_tool_name():
     with pytest.raises(BridgeProtocolError) as ei:
         validate_tool_name("format_disk", write_enabled=True)
     assert ei.value.code == CODE_METHOD_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_audit_rotation_keeps_generations(tmp_path):
+    """§7.5: rotating keeps history (path.1, path.2, ...) instead of discarding."""
+    path = str(tmp_path / "calls.jsonl")
+    log = AuditLog(path, max_bytes=1)  # rotate on every append
+    for i in range(3):
+        await log.record(user_id="u", method=f"m{i}", decision="allow", code=0)
+    # rotate happens before each append: after 3 writes the current file plus
+    # two rotated generations (.1, .2) exist.
+    assert os.path.exists(path)
+    assert os.path.exists(path + ".1")
+    assert os.path.exists(path + ".2")
+
+
+@pytest.mark.asyncio
+async def test_audit_rotation_prunes_old_generations(tmp_path):
+    """§7.5: rotated generations older than 30 days are deleted."""
+    path = str(tmp_path / "calls.jsonl")
+    log = AuditLog(path, max_bytes=1)
+    await log.record(user_id="u", method="m", decision="allow", code=0)  # writes file
+    await log.record(user_id="u", method="m", decision="allow", code=0)  # rotates -> .1
+    # Make the rotated generation look 31 days old.
+    old = time.time() - 31 * 86400
+    os.utime(path + ".1", (old, old))
+    await log.record(user_id="u", method="m", decision="allow", code=0)  # rotates again
+    # .1 shifted to .2 (old) is pruned; current .1 (fresh) survives.
+    assert os.path.exists(path + ".1")
+    assert not os.path.exists(path + ".2"), "31-day-old generation must be pruned"

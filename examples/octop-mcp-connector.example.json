@@ -1,13 +1,11 @@
 {
-  "servers": {
-    "localoctop": {
-      "transport": "streamable_http",
-      "url": "https://CHANGE_ME_SERVER/mcp/localoctop/",
-      "headers": {
-        "Authorization": "Bearer CHANGE_ME_MCP_TOKEN"
-      },
-      "display_name": "本地文件（localoctop）",
-      "enabled": true
-    }
+  "localoctop": {
+    "transport": "streamable_http",
+    "url": "https://CHANGE_ME_SERVER/mcp/localoctop/",
+    "headers": {
+      "Authorization": "Bearer CHANGE_ME_MCP_TOKEN"
+    },
+    "display_name": "本地文件（localoctop）",
+    "enabled": true
   }
 }

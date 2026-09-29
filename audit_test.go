@@ -119,3 +119,28 @@ func TestAuditEvent_TimestampFormat(t *testing.T) {
 		t.Fatalf("unexpected timestamp %q", captured.Time)
 	}
 }
+
+func TestAuditLogger_PrunesOldGenerations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.log")
+	// maxBytes=1 forces rotation on every write after the first.
+	a, err := NewAuditLogger(path, 1, NopLogger{}, nil)
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	a.Record(AuditEvent{Method: "read_file", Decision: "allow"}) // file
+	a.Record(AuditEvent{Method: "read_file", Decision: "allow"}) // rotate -> .1
+	// Age .1 past the 30-day window.
+	old := time.Now().UTC().AddDate(0, 0, -31)
+	if err := os.Chtimes(path+".1", old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	a.Record(AuditEvent{Method: "read_file", Decision: "allow"}) // rotates: .1->.2(stale, prune), fresh .1
+	_ = a.Close()
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("fresh .1 must survive: %v", err)
+	}
+	if _, err := os.Stat(path + ".2"); err == nil {
+		t.Fatal("31-day-old generation .2 must be pruned")
+	}
+}
