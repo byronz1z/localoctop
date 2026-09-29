@@ -53,12 +53,9 @@ jobs:
       - name: Package adapter zip
         run: |
           $tag = "${{ github.ref_name }}"
-          # adapter/ is self-contained; stage it without local runtime
-          # artifacts (defensive: a clean CI checkout has none of these).
-          New-Item -ItemType Directory -Force dist/adapter-pkg | Out-Null
-          robocopy adapter dist/adapter-pkg /E /XD .venv __pycache__ .pytest_cache logs /NFL /NDL /NJH /NJS | Out-Null
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed: $LASTEXITCODE" }
-          Compress-Archive -Path dist/adapter-pkg/* -DestinationPath "dist/mcp-localfs-adapter-$tag.zip"
+          # Clean CI checkout has no runtime artifacts under adapter/ (all gitignored),
+          # so zip the tracked directory directly; -Force keeps re-runs idempotent.
+          Compress-Archive -Path adapter -DestinationPath "dist/mcp-localfs-adapter-$tag.zip" -Force
 
       - name: sha256 checksums
         run: |
