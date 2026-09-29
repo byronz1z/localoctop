@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // DefaultConsolePort is the preferred console port; on conflict the shell
@@ -27,6 +28,18 @@ type Dir struct {
 	Enabled bool   `json:"enabled"`
 }
 
+// RecentServer is one entry of the remembered server list: the URL plus the
+// token that was last used with it. The token stays on disk in the 0600
+// config file and is only ever sent back to the console page on loopback —
+// it is never auto-filled from the network.
+type RecentServer struct {
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}
+
+// MaxRecentServers caps the remembered server list (task spec: 5).
+const MaxRecentServers = 5
+
 // File is everything the local web console can read and write.
 type File struct {
 	ServerURL   string `json:"server_url"`
@@ -35,6 +48,11 @@ type File struct {
 	AllowWrite  bool   `json:"allow_write"`
 	ConsolePort int    `json:"console_port"` // 0 = default (19880)
 	OpenBrowser bool   `json:"open_browser"` // open the console in the browser on start
+
+	// RecentServers remembers the last used server connections (deduped,
+	// most recent first, capped at MaxRecentServers) so the console can
+	// offer them in a dropdown. Absent in pre-0.2.1 files: loads as empty.
+	RecentServers []RecentServer `json:"recent_servers,omitempty"`
 
 	// AuditLogPath is fixed at the data dir by DefaultPath; kept in the file
 	// so power users can redirect it.
@@ -66,6 +84,26 @@ func (f File) EnabledDirs() []string {
 		}
 	}
 	return out
+}
+
+// RememberServer records a used server connection in RecentServers: the URL
+// is deduped case-insensitively, the entry moves to the front, and the list
+// is capped at MaxRecentServers. Empty URLs are ignored.
+func (f *File) RememberServer(url, token string) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return
+	}
+	out := []RecentServer{{URL: url, Token: token}}
+	for _, r := range f.RecentServers {
+		if !strings.EqualFold(r.URL, url) {
+			out = append(out, r)
+		}
+	}
+	if len(out) > MaxRecentServers {
+		out = out[:MaxRecentServers]
+	}
+	f.RecentServers = out
 }
 
 // UnmarshalJSON accepts both the current form ([]Dir) and the legacy plain

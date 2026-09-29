@@ -50,6 +50,9 @@
   .btn.danger { background: none; color: var(--bad); border: 1px solid var(--bad); padding: 4px 12px; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .chk { display: flex; gap: 8px; align-items: center; margin: 12px 0; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 2px; }
+  .chip { border: 1px solid var(--line); background: var(--bg); color: var(--ink); padding: 4px 12px; border-radius: 14px; cursor: pointer; font: inherit; font-size: 12.5px; }
+  .chip:hover { border-color: var(--accent); color: var(--accent); }
   .msg { margin: 10px 0; padding: 8px 14px; border-radius: 8px; display: none; }
   .msg.ok { display: block; background: #e5f4ec; color: var(--ok); }
   .msg.err { display: block; background: #fbe9e9; color: var(--bad); }
@@ -80,9 +83,14 @@
       <p class="muted">首次使用需要完成三步：选择白名单目录 → 填写服务器地址与令牌 → 保存并连接。</p>
       <form id="onboardForm">
         <label>白名单目录（云端 AI 只能访问这些目录）</label>
-        <input type="text" id="obDir" placeholder="例如 C:\Users\me\Documents\Octop" required>
+        <div class="row" style="align-items:center; gap:8px; flex-wrap:nowrap">
+          <input type="text" id="obDir" placeholder="例如 C:\Users\me\Documents\Octop" style="flex:1" required>
+          <button class="btn secondary" type="button" id="obBrowse">浏览文件夹…</button>
+        </div>
+        <div class="chips" id="obCommon"></div>
         <label>服务器地址</label>
-        <input type="url" id="obURL" placeholder="wss://your-octop-server/mcp-localfs/ws" required>
+        <input type="url" id="obURL" placeholder="ws://<server-ip>:8080/mcp-localfs/ws" list="obURLList" required>
+        <datalist id="obURLList"></datalist>
         <label>访问令牌（由服务器管理员签发）</label>
         <input type="password" id="obToken" placeholder="token" required autocomplete="off">
         <div style="margin-top:16px"><button class="btn" type="submit">保存并连接</button></div>
@@ -124,8 +132,10 @@
       <div class="dirs"><ul id="dirList"></ul></div>
       <div class="row" style="margin-top:12px; align-items:center">
         <input type="text" id="newDir" placeholder="添加目录（绝对路径，如 D:\projects\docs）" style="flex:1">
+        <button class="btn secondary" type="button" id="dirBrowseBtn">浏览文件夹…</button>
         <button class="btn" id="addDirBtn">添加</button>
       </div>
+      <div class="chips" id="dirCommon"></div>
       <div class="msg" id="dirMsg"></div>
     </div>
   </section>
@@ -136,7 +146,8 @@
       <h2>连接配置</h2>
       <form id="connForm">
         <label>服务器地址（WebSocket URL）</label>
-        <input type="url" id="cfURL" placeholder="wss://your-octop-server/mcp-localfs/ws">
+        <input type="url" id="cfURL" placeholder="ws://<server-ip>:8080/mcp-localfs/ws" list="cfURLList">
+        <datalist id="cfURLList"></datalist>
         <label>访问令牌</label>
         <input type="password" id="cfToken" autocomplete="off" placeholder="token" title="令牌仅保存在本机配置文件中，不会出现在日志里">
         <div class="chk"><input type="checkbox" id="cfWrite"><label for="cfWrite" style="margin:0">允许写入（默认关闭：只读访问）</label></div>
@@ -174,7 +185,7 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const state = { dirs: [], token: "" };
+const state = { dirs: [], token: "", recent: [] };
 
 /* ---------- navigation ---------- */
 document.querySelectorAll("nav button").forEach(btn => {
@@ -199,6 +210,86 @@ async function api(path, opts) {
   return data;
 }
 
+/* ---------- native directory picker (browse) ---------- */
+async function browseDir(btn, inputEl, msgEl) {
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "选择中…";
+  try {
+    const r = await api("/api/browse");
+    if (r.selected && r.path) {
+      inputEl.value = r.path; // picked: auto-fill, ready to submit
+    }
+    // cancelled (selected=false): leave the form untouched
+  } catch (err) {
+    if (msgEl) flash(msgEl, "无法打开目录选择器：" + err.message + "（请手动输入路径）", false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prev;
+  }
+}
+$("obBrowse").addEventListener("click", () => browseDir($("obBrowse"), $("obDir"), $("obMsg")));
+$("dirBrowseBtn").addEventListener("click", () => browseDir($("dirBrowseBtn"), $("newDir"), $("dirMsg")));
+
+/* ---------- common locations (one-click add) ---------- */
+function renderChips(container, dirs, onClick) {
+  container.innerHTML = "";
+  dirs.forEach(d => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "chip";
+    b.textContent = "+ " + d.name;
+    b.title = d.path;
+    b.addEventListener("click", () => onClick(d.path));
+    container.appendChild(b);
+  });
+}
+async function loadCommonDirs() {
+  try {
+    const r = await api("/api/commondirs");
+    const dirs = r.dirs || [];
+    // Onboarding: fill the input (submitted with the form). Dirs page: add+save now.
+    renderChips($("obCommon"), dirs, p => { $("obDir").value = p; });
+    renderChips($("dirCommon"), dirs, p => addCommonDir(p));
+  } catch { /* no common locations available */ }
+}
+async function addCommonDir(path) {
+  if (state.dirs.some(d => d.path.toLowerCase() === path.toLowerCase())) {
+    flash($("dirMsg"), "该目录已在白名单中", false);
+    return;
+  }
+  state.dirs.push({ path, enabled: true });
+  renderDirs();
+  await saveDirs();
+}
+
+/* ---------- recent servers (dropdown + token auto-fill) ---------- */
+function renderRecent() {
+  ["obURLList", "cfURLList"].forEach(id => {
+    const dl = $(id);
+    dl.innerHTML = "";
+    state.recent.forEach(r => {
+      const o = document.createElement("option");
+      o.value = r.url;
+      dl.appendChild(o);
+    });
+  });
+}
+function onURLPick(inputEl, tokenEl) {
+  const v = inputEl.value.trim();
+  const hit = state.recent.find(r => r.url.toLowerCase() === v.toLowerCase());
+  if (hit && hit.token) tokenEl.value = hit.token; // refill stored token locally
+}
+$("obURL").addEventListener("change", () => onURLPick($("obURL"), $("obToken")));
+$("cfURL").addEventListener("change", () => onURLPick($("cfURL"), $("cfToken")));
+async function refreshRecent() {
+  try {
+    const cfg = await api("/api/config");
+    state.recent = cfg.recent_servers || [];
+    renderRecent();
+  } catch { /* keep current list */ }
+}
+
 /* ---------- config load ---------- */
 async function loadAbout() {
   try {
@@ -220,6 +311,7 @@ $("onboardForm").addEventListener("submit", async e => {
   cfg.allowed_dirs = state.dirs;
   try {
     await api("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    refreshRecent();
     flash($("obMsg"), "已保存，正在连接…", true);
     setTimeout(() => showPage("status"), 900);
   } catch (err) { flash($("obMsg"), err.message, false); }
@@ -241,7 +333,7 @@ function renderDirs() {
     const code = document.createElement("code"); code.textContent = d.path;
     const del = document.createElement("button");
     del.className = "btn danger"; del.textContent = "删除";
-    del.addEventListener("click", () => { state.dirs.splice(i, 1); saveDirs(); });
+    del.addEventListener("click", () => { state.dirs.splice(i, 1); renderDirs(); saveDirs(); });
     li.append(chk, code, del);
     ul.appendChild(li);
   });
@@ -266,8 +358,8 @@ $("addDirBtn").addEventListener("click", async () => {
   }
   state.dirs.push({ path: p, enabled: true });
   $("newDir").value = "";
-  await saveDirs();
   renderDirs();
+  await saveDirs();
 });
 
 /* ---------- connection page ---------- */
@@ -285,6 +377,7 @@ $("connForm").addEventListener("submit", async e => {
   cfg.console_port = parseInt($("cfPort").value, 10) || 19880;
   try {
     await api("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    refreshRecent();
     flash($("cfMsg"), "已保存并重连", true);
   } catch (err) { flash($("cfMsg"), err.message, false); }
 });
@@ -341,9 +434,12 @@ async function boot() {
     $("cfPort").value = cfg.console_port || 19880;
     renderDirs();
     renderStatus(st);
+    state.recent = cfg.recent_servers || [];
+    renderRecent();
     if (!cfg.configured) showPage("onboard"); else showPage("status");
   } catch (err) { console.error(err); }
   loadAbout();
+  loadCommonDirs();
   connectSSE();
 }
 boot();

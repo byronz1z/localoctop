@@ -9,7 +9,7 @@
 
 - 模块名：`github.com/byronz1z/octop-local-bridge`
 - 许可证：Apache-2.0
-- 版本：v0.1.0（预览期）
+- 版本：v0.2.1（预览期）
 
 ## 是什么
 

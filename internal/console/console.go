@@ -4,6 +4,7 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -81,6 +82,8 @@ func New(cfg appcfg.File, apply func(appcfg.File) error) *Server {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/about", s.handleAbout)
 	mux.HandleFunc("/api/events", s.handleEvents)
+	mux.HandleFunc("/api/browse", s.handleBrowse)
+	mux.HandleFunc("/api/commondirs", s.handleCommonDirs)
 	s.mux = mux
 	return s
 }
@@ -166,13 +169,14 @@ func (s *Server) handleAbout(w http.ResponseWriter, r *http.Request) {
 // console is loopback-only and the settings page needs to show the current
 // value in its (masked) input.
 type configView struct {
-	ServerURL   string       `json:"server_url"`
-	Token       string       `json:"token"`
-	AllowedDirs []appcfg.Dir `json:"allowed_dirs"`
-	AllowWrite  bool         `json:"allow_write"`
-	ConsolePort int          `json:"console_port"`
-	OpenBrowser bool         `json:"open_browser"`
-	Configured  bool         `json:"configured"` // false = show onboarding
+	ServerURL     string                `json:"server_url"`
+	Token         string                `json:"token"`
+	AllowedDirs   []appcfg.Dir          `json:"allowed_dirs"`
+	AllowWrite    bool                  `json:"allow_write"`
+	ConsolePort   int                   `json:"console_port"`
+	OpenBrowser   bool                  `json:"open_browser"`
+	RecentServers []appcfg.RecentServer `json:"recent_servers"`
+	Configured    bool                  `json:"configured"` // false = show onboarding
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -180,13 +184,14 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		c := s.config()
 		writeJSON(w, http.StatusOK, configView{
-			ServerURL:   c.ServerURL,
-			Token:       c.Token,
-			AllowedDirs: c.AllowedDirs,
-			AllowWrite:  c.AllowWrite,
-			ConsolePort: c.ConsolePort,
-			OpenBrowser: c.OpenBrowser,
-			Configured:  c.ServerURL != "" && c.Token != "" && len(c.EnabledDirs()) > 0,
+			ServerURL:     c.ServerURL,
+			Token:         c.Token,
+			AllowedDirs:   c.AllowedDirs,
+			AllowWrite:    c.AllowWrite,
+			ConsolePort:   c.ConsolePort,
+			OpenBrowser:   c.OpenBrowser,
+			RecentServers: c.RecentServers,
+			Configured:    c.ServerURL != "" && c.Token != "" && len(c.EnabledDirs()) > 0,
 		})
 	case http.MethodPost:
 		var in configView
@@ -201,6 +206,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		cfg.AllowWrite = in.AllowWrite
 		cfg.ConsolePort = in.ConsolePort
 		cfg.OpenBrowser = in.OpenBrowser
+		// Remember this connection (deduped, capped) so the console can offer
+		// it in the server dropdown next time.
+		cfg.RememberServer(in.ServerURL, in.Token)
 		// apply validates via octobridge.Config.Validate, persists, and
 		// rebuilds the bridge; the returned error is user-actionable.
 		if err := s.apply(cfg); err != nil {
@@ -213,6 +221,46 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 	}
+}
+
+// handleBrowse opens the native directory picker and returns the chosen
+// path. Serialized: at most one dialog at a time — a concurrent request gets
+// 409 so the UI can tell the user instead of opening a second window.
+func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !browseMu.TryLock() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "a directory picker is already open"})
+		return
+	}
+	defer browseMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(r.Context(), BrowseTimeout)
+	defer cancel()
+	path, ok, err := currentPicker()(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"selected": ok, "path": path})
+}
+
+// handleCommonDirs lists the frequently-used locations that exist on this
+// machine, for one-click whitelist adding.
+func (s *Server) handleCommonDirs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	dirs := commonDirs()
+	if dirs == nil {
+		dirs = []CommonDir{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"dirs": dirs})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
