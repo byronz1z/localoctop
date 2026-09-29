@@ -94,10 +94,10 @@
         <label>访问令牌（由服务器管理员签发）</label>
         <input type="password" id="obToken" placeholder="token" required autocomplete="off">
         <div class="chk" style="margin-top:14px; padding:10px 12px; border:1px solid var(--color-border-secondary,#ccc); border-radius:8px; display:flex; gap:8px; align-items:flex-start">
-          <input type="checkbox" id="obWrite" style="margin-top:2px">
+          <input type="checkbox" id="obWrite" checked style="margin-top:2px">
           <label for="obWrite" style="margin:0; font-weight:normal">
             <strong>允许云端 AI 写入以上目录</strong><br>
-            <span class="muted">不勾选 = 只读访问（AI 只能列出/读取/搜索/看属性）；勾选后 AI 才能创建、修改文件与目录。可随时在「连接配置」页改。</span>
+            <span class="muted">默认开启：AI 可创建、修改、删除白名单内文件。取消勾选 = 只读访问（AI 只能列出/读取/搜索/看属性）。可随时在「连接配置」页改。</span>
           </label>
         </div>
         <div style="margin-top:16px"><button class="btn" type="submit">保存并连接</button></div>
@@ -157,7 +157,7 @@
         <datalist id="cfURLList"></datalist>
         <label>访问令牌</label>
         <input type="password" id="cfToken" autocomplete="off" placeholder="token" title="令牌仅保存在本机配置文件中，不会出现在日志里">
-        <div class="chk"><input type="checkbox" id="cfWrite"><label for="cfWrite" style="margin:0">允许写入（默认关闭：只读访问）</label></div>
+        <div class="chk"><input type="checkbox" id="cfWrite"><label for="cfWrite" style="margin:0">允许写入（默认开启：取消勾选=只读访问）</label></div>
         <div class="chk"><input type="checkbox" id="cfBrowser"><label for="cfBrowser" style="margin:0">启动时自动打开控制台页面</label></div>
         <label>控制台端口（重启后生效）</label>
         <input type="number" id="cfPort" min="1024" max="65535">
@@ -184,7 +184,7 @@
         <tr><th>审计日志</th><td class="mono" id="abAudit">—</td></tr>
       </table>
       <p class="muted" style="margin-top:14px">安全模型：路径白名单 + 穿越/符号链接逃逸防护 + Bearer 认证 + 全量审计（allow/deny/error）。
-      写工具默认禁用。控制台仅监听 127.0.0.1。</p>
+      写工具默认启用，可在连接配置页关闭。控制台仅监听 127.0.0.1。</p>
     </div>
   </section>
 </main>

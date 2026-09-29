@@ -39,7 +39,9 @@ func main() {
 	server := flag.String("server", envOr("LOCALOCTOP_SERVER_URL", ""), "headless: adapter WebSocket URL")
 	token := flag.String("token", envOr("LOCALOCTOP_TOKEN", ""), "headless: user token issued by the adapter")
 	dirs := flag.String("dir", envOr("LOCALOCTOP_DIRS", ""), "headless: comma-separated whitelist directories")
-	allowWrite := flag.Bool("write", envOr("LOCALOCTOP_ALLOW_WRITE", "") == "1", "headless: enable reserved write tools (default off)")
+	// User ruling 2026-09-29: write is ON by default (switch kept). Opt out
+	// with -write=false or LOCALOCTOP_ALLOW_WRITE=0.
+	allowWrite := flag.Bool("write", envOr("LOCALOCTOP_ALLOW_WRITE", "1") != "0", "headless: reserved write tools enabled by default; -write=false for read-only")
 	audit := flag.String("audit", envOr("LOCALOCTOP_AUDIT", ""), "headless: audit log path (empty = stderr hook only)")
 	verbose := flag.Bool("v", false, "debug logging")
 	flag.Parse()

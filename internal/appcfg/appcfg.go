@@ -60,13 +60,15 @@ type File struct {
 }
 
 // Default returns the zero-settings file: empty server/token/dirs (triggers
-// first-run onboarding in the console), console on the default port, browser
-// auto-open on, and the audit log at its default location so auditing is on
-// from the very first run.
+// first-run onboarding in the console), write access ON by default (user
+// ruling 2026-09-29: switch kept, default checked; untick = read-only),
+// console on the default port, browser auto-open on, and the audit log at
+// its default location so auditing is on from the very first run.
 func Default() File {
 	f := File{
 		ConsolePort: DefaultConsolePort,
 		OpenBrowser: true,
+		AllowWrite:  true,
 	}
 	if p, err := AuditPath(); err == nil {
 		f.AuditLogPath = p
