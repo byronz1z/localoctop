@@ -43,6 +43,9 @@ type Bridge struct {
 	connected   bool
 	lastHealthy bool
 
+	// detail tracks the rich status surfaced via StatusDetail()/OnStatusDetail.
+	detail statusTracker
+
 	// shutdownCh is closed by Shutdown so Run's backoff sleep can exit early.
 	shutdownCh chan struct{}
 }
@@ -73,6 +76,7 @@ func New(cfg Config) (*Bridge, error) {
 		clientID: clientID,
 
 		shutdownCh: make(chan struct{}),
+		detail:     statusTracker{onEvent: cfg.OnStatusDetail},
 	}, nil
 }
 
@@ -104,6 +108,12 @@ func (b *Bridge) setConnected(v bool, err error) {
 	}
 }
 
+// StatusDetail returns the current rich connection snapshot. Safe to call
+// from any goroutine; the desktop shell polls this for its tray indicator.
+func (b *Bridge) StatusDetail() StatusDetail {
+	return b.detail.snapshot()
+}
+
 // Run blocks until ctx is cancelled, maintaining the connection with
 // exponential backoff. It is safe to call from a goroutine exactly once.
 func (b *Bridge) Run(ctx context.Context) error {
@@ -119,6 +129,15 @@ func (b *Bridge) Run(ctx context.Context) error {
 		err := b.runOnce(ctx)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		// Dial/session failures count as reconnect attempts for the detail
+		// surface; a clean Shutdown does not (no error, bridge is closing).
+		if err != nil {
+			b.detail.update(func(d *StatusDetail) {
+				d.Connected = false
+				d.ReconnectAttempt++
+				d.LastError = err.Error()
+			})
 		}
 		b.setConnected(false, err)
 		if err != nil {
@@ -168,6 +187,10 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 	headers.Set("User-Agent", "localoctop/"+Version)
 	conn, err := dialWS(dialCtx, b.cfg.ServerURL, headers, b.cfg.DialTimeout, nil, b.cfg.MaxMsgBytes)
 	if err != nil {
+		b.detail.update(func(d *StatusDetail) {
+			d.Connected = false
+			d.LastError = err.Error()
+		})
 		return err
 	}
 	b.mu.Lock()
@@ -185,27 +208,26 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 		return fmt.Errorf("register failed: %w", err)
 	}
 	b.setConnected(true, nil)
+	b.detail.update(func(d *StatusDetail) {
+		d.Connected = true
+		d.ReconnectAttempt = 0
+		d.LastError = ""
+	})
 	b.log.Infof("bridge connected to %s (client_id=%s)", b.cfg.ServerURL, b.clientID)
+
+	// Pong frames refresh LastPongAt; the hook runs on the readLoop goroutine
+	// (WSConn.ReadMessage dispatches it inline for opPong).
+	conn.onPong = func() {
+		b.detail.update(func(d *StatusDetail) {
+			d.LastPongAt = time.Now()
+		})
+	}
 
 	// Keep-alive pings.
 	pingDone := make(chan struct{})
 	go func() {
 		defer close(pingDone)
-		t := time.NewTicker(b.cfg.PingInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-conn.Closed():
-				return
-			case <-t.C:
-				if err := conn.Ping(); err != nil {
-					b.log.Debugf("ping failed: %v", err)
-					return
-				}
-			}
-		}
+		b.pingLoop(ctx, conn)
 	}()
 
 	err = b.readLoop(ctx, conn)
@@ -239,6 +261,41 @@ func (b *Bridge) sendRegister(conn *WSConn) error {
 		return err
 	}
 	return conn.WriteMessage(data)
+}
+
+// pingLoop keeps an idle session alive: without outbound traffic the
+// readLoop's PongWait deadline would trip within PongWait and drop a
+// perfectly healthy connection (the 70s field disconnects). One ping per
+// PingInterval refreshes both the wire and LastPingAt.
+//
+// It exits on ctx cancellation, socket teardown (conn.Closed, e.g. readLoop
+// hit the deadline or the peer sent a close frame), or a failed Ping — in
+// the failure case it closes the socket so readLoop unblocks at once instead
+// of waiting out the remaining read deadline. runOnce joins via pingDone
+// before returning, so no goroutine survives into the next session.
+func (b *Bridge) pingLoop(ctx context.Context, conn *WSConn) {
+	t := time.NewTicker(b.cfg.PingInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-conn.Closed():
+			return
+		case <-t.C:
+			if err := conn.Ping(); err != nil {
+				b.log.Debugf("ping failed: %v", err)
+				// Trigger the reconnect path immediately: readLoop is
+				// (likely) still blocked on ReadMessage with a full-window
+				// read deadline.
+				conn.Close()
+				return
+			}
+			b.detail.update(func(d *StatusDetail) {
+				d.LastPingAt = time.Now()
+			})
+		}
+	}
 }
 
 // readLoop serves requests until the socket breaks or ctx is cancelled.

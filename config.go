@@ -89,6 +89,11 @@ type Config struct {
 
 	// OnStatus, when set, is called on connect/disconnect transitions.
 	OnStatus func(connected bool, err error)
+	// OnStatusDetail, when set, receives a StatusDetail snapshot whenever the
+	// connection state changes (connect/disconnect/reconnect attempt, or a
+	// successful ping/pong refreshing the timestamps). Superset of OnStatus;
+	// both may be set. May be nil.
+	OnStatusDetail func(StatusDetail)
 	// OnAudit, when set, receives every audit event in addition to the file.
 	OnAudit func(AuditEvent)
 }
