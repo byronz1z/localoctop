@@ -52,9 +52,9 @@ type session struct {
 
 // server tracks sessions per token and proxies /call requests.
 type server struct {
-	log   *log.Logger
-	mu    sync.RWMutex
-	sess  map[string]*session // token -> latest session
+	log    *log.Logger
+	mu     sync.RWMutex
+	sess   map[string]*session // token -> latest session
 	tokens map[string]bool
 }
 
@@ -155,7 +155,9 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.log.Printf("token=%s: bridge registered client_id=%s version=%s from %s", token, reg.ClientID, reg.Version, r.RemoteAddr)
 
-	// Read pump: deliver responses to waiting /call requests.
+	// Read pump: deliver responses to waiting /call requests. App-level
+	// pings ({"type":"ping","id":N}) are answered with a JSON pong like the
+	// real adapter (bridge_ws.py) instead of being routed as responses.
 	for {
 		raw, err := conn.ReadMessage()
 		if err != nil {
@@ -163,9 +165,17 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		var env struct {
-			ID json.RawMessage `json:"id"`
+			Type string          `json:"type"`
+			ID   json.RawMessage `json:"id"`
 		}
 		if err := json.Unmarshal(raw, &env); err != nil {
+			continue
+		}
+		if env.Type == "ping" {
+			pong, _ := json.Marshal(map[string]any{"id": env.ID, "result": map[string]string{"type": "pong"}})
+			if err := conn.WriteMessage(pong); err != nil {
+				break
+			}
 			continue
 		}
 		var id int
@@ -264,8 +274,8 @@ func (s *server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 	out := make([]map[string]any, 0, len(s.sess))
 	for token, sess := range s.sess {
 		out = append(out, map[string]any{
-			"token":       token,
-			"client_id":   sess.clientID,
+			"token":        token,
+			"client_id":    sess.clientID,
 			"connected_at": sess.connected.Format(time.RFC3339),
 		})
 	}

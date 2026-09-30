@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -46,6 +47,13 @@ type Bridge struct {
 	// detail tracks the rich status surfaced via StatusDetail()/OnStatusDetail.
 	detail statusTracker
 
+	// pingMu guards the app-level ping bookkeeping: pingSeq hands out
+	// monotonic ids (never reused, across sessions too) and pendingPings
+	// holds the ids still awaiting their JSON pong from the adapter.
+	pingMu       sync.Mutex
+	pingSeq      int64
+	pendingPings map[int64]struct{}
+
 	// shutdownCh is closed by Shutdown so Run's backoff sleep can exit early.
 	shutdownCh chan struct{}
 }
@@ -75,8 +83,9 @@ func New(cfg Config) (*Bridge, error) {
 		audit:    audit,
 		clientID: clientID,
 
-		shutdownCh: make(chan struct{}),
-		detail:     statusTracker{onEvent: cfg.OnStatusDetail},
+		shutdownCh:   make(chan struct{}),
+		detail:       statusTracker{onEvent: cfg.OnStatusDetail},
+		pendingPings: map[int64]struct{}{},
 	}, nil
 }
 
@@ -213,6 +222,12 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 		d.ReconnectAttempt = 0
 		d.LastError = ""
 	})
+	// Pings pending from a previous session can never be answered now (their
+	// socket is gone); drop them so the pending set stays bounded to one
+	// session's worth of ids.
+	b.pingMu.Lock()
+	b.pendingPings = map[int64]struct{}{}
+	b.pingMu.Unlock()
 	b.log.Infof("bridge connected to %s (client_id=%s)", b.cfg.ServerURL, b.clientID)
 
 	// Pong frames refresh LastPongAt; the hook runs on the readLoop goroutine
@@ -263,16 +278,24 @@ func (b *Bridge) sendRegister(conn *WSConn) error {
 	return conn.WriteMessage(data)
 }
 
-// pingLoop keeps an idle session alive: without outbound traffic the
-// readLoop's PongWait deadline would trip within PongWait and drop a
-// perfectly healthy connection (the 70s field disconnects). One ping per
-// PingInterval refreshes both the wire and LastPingAt.
+// pingLoop keeps an idle session alive on two independent layers:
 //
-// It exits on ctx cancellation, socket teardown (conn.Closed, e.g. readLoop
-// hit the deadline or the peer sent a close frame), or a failed Ping — in
-// the failure case it closes the socket so readLoop unblocks at once instead
-// of waiting out the remaining read deadline. runOnce joins via pingDone
-// before returning, so no goroutine survives into the next session.
+//   - the WS control-frame ping (conn.Ping) refreshes our own read deadline
+//     (PongWait) and NAT mappings on the path — but control frames never
+//     reach the adapter's application layer;
+//   - the app-level JSON ping {"type":"ping","id":N} feeds the adapter's
+//     receive_json() idle_timeout (bridge_ws.py closes with 4408 after
+//     idle_timeout of no *JSON* traffic — observed as the 0.6.0 field
+//     "58-second kick" despite control-frame pings). The adapter replies
+//     {"id":N,"result":{"type":"pong"}}, routed back through handleFrame's
+//     response path, and the pong refreshes LastPongAt.
+//
+// One tick sends both. It exits on ctx cancellation, socket teardown
+// (conn.Closed, e.g. readLoop hit the deadline or the peer sent a close
+// frame), or a failed send — in the failure case it closes the socket so
+// readLoop unblocks at once instead of waiting out the remaining read
+// deadline. runOnce joins via pingDone before returning, so no goroutine
+// survives into the next session.
 func (b *Bridge) pingLoop(ctx context.Context, conn *WSConn) {
 	t := time.NewTicker(b.cfg.PingInterval)
 	defer t.Stop()
@@ -291,11 +314,55 @@ func (b *Bridge) pingLoop(ctx context.Context, conn *WSConn) {
 				conn.Close()
 				return
 			}
+			if err := b.sendAppPing(conn); err != nil {
+				b.log.Debugf("app ping failed: %v", err)
+				conn.Close()
+				return
+			}
 			b.detail.update(func(d *StatusDetail) {
 				d.LastPingAt = time.Now()
 			})
 		}
 	}
+}
+
+// sendAppPing writes one application-layer ping frame with a fresh id and
+// records it as pending. The id is drawn from pingSeq, a monotonically
+// increasing counter that never collides with the adapter's own tool-call
+// ids (see handleFrame's pong routing).
+func (b *Bridge) sendAppPing(conn *WSConn) error {
+	b.pingMu.Lock()
+	b.pingSeq++
+	id := b.pingSeq
+	if b.pendingPings == nil {
+		b.pendingPings = map[int64]struct{}{}
+	}
+	b.pendingPings[id] = struct{}{}
+	b.pingMu.Unlock()
+
+	frame, err := json.Marshal(Request{ID: json.RawMessage(strconv.FormatInt(id, 10)), FrameType: "ping"})
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(frame)
+}
+
+// matchAppPong reports whether id is one of this bridge's outstanding
+// app-level pings (and takes it off the pending set). Used by handleFrame to
+// route result frames before they are mistaken for tool-call traffic.
+func (b *Bridge) matchAppPong(id json.RawMessage) bool {
+	if len(id) == 0 {
+		return false
+	}
+	var i int64
+	if err := json.Unmarshal(id, &i); err != nil {
+		return false
+	}
+	b.pingMu.Lock()
+	_, ok := b.pendingPings[i]
+	delete(b.pendingPings, i)
+	b.pingMu.Unlock()
+	return ok
 }
 
 // readLoop serves requests until the socket breaks or ctx is cancelled.
@@ -333,12 +400,40 @@ func (b *Bridge) readLoop(ctx context.Context, conn *WSConn) error {
 // handleFrame decodes and dispatches one inbound frame. Tool calls run in
 // their own goroutine (bounded by RequestWait) so a slow disk read cannot
 // stall the socket's read deadline.
+//
+// Frames carrying an id with a result/error envelope but no method are
+// *responses to frames we sent* — app-level pongs from pingLoop (and, if the
+// adapter ever echoes one of ours, anything else). They must be consumed
+// here, before the tool-call path: routing them onward would (a) dispatch a
+// nonsense method and (b) send a bogus error reply back over the socket,
+// whose id could collide with an in-flight tool call on the adapter side.
 func (b *Bridge) handleFrame(conn *WSConn, raw []byte) {
 	var req Request
 	if err := json.Unmarshal(raw, &req); err != nil {
 		b.log.Warnf("dropping malformed frame: %v", err)
 		return
 	}
+
+	// Response frames from the adapter: our app-ping pongs live here.
+	// A recognized pending ping id updates LastPongAt; an unrecognized
+	// response id is ignored (the adapter never sends unsolicited ones —
+	// and even a colliding future would just be an unmatched deliver).
+	// Tool calls always carry a method, so this never swallows one.
+	if req.Method == "" {
+		var resp Response
+		if err := json.Unmarshal(raw, &resp); err == nil &&
+			len(resp.ID) > 0 && (resp.Result != nil || resp.Error != nil) {
+			if b.matchAppPong(resp.ID) {
+				b.detail.update(func(d *StatusDetail) {
+					d.LastPongAt = time.Now()
+				})
+			} else {
+				b.log.Debugf("ignoring response frame with id %s (no pending app ping)", string(resp.ID))
+			}
+			return
+		}
+	}
+
 	switch req.FrameType {
 	case "ping":
 		b.respond(conn, Response{ID: req.ID, Result: map[string]string{"type": "pong", "client_id": b.clientID}})

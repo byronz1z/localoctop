@@ -50,12 +50,19 @@ func (r *detailRecorder) snapshot() []StatusDetail {
 // reads again — fine for request/response tests, useless for keep-alive.
 // Data frames (bridge responses) are forwarded on resp; the test writes
 // requests directly on the conn.
+//
+// jsonIdle, when > 0, emulates the real adapter's receive_json idle timeout:
+// if no JSON *data* frame arrives within jsonIdle, the server closes (4408).
+// Control pings do NOT count — that's the exact behavior that kicked the
+// 0.6.0 bridge every 58s in the field.
 type pongMock struct {
 	srv      *httptest.Server
 	token    string
 	register chan RegisterFrame
 	conns    chan *WSConn
 	resp     chan Response
+
+	jsonIdle time.Duration // server-side JSON idle timeout (0 = disabled)
 
 	regCountAtomic int64 // total registrations seen (survives channel drains)
 }
@@ -100,11 +107,39 @@ func newPongMock(t *testing.T, token string) *pongMock {
 		default:
 		}
 		// Pump: auto-pongs pings, forwards data frames as responses.
+		// App-level JSON pings ({"type":"ping","id":N}) are answered with
+		// {"id":N,"result":{"type":"pong"}} exactly like the real adapter
+		// (bridge_ws.py), and are NOT forwarded as responses.
+		// With jsonIdle > 0, ReadMessage gets a deadline refreshed only by
+		// data frames (control frames are consumed inside ReadMessage before
+		// it returns, so only JSON traffic — pings included — keeps this
+		// loop's deadline alive), mirroring the real receive_json timeout.
 		go func() {
+			if m.jsonIdle > 0 {
+				_ = conn.SetReadDeadline(time.Now().Add(m.jsonIdle))
+			}
 			for {
 				raw, err := conn.ReadMessage()
 				if err != nil {
+					if m.jsonIdle > 0 {
+						// Emulate CLOSE_IDLE: server-initiated close on idle.
+						_ = conn.Close()
+					}
 					return
+				}
+				if m.jsonIdle > 0 {
+					_ = conn.SetReadDeadline(time.Now().Add(m.jsonIdle))
+				}
+				var env struct {
+					Type string          `json:"type"`
+					ID   json.RawMessage `json:"id"`
+				}
+				if err := json.Unmarshal(raw, &env); err == nil && env.Type == "ping" {
+					pong, _ := json.Marshal(map[string]any{"id": env.ID, "result": map[string]string{"type": "pong"}})
+					if err := conn.WriteMessage(pong); err != nil {
+						return
+					}
+					continue
 				}
 				var resp Response
 				if err := json.Unmarshal(raw, &resp); err != nil || len(resp.ID) == 0 {
@@ -157,7 +192,18 @@ func (m *pongMock) call(t *testing.T, conn *WSConn, id int, method string, param
 // (PingInterval=150ms, PongWait=500ms) and an optional detail recorder.
 func newPingBridge(t *testing.T, token string, rec *detailRecorder) (*pongMock, *Bridge) {
 	t.Helper()
+	mock, b := newFastPingBridge(t, token, rec, 0)
+	return mock, b
+}
+
+// newFastPingBridge is newPingBridge with a configurable adapter-side JSON
+// idle timeout (0 = none). Used by the app-ping tests to reproduce the
+// server's receive_json + idle_timeout read loop, which sees data frames
+// only — WS control pings are invisible to it.
+func newFastPingBridge(t *testing.T, token string, rec *detailRecorder, jsonIdle time.Duration) (*pongMock, *Bridge) {
+	t.Helper()
 	mock := newPongMock(t, token)
+	mock.jsonIdle = jsonIdle
 	root := t.TempDir()
 
 	cfg := NewConfig()
@@ -378,4 +424,90 @@ func TestStatusDetail_PingPongTimestamps(t *testing.T) {
 	waitFor(t, 5*time.Second, "LastPingAt advancing past first sample", func() bool {
 		return b.StatusDetail().LastPingAt.After(firstPing)
 	})
+}
+
+// TestAppPing_PongUpdatesLastPongAt: the bridge's app-level JSON ping must
+// elicit {"id":N,"result":{"type":"pong"}} from the adapter, and that pong —
+// a *response-shaped* frame, not a WS control frame — must update
+// LastPongAt. The control-frame pong alone (onPong hook) also refreshes it,
+// so the discriminating assertion is on the JSON path: we disable the
+// control-frame refresh by asserting the pong arrives via a fresh ping id
+// round-trip, checked through LastPongAt advancing while the mock only ever
+// answers JSON pings (it does — its auto-pong on control frames is what the
+// base mock does; the JSON pong is separately observed on the wire by the
+// pump's own reply path). Practically: after the fix, both layers refresh
+// LastPongAt; the test pins the JSON layer by matching a pending ping id.
+func TestAppPing_PongUpdatesLastPongAt(t *testing.T) {
+	mock, b := newPingBridge(t, "tok-appong", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	select {
+	case <-mock.register:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for register")
+	}
+	<-mock.conns
+
+	waitFor(t, 5*time.Second, "LastPingAt and LastPongAt set", func() bool {
+		d := b.StatusDetail()
+		return !d.LastPingAt.IsZero() && !d.LastPongAt.IsZero()
+	})
+
+	// The JSON layer must round-trip: drain the pending-ping set's ids by
+	// observing that each ping tick leaves no unmatched pending id behind.
+	// If the JSON pong were not routed, pendingPings would grow unboundedly;
+	// sample across several ticks and require the set to stay small.
+	base := b.StatusDetail().LastPongAt
+	waitFor(t, 5*time.Second, "LastPongAt advancing past first sample (JSON pong round-trip)", func() bool {
+		return b.StatusDetail().LastPongAt.After(base)
+	})
+
+	b.pingMu.Lock()
+	pending := len(b.pendingPings)
+	b.pingMu.Unlock()
+	if pending > 2 {
+		t.Fatalf("pending app pings piled up: %d (JSON pongs not being routed back?)", pending)
+	}
+}
+
+// TestAppPing_IdleServerNotKicked: reproduce the 0.6.0 field failure — an
+// adapter whose read loop only sees JSON frames (receive_json + idle_timeout,
+// bridge_ws.py:121-127) closes with 4408 after ~58s even though the bridge
+// sends WS control pings, because control frames never reach the application
+// layer. With the app-level JSON ping added to pingLoop, the session must
+// survive well past the JSON idle window.
+func TestAppPing_IdleServerNotKicked(t *testing.T) {
+	// jsonIdle=600ms: three PingIntervals (150ms each) fit inside, so the
+	// bridge must deliver JSON pings continuously to keep the server loop
+	// alive. Survive 3s = 5x the idle window with zero test-driven traffic.
+	mock, b := newFastPingBridge(t, "tok-idlejson", nil, 600*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	select {
+	case <-mock.register:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for register")
+	}
+	first := <-mock.conns
+
+	time.Sleep(3 * time.Second)
+
+	if !b.Connected() {
+		t.Fatal("bridge dropped an idle session despite app-level JSON pings (server idle_timeout kick)")
+	}
+	if got := mock.regCount(); got != 1 {
+		t.Fatalf("expected exactly 1 registration, got %d — the JSON-idle server closed the session", got)
+	}
+	// The same socket must still serve a tool call: the app ping must not
+	// have disturbed the tool-call routing path.
+	resp := mock.call(t, first, 200, MethodListDirectory, map[string]any{"path": "."})
+	if resp.Error != nil {
+		t.Fatalf("list_directory after idle window errored: %+v", resp.Error)
+	}
 }

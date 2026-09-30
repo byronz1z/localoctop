@@ -82,6 +82,8 @@ func (m *mockAdapter) wsURL() string {
 }
 
 // call pushes a tool call to the connected bridge and waits for the response.
+// App-level ping frames ({"type":"ping",...}) sent by pingLoop while the test
+// idles are skipped so they can't be mistaken for the reply.
 func (m *mockAdapter) call(t *testing.T, conn *WSConn, id int, method string, params map[string]any) Response {
 	t.Helper()
 	frame, _ := json.Marshal(map[string]any{"id": id, "method": method, "params": params})
@@ -93,6 +95,12 @@ func (m *mockAdapter) call(t *testing.T, conn *WSConn, id int, method string, pa
 		raw, err := conn.ReadMessage()
 		if err != nil {
 			t.Fatalf("mock read response: %v", err)
+		}
+		var env struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &env); err == nil && env.Type == "ping" {
+			continue // keep-alive ping, not a response
 		}
 		var resp Response
 		if err := json.Unmarshal(raw, &resp); err != nil {
