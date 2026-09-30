@@ -33,6 +33,15 @@ jobs:
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
             choco install nsis -y --no-progress
           }
+          # choco deploy puts makensis outside the current PATH; refresh it
+          # for this step AND all later steps (wails build -nsis needs it).
+          $nsis = @("${env:ProgramFiles(x86)}\NSIS", "$env:ProgramFiles\NSIS",
+                    "$env:ProgramData\chocolatey\lib\nsis\tools\nsis\Bin") |
+                  Where-Object { Test-Path (Join-Path $_ 'makensis.exe') } |
+                  Select-Object -First 1
+          if (-not $nsis) { throw 'makensis.exe not found after install' }
+          Add-Content $env:GITHUB_PATH $nsis
+          $env:PATH = "$nsis;$env:PATH"
           makensis /VERSION
 
       - name: Build EXE + NSIS installer
