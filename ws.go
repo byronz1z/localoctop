@@ -44,7 +44,11 @@ const (
 	closeGoingAwy uint16 = 1001
 	closeProtocol uint16 = 1002
 	closePolicy   uint16 = 1008
-	closeTooBig   uint16 = 1009
+	closeTooBig    uint16 = 1009
+	// closeSuperseded is the adapter's takeover kick: the same token
+	// registered from another machine and the server dropped this session in
+	// favor of the newer one. The bridge parks on it instead of reconnecting.
+	closeSuperseded uint16 = 4000
 )
 
 // ErrConnClosed is returned by write operations after the connection closed.
@@ -338,6 +342,13 @@ func applyMask(key [4]byte, data []byte) {
 
 // Close performs a best-effort close handshake and tears down the connection.
 func (c *WSConn) Close() error { return c.closeWithCode(closeNormal, "") }
+
+// CloseWithCode is Close with an explicit status code, for server-side users
+// (the mock adapter in tests) that need to kick a client the way the real
+// adapter does, e.g. with closeSuperseded.
+func (c *WSConn) CloseWithCode(code uint16, reason string) error {
+	return c.closeWithCode(code, reason)
+}
 
 func (c *WSConn) closeWithCode(code uint16, reason string) error {
 	var err error

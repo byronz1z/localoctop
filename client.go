@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -125,6 +126,14 @@ func (b *Bridge) StatusDetail() StatusDetail {
 
 // Run blocks until ctx is cancelled, maintaining the connection with
 // exponential backoff. It is safe to call from a goroutine exactly once.
+//
+// One exception to "maintaining the connection": a peer close with code 4000
+// (closeSuperseded — the same token registered from another machine) means
+// this session was taken over. Run parks instead of reconnecting: it reports
+// conn_state=parked / reason=superseded and returns, because auto-reconnecting
+// would start a ping-pong war over the token (observed as 2-4s reconnect
+// cycles in 0.6.0 docker logs). Only a user-initiated action — a fresh Bridge
+// via manual Connect or SaveConfig — un-parks.
 func (b *Bridge) Run(ctx context.Context) error {
 	defer b.Shutdown()
 	backoff := b.cfg.MinBackoff
@@ -139,12 +148,28 @@ func (b *Bridge) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// Takeover kick: park, don't reconnect. This is checked before the
+		// generic failure path so the detail surfaces "parked", not
+		// "reconnecting", and ReconnectAttempt stays at 0.
+		var ce *CloseError
+		if errors.As(err, &ce) && ce.Code == closeSuperseded {
+			b.detail.update(func(d *StatusDetail) {
+				d.Connected = false
+				d.ConnState = ConnStateParked
+				d.ParkReason = ParkReasonSuperseded
+				d.LastError = err.Error()
+			})
+			b.setConnected(false, err)
+			b.log.Warnf("session superseded (close code %d): parking, no auto-reconnect — manual connect required to take the token back", closeSuperseded)
+			return nil
+		}
 		// Dial/session failures count as reconnect attempts for the detail
 		// surface; a clean Shutdown does not (no error, bridge is closing).
 		if err != nil {
 			b.detail.update(func(d *StatusDetail) {
 				d.Connected = false
 				d.ReconnectAttempt++
+				d.ConnState = ConnStateReconnecting
 				d.LastError = err.Error()
 			})
 		}
@@ -220,6 +245,7 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 	b.detail.update(func(d *StatusDetail) {
 		d.Connected = true
 		d.ReconnectAttempt = 0
+		d.ConnState = ConnStateOnline
 		d.LastError = ""
 	})
 	// Pings pending from a previous session can never be answered now (their

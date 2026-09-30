@@ -252,6 +252,118 @@ func TestE2E_AuditLogRecorded(t *testing.T) {
 	}
 }
 
+// TestE2E_ParkOnSupersededNoReconnect is the takeover case: the adapter
+// kicks the session with close code 4000 ("replaced by reconnect" — another
+// machine registered the same token). The bridge must park (conn_state=parked,
+// reason=superseded) instead of auto-reconnecting, which would fight the
+// new owner in a ping-pong war (T2'-BRIDGE-PARKING).
+func TestE2E_ParkOnSupersededNoReconnect(t *testing.T) {
+	mock := newMockAdapter(t, "tok-park")
+	b := newTestBridge(t, mock.wsURL(), "tok-park", false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		_ = b.Run(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case <-mock.register:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for register")
+	}
+	conn := <-mock.conns
+
+	// The adapter drops us for a newer connection: close code 4000.
+	_ = conn.CloseWithCode(4000, "replaced by reconnect")
+
+	// Run must return (parked = the reconnect loop is over), and the detail
+	// must read parked/superseded with no reconnect attempt counted.
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after a 4000 kick — the bridge must park, not keep running")
+	}
+
+	d := b.StatusDetail()
+	if d.Connected {
+		t.Fatalf("parked bridge must not report connected: %+v", d)
+	}
+	if d.ConnState != ConnStateParked {
+		t.Fatalf("expected conn_state=%q, got %q", ConnStateParked, d.ConnState)
+	}
+	if d.ParkReason != ParkReasonSuperseded {
+		t.Fatalf("expected park reason %q, got %q", ParkReasonSuperseded, d.ParkReason)
+	}
+	if d.ReconnectAttempt != 0 {
+		t.Fatalf("parking is not a reconnect attempt, got attempt=%d", d.ReconnectAttempt)
+	}
+
+	// No re-register may arrive: backoff in tests is 50ms, so a full second
+	// is 20 backoff cycles — enough to catch any auto-reconnect.
+	select {
+	case <-mock.register:
+		t.Fatal("bridge re-registered after a 4000 kick — parked bridges must not auto-reconnect")
+	case <-time.After(1 * time.Second):
+	}
+}
+
+// TestE2E_RegularCloseStillReconnects is the parked-negative case: a close
+// with any other code (here 1000, as a network blip would also surface) keeps
+// the existing backoff-reconnect behavior — parking is exclusive to code 4000.
+func TestE2E_RegularCloseStillReconnects(t *testing.T) {
+	mock := newMockAdapter(t, "tok-live")
+	b := newTestBridge(t, mock.wsURL(), "tok-live", false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan struct{})
+	go func() {
+		_ = b.Run(ctx)
+		close(runDone)
+	}()
+
+	select {
+	case <-mock.register:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for register")
+	}
+	conn := <-mock.conns
+
+	// Ordinary drop, not a takeover.
+	_ = conn.CloseWithCode(1000, "")
+
+	var second *WSConn
+	select {
+	case <-mock.register:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bridge did not re-register after an ordinary close — auto-reconnect must keep working")
+	}
+	second = <-mock.conns
+
+	select {
+	case <-runDone:
+		t.Fatal("Run must keep reconnecting after an ordinary close")
+	default:
+	}
+
+	d := b.StatusDetail()
+	if d.ConnState == ConnStateParked || d.ParkReason != "" {
+		t.Fatalf("ordinary close must never park, got %+v", d)
+	}
+	if d.ConnState != ConnStateOnline || !d.Connected {
+		t.Fatalf("expected back online after ordinary close, got %+v", d)
+	}
+
+	// The fresh session still serves calls.
+	resp := mock.call(t, second, 21, MethodReadFile, map[string]any{"path": "hello.txt"})
+	if resp.Error != nil {
+		t.Fatalf("read_file after reconnect errored: %+v", resp.Error)
+	}
+}
+
 // TestE2E_ReconnectAfterServerClose verifies the exponential-backoff loop
 // re-dials and re-registers after the adapter drops the session.
 func TestE2E_ReconnectAfterServerClose(t *testing.T) {

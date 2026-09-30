@@ -5,6 +5,25 @@ import (
 	"time"
 )
 
+// ConnState values surfaced via StatusDetail.ConnState. The desktop tray and
+// status card derive their five-state view from these (T3' will consume
+// "parked" the same way). Empty means the bridge has not classified the
+// situation yet (e.g. fresh start, dialing).
+const (
+	// ConnStateOnline: session up and registered.
+	ConnStateOnline = "online"
+	// ConnStateReconnecting: down, backoff loop running (attempt > 0).
+	ConnStateReconnecting = "reconnecting"
+	// ConnStateParked: the adapter kicked us with close code 4000 — another
+	// machine took over this token. Run has stopped; only a user-initiated
+	// connect (rebuilding the bridge) leaves this state.
+	ConnStateParked = "parked"
+)
+
+// ParkReasonSuperseded is the ConnStateParked reason: the same token
+// registered from a newer connection and the server dropped ours.
+const ParkReasonSuperseded = "superseded"
+
 // StatusDetail is a rich snapshot of the bridge's connection state, for
 // surfaces that want more than the binary up/down of OnStatus (e.g. the
 // desktop tray: "重连中 第 3 次" vs a plain dot). Read it via
@@ -15,6 +34,13 @@ type StatusDetail struct {
 	LastError        string    // 最近一次失败原因（在线时为空）
 	LastPingAt       time.Time // 最近一次成功发出的 ping（零值=从未）
 	LastPongAt       time.Time // 最近一次收到 pong（零值=从未）
+	// ConnState classifies the session for surfaces that render states, not
+	// just up/down: "", online, reconnecting, parked. Set by the core; it
+	// never regresses to "" once parked until the bridge is rebuilt.
+	ConnState string
+	// ParkReason is set iff ConnState == parked (e.g. "superseded"); it is
+	// the machine-readable cause the desktop shows next to the parked state.
+	ParkReason string
 }
 
 // statusTracker holds the fields behind StatusDetail. All mutations funnel
