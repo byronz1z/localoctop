@@ -1,0 +1,56 @@
+# =============================================================================
+# localoctop-server — 本机生产部署（方案 A：8445 直连 TLS，无 NPM）
+#
+# 用法（在本目录执行）:
+#   docker compose up -d --build
+#   docker compose ps / logs -f localoctop-server
+#   docker compose down          # 不动卷；审计日志保留
+#
+# 证书: fullchain.pem / privkey.pem 从 octop 容器 /data/.octop/ssl/ 拷出。
+# ⚠ Octop LE 证书续期后（约 60 天）需重新拷贝并 restart 本容器。
+# =============================================================================
+services:
+  localoctop-server:
+    build: .
+    image: localoctop-server:0.5.0
+    container_name: localoctop-server
+    restart: unless-stopped
+    environment:
+      LOCALOCTOP_MCP_TOKENS: ${LOCALOCTOP_MCP_TOKENS:-}
+      LOCALOCTOP_CLIENT_TOKENS: ${LOCALOCTOP_CLIENT_TOKENS:-}
+      LOCALOCTOP_ADMIN_TOKEN: ${LOCALOCTOP_ADMIN_TOKEN:-}
+      LOCALOCTOP_ALLOW_WRITE: "true"
+      LOCALOCTOP_DISABLED: "false"
+      LOCALOCTOP_AUDIT_LOG: /app/logs/calls.jsonl
+      LOCALOCTOP_LOG_LEVEL: INFO
+      # 公网 TLS 监听（员工桥 wss 拨入）；内网 plain 监听见 ports
+      LOCALOCTOP_SSL_PORT: "8445"
+      LOCALOCTOP_SSL_CERTFILE: /certs/fullchain.pem
+      LOCALOCTOP_SSL_KEYFILE: /certs/privkey.pem
+    volumes:
+      - localoctop-audit:/app/logs
+      - ./fullchain.pem:/certs/fullchain.pem:ro
+      - ./privkey.pem:/certs/privkey.pem:ro
+    ports:
+      # 公网口：路由器 8445 端口转发指向本机 8445
+      - "8445:8445"
+      # 内网明文口：仅回环（供本机调试；Octop 走容器网络，不经此端口）
+      - "127.0.0.1:8080:8080"
+    networks:
+      octop-net:
+        aliases:
+          # Octop 校验规则：.internal 后缀主机名允许 http；明文不出容器网络
+          - localoctop.internal
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+
+volumes:
+  localoctop-audit:
+
+networks:
+  octop-net:
+    name: octop_default
+    external: true

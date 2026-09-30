@@ -7,7 +7,7 @@ name: Release
 #        localoctop.exe + examples/ (Octop connector template + 3-step guide)
 #        — the out-of-the-box desktop package.
 #   2. localoctop-server-<tag>.zip
-#        the adapter/ source tree — server-side deployment bundle.
+#        the server/ source tree — server-side deployment bundle.
 #
 # Local builds are self-test evidence only — they are never a deliverable.
 
@@ -50,12 +50,12 @@ jobs:
           Copy-Item examples/* dist/pkg/examples/ -Recurse
           Compress-Archive -Path dist/pkg/* -DestinationPath "dist/localoctop-$tag-windows-amd64.zip"
 
-      - name: Package adapter zip
+      - name: Package server zip
         run: |
           $tag = "${{ github.ref_name }}"
-          # Clean CI checkout has no runtime artifacts under adapter/ (all gitignored),
+          # Clean CI checkout has no runtime artifacts under server/ (all gitignored),
           # so zip the tracked directory directly; -Force keeps re-runs idempotent.
-          Compress-Archive -Path adapter -DestinationPath "dist/localoctop-server-$tag.zip" -Force
+          Compress-Archive -Path server -DestinationPath "dist/localoctop-server-$tag.zip" -Force
 
       - name: sha256 checksums
         run: |

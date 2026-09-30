@@ -1,0 +1,10 @@
+# 构建产物
+build/bin/
+*.exe
+
+# 前端依赖
+frontend/node_modules/
+
+# Wails 调试产物
+frontend/dist/
+frontend/wailsjs/

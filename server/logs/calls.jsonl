@@ -1,0 +1,2 @@
+{"ts": "2026-09-29T01:36:32.199Z", "user": "e2e-user", "method": "list_directory", "path": ".", "decision": "allow", "code": 0, "detail": "", "duration_ms": 2.83, "client_id": "7b3924aca08de3e4"}
+{"ts": "2026-09-29T08:36:33.075Z", "user": "e2e", "method": "list_directory", "path": ".", "decision": "allow", "code": 0, "detail": "", "duration_ms": 1.08, "client_id": "08ce4f5d926fb475"}

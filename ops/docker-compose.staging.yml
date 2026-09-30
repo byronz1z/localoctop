@@ -1,0 +1,51 @@
+# =============================================================================
+# localoctop-server STAGING — 测试环境（与生产零共享）
+#
+# 端口: 18080 plain / 18445 TLS（生产为 8080/8445，绝不冲突）
+# 容器/卷/网络全部独立命名；令牌走 .env.staging（不入 git）
+# 证书: scripts 下 mkcert-staging 自签生成（certs-staging/ 目录）
+#
+# 用法（本目录执行）:
+#   copy .env.staging.example .env.staging   # 首次，填测试令牌
+#   powershell -File scripts\mkcert-staging.ps1   # 首次，生成自签证书
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging ps
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging down -v   # 连卷全清
+#
+# ⚠ 本环境专用于测试（桥连接/e2e/升级演练/客户端验收），一切验证默认打这里。
+#   碰生产（docker-compose.yml）前必须按 ENV-POLICY.md 报备获批。
+# =============================================================================
+services:
+  localoctop-server-staging:
+    build: .
+    image: localoctop-server:0.5.0-staging
+    container_name: localoctop-server-staging
+    restart: no   # 测试环境不自动重启，用完即下
+    environment:
+      LOCALOCTOP_MCP_TOKENS: ${LOCALOCTOP_MCP_TOKENS:-}
+      LOCALOCTOP_CLIENT_TOKENS: ${LOCALOCTOP_CLIENT_TOKENS:-}
+      LOCALOCTOP_ADMIN_TOKEN: ${LOCALOCTOP_ADMIN_TOKEN:-}
+      LOCALOCTOP_ALLOW_WRITE: ${LOCALOCTOP_ALLOW_WRITE:-true}
+      LOCALOCTOP_DISABLED: "false"
+      LOCALOCTOP_AUDIT_LOG: /app/logs/calls.jsonl
+      LOCALOCTOP_LOG_LEVEL: DEBUG   # 测试环境开 DEBUG 便于排查
+      LOCALOCTOP_SSL_PORT: "18445"
+      LOCALOCTOP_SSL_CERTFILE: /certs/fullchain.pem
+      LOCALOCTOP_SSL_KEYFILE: /certs/privkey.pem
+    volumes:
+      - localoctop-audit-staging:/app/logs
+      - ./certs-staging/fullchain.pem:/certs/fullchain.pem:ro
+      - ./certs-staging/privkey.pem:/certs/privkey.pem:ro
+    ports:
+      # 仅回环绑定：staging 不暴露公网，客户端验证走 wss://localhost:18445（忽略自签证书告警）
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:18445:18445"
+    networks:
+      - localoctop-staging-net
+
+volumes:
+  localoctop-audit-staging:
+
+networks:
+  localoctop-staging-net:
+    name: localoctop-staging

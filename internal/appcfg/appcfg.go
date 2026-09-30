@@ -54,6 +54,13 @@ type File struct {
 	// offer them in a dropdown. Absent in pre-0.2.1 files: loads as empty.
 	RecentServers []RecentServer `json:"recent_servers,omitempty"`
 
+	// ConfirmExit gates the desktop shell's "exiting disconnects the bridge"
+	// confirmation dialog on window close. Pointer+omitempty so the desktop
+	// can distinguish "old file without the key" (defaults to true) from an
+	// explicit false, and headless builds simply ignore the key. Desktop-only
+	// addition (0.5.0 desktop M3); the headless bridge never writes it.
+	ConfirmExit *bool `json:"confirm_exit,omitempty"`
+
 	// AuditLogPath is fixed at the data dir by DefaultPath; kept in the file
 	// so power users can redirect it.
 	AuditLogPath string `json:"audit_log_path"`
@@ -65,10 +72,12 @@ type File struct {
 // console on the default port, browser auto-open on, and the audit log at
 // its default location so auditing is on from the very first run.
 func Default() File {
+	confirm := true // desktop: confirm-on-first-close-to-tray is on out of the box
 	f := File{
 		ConsolePort: DefaultConsolePort,
 		OpenBrowser: true,
 		AllowWrite:  true,
+		ConfirmExit: &confirm,
 	}
 	if p, err := AuditPath(); err == nil {
 		f.AuditLogPath = p
@@ -176,6 +185,12 @@ func Load() (File, bool, error) {
 		if ap, err := AuditPath(); err == nil {
 			cfg.AuditLogPath = ap
 		}
+	}
+	// Legacy desktop configs (pre-M3) lack confirm_exit: default it on so
+	// the safety confirmation stays enabled unless explicitly disabled.
+	if cfg.ConfirmExit == nil {
+		confirm := true
+		cfg.ConfirmExit = &confirm
 	}
 	return cfg, true, nil
 }

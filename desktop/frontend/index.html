@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <title>Octop 本地文件桥</title>
+    <script src="./src/main.js" type="module"></script>
+</head>
+<body>
+<div id="app">
+    <!-- M3 侧边栏布局：左侧固定导航 + 右侧页面区 -->
+    <div class="shell">
+        <nav class="sidebar" aria-label="主导航">
+            <div class="brand">
+                <span class="dot" id="connDot"></span>
+                <span class="brand-name">Octop 文件桥</span>
+            </div>
+            <ul class="nav">
+                <li><button class="nav-btn" id="nav-conn" type="button" data-page="conn">
+                    <span class="ni" aria-hidden="true">🔗</span>连接
+                </button></li>
+                <li><button class="nav-btn" id="nav-activity" type="button" data-page="activity">
+                    <span class="ni" aria-hidden="true">📋</span>活动
+                </button></li>
+                <li><button class="nav-btn" id="nav-settings" type="button" data-page="settings">
+                    <span class="ni" aria-hidden="true">⚙️</span>设置
+                </button></li>
+            </ul>
+            <div class="side-foot">
+                <div class="pill" id="connText">未连接</div>
+                <div class="ver-side mono" id="verCorner"></div>
+            </div>
+        </nav>
+
+        <div class="content">
+            <main>
+                <!-- ========== 连接页（M2 表单原样搬入） ========== -->
+                <div class="page" id="page-conn">
+                    <!-- 状态卡片：大字状态 + 关键指标行 -->
+                    <section class="card status-card" id="statusCard">
+                        <div class="status-head">
+                            <span class="status-ico" id="statusIco" aria-hidden="true"></span>
+                            <div class="status-main">
+                                <div class="status-big" id="statusBig">正在加载…</div>
+                                <div class="status-sub muted" id="statusSub"></div>
+                            </div>
+                            <span class="pill" id="statusTag"></span>
+                        </div>
+                        <div class="stats">
+                            <div class="stat"><div class="k">客户端 ID</div><div class="v mono" id="stClient">—</div></div>
+                            <div class="stat"><div class="k">重连次数</div><div class="v" id="stReconn">0</div></div>
+                            <div class="stat st-wide"><div class="k">服务器地址</div><div class="v mono" id="stServer">—</div></div>
+                            <div class="stat"><div class="k">最近审计</div><div class="v mono" id="stAudit">—</div></div>
+                        </div>
+                    </section>
+
+                    <!-- 连接设置表单卡片 -->
+                    <section class="card">
+                        <h2 id="formTitle">连接设置</h2>
+                        <p class="muted" id="formHint">填写服务器信息与白名单目录，保存后即连接。</p>
+                        <form id="cfgForm" novalidate>
+                            <label for="serverURL">服务器地址</label>
+                            <input id="serverURL" type="url" autocomplete="off" spellcheck="false"
+                                   list="recentServers"
+                                   placeholder="wss://example.com:8445/mcp/localoctop/ws"/>
+                            <datalist id="recentServers"></datalist>
+                            <div class="hint muted" id="recentHint" hidden>
+                                从「最近使用」列表选择，将自动填入对应令牌
+                            </div>
+
+                            <label for="token">访问令牌</label>
+                            <div class="token-row">
+                                <input id="token" type="password" autocomplete="off" spellcheck="false"
+                                       placeholder="由管理员发放的桥令牌"/>
+                                <button class="btn eye" id="toggleToken" type="button"
+                                        aria-label="显示或隐藏令牌" title="显示 / 隐藏令牌"><span>👁</span></button>
+                            </div>
+
+                            <label>白名单目录（云端 AI 只能访问这些目录）</label>
+                            <div class="dir-add-row">
+                                <input id="newDir" type="text" spellcheck="false"
+                                       placeholder="点击「选择目录」或输入绝对路径，如 D:\projects\docs"/>
+                                <button class="btn secondary" id="pickDirBtn" type="button">
+                                    <span class="bi" aria-hidden="true">📂</span>选择目录…
+                                </button>
+                                <button class="btn" id="addDirBtn" type="button">添加</button>
+                            </div>
+                            <div class="chips" id="commonChips"></div>
+                            <ul class="dirs" id="dirList"></ul>
+
+                            <div class="chk">
+                                <input id="allowWrite" type="checkbox" checked/>
+                                <label for="allowWrite">
+                                    <strong>允许云端 AI 写入以上目录</strong>
+                                    <span class="muted">（默认开启；关闭 = 只读访问）</span>
+                                </label>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn big" id="saveBtn" type="submit">保存并连接</button>
+                                <span class="msg" id="saveMsg"></span>
+                            </div>
+                        </form>
+                    </section>
+                </div>
+
+                <!-- ========== 活动页（M3 审计事件流） ========== -->
+                <div class="page" id="page-activity" hidden>
+                    <section class="card">
+                        <div class="act-head">
+                            <h2>操作记录</h2>
+                            <label class="chk-inline">
+                                <input id="onlyErrors" type="checkbox"/>
+                                仅看错误
+                            </label>
+                            <span class="spacer"></span>
+                            <span class="muted mono" id="actCount">0 条</span>
+                        </div>
+                        <p class="muted">云端 AI 对本机白名单目录的每一次工具调用都会记录在此（最近 500 条，实时更新）。</p>
+                        <div class="act-list" id="actList">
+                            <div class="act-empty muted" id="actEmpty">暂无操作记录</div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- ========== 设置页（M3） ========== -->
+                <div class="page" id="page-settings" hidden>
+                    <section class="card">
+                        <h2>常规</h2>
+                        <div class="chk">
+                            <input id="confirmExit" type="checkbox" checked/>
+                            <label for="confirmExit">
+                                <strong>关闭窗口时提示确认</strong>
+                                <span class="muted">（关闭窗口 = 最小化到托盘，桥连接保持不断；勾选后每次关窗会先询问是否真的要退出）</span>
+                            </label>
+                        </div>
+                        <p class="hint muted">
+                            关闭窗口时程序将最小化到系统托盘继续运行，不会断开桥连接。要从托盘恢复窗口，右键托盘图标选择「打开窗口」；要完全退出（断开桥），请使用托盘菜单的「退出」。
+                        </p>
+                    </section>
+
+                    <section class="card">
+                        <h2>审计日志</h2>
+                        <div class="kv"><div class="k">日志文件</div><div class="v mono" id="setAuditPath">—</div></div>
+                        <p class="hint muted">审计日志由桥核心写入并自动轮转，桌面端仅展示路径。</p>
+                    </section>
+
+                    <section class="card">
+                        <h2>关于</h2>
+                        <div class="kv"><div class="k">版本</div><div class="v mono" id="setVersion">—</div></div>
+                        <div class="kv"><div class="k">配置文件</div><div class="v mono" id="setConfigPath">—</div></div>
+                        <p class="hint muted">配置与主仓 bridge.exe 共享：修改任意一端，另一端下次启动生效。</p>
+                    </section>
+                </div>
+            </main>
+        </div>
+    </div>
+</div>
+</body>
+</html>
