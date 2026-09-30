@@ -61,6 +61,14 @@ type File struct {
 	// addition (0.5.0 desktop M3); the headless bridge never writes it.
 	ConfirmExit *bool `json:"confirm_exit,omitempty"`
 
+	// Autostart mirrors the desktop "开机自动启动" toggle: true = the HKCU Run
+	// entry "localoctop-desktop" should exist, false = not. The registry is
+	// the source of truth for whether Windows launches us; this field is the
+	// checkbox state so the settings page can render it on next start.
+	// Pointer+omitempty for the same headless-tolerance reasons as ConfirmExit
+	// (0.6.0 desktop T2). The desktop Run entry always uses --minimized.
+	Autostart *bool `json:"autostart,omitempty"`
+
 	// AuditLogPath is fixed at the data dir by DefaultPath; kept in the file
 	// so power users can redirect it.
 	AuditLogPath string `json:"audit_log_path"`
@@ -192,6 +200,10 @@ func Load() (File, bool, error) {
 		confirm := true
 		cfg.ConfirmExit = &confirm
 	}
+	// autostart intentionally stays nil when absent (pre-0.6.0 file): the
+	// settings page then falls back to probing the registry for the real
+	// state instead of trusting a default — an old install that was never
+	// migrated reads "off" from HKCU, not "on" from a fabricated default.
 	return cfg, true, nil
 }
 
