@@ -52,7 +52,7 @@ jobs:
         run: |
           python -c @"
           import struct
-          for fn in ['desktop/build/bin/localoctop-desktop.exe',
+          for fn in ['desktop/build/bin/localoctop.exe',
                      'desktop/build/bin/localoctop-desktop-amd64-installer.exe']:
               with open(fn,'rb') as f:
                   assert f.read(2)==b'MZ', fn
@@ -69,15 +69,15 @@ jobs:
           $tag = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item desktop/README.md desktop/build/bin/
-          Compress-Archive -Path desktop/build/bin/localoctop-desktop.exe,desktop/build/bin/README.md `
-            -DestinationPath "dist/localoctop-desktop-$tag-windows-amd64.zip" -Force
+          Compress-Archive -Path desktop/build/bin/localoctop.exe,desktop/build/bin/README.md `
+            -DestinationPath "dist/localoctop-$tag-windows-amd64.zip" -Force
 
       - name: sha256 checksums
         run: |
           $tag = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item desktop/build/bin/localoctop-desktop-amd64-installer.exe `
-            "dist/localoctop-desktop-$tag-setup.exe"
+            "dist/localoctop-$tag-setup.exe"
           Get-ChildItem dist/* | ForEach-Object {
             (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + "  " + $_.Name
           } | Set-Content "dist/checksums-sha256.txt"
@@ -86,7 +86,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/localoctop-desktop-*-windows-amd64.zip
-            dist/localoctop-desktop-*-setup.exe
+            dist/localoctop-*-windows-amd64.zip
+            dist/localoctop-*-setup.exe
             dist/checksums-sha256.txt
           generate_release_notes: true
