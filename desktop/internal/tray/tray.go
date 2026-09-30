@@ -34,6 +34,11 @@
 // non-blocking send with a default drop), and this package's own goroutine
 // converts them into Actions callbacks. Menu-item mutation (SetTitle /
 // AddMenuItem) is mutex-guarded inside systray and safe from any goroutine.
+//
+// 0.6.0 (T2): SetStatus takes the app's conn_state string so the tray row
+// and tooltip mirror the same five states the status card renders
+// (已连接 / 连接中 / 重连中 第 N 次 / 已断开 / 未配置) instead of the old
+// binary 已连接-未连接.
 package tray
 
 import (
@@ -53,7 +58,7 @@ type Actions struct {
 }
 
 var (
-	statusItem *systray.MenuItem // disabled row showing connection state
+	statusItem *systray.MenuItem // disabled row displaying connection state
 	actions    Actions
 )
 
@@ -95,18 +100,38 @@ func setup(version string) {
 	}()
 }
 
-// SetStatus updates the status row and tooltip. Safe from any goroutine.
-func SetStatus(version string, connected bool, clientID string) {
-	state := "未连接"
-	if connected {
-		state = "已连接"
+// TrayLabel maps the app's conn_state (+ attempt count) to the tray row
+// text and tooltip tail. Kept in sync with main.js's renderStatus — the
+// same five states, same words.
+func TrayLabel(connState string, connected bool, attempt int) (row, tail string) {
+	switch connState {
+	case "connected":
+		return "已连接", "已连接"
+	case "connecting":
+		return "连接中…", "连接中"
+	case "reconnecting":
+		row = fmt.Sprintf("重连中（第 %d 次）", attempt)
+		return row, row
+	case "disconnected":
+		return "已断开", "已断开（手动）"
+	default: // "unconfigured" / pre-startup ""
+		if connected { // defensive: state lagging behind the bool
+			return "已连接", "已连接"
+		}
+		return "未配置", "未配置"
 	}
-	text := state
-	if clientID != "" {
+}
+
+// SetStatus updates the status row and tooltip from the app's five-state
+// snapshot. Safe from any goroutine.
+func SetStatus(version, connState string, connected bool, attempt int, clientID string) {
+	row, tail := TrayLabel(connState, connected, attempt)
+	text := row
+	if clientID != "" && connState == "connected" {
 		text += " · " + clientID
 	}
 	if statusItem != nil {
 		statusItem.SetTitle(text)
 	}
-	systray.SetTooltip(fmt.Sprintf("Octop 本地文件桥 v%s — %s", version, state))
+	systray.SetTooltip(fmt.Sprintf("Octop 本地文件桥 v%s — %s", version, tail))
 }

@@ -137,52 +137,157 @@ async function loadSettingsPage() {
             showPage('conn'); // the msg slot lives on the connection page
         }
     });
+
+    // 开机自启 (0.6.0 T2): registry is truth; warning surfaces as hint text.
+    try {
+        const [on, warn] = await goApp().GetAutostart();
+        $('autostartChk').checked = on;
+        if (warn) {
+            $('autostartHint').textContent = '无法读取自启状态：' + warn;
+            $('autostartHint').hidden = false;
+        }
+    } catch { /* keep unchecked */ }
+    $('autostartChk').addEventListener('change', async () => {
+        $('autostartHint').hidden = true;
+        try {
+            await goApp().SetAutostart($('autostartChk').checked);
+        } catch (err) {
+            $('autostartChk').checked = !$('autostartChk').checked; // revert on failure
+            $('autostartHint').textContent = '设置开机自启失败：' + err;
+            $('autostartHint').hidden = false;
+        }
+    });
 }
 
-/* ---------- status card + header dot ---------- */
+/* ---------- status card + header dot (five states, 0.6.0 T2) ---------- */
+
+// STALE_PONG: connected but last pong older than this (ms) → 心跳异常.
+// Mirrors the Go side's stalePongAfter (90s). Evaluated at render time so
+// the warning appears on the 3s poll tick even without a push event.
+const STALE_PONG_MS = 90 * 1000;
+
+// elapsedAgo formats "X 秒前" for the heartbeat row (0 → 刚刚).
+function elapsedAgo(ts) {
+    if (!ts) return '';
+    const ms = Date.now() - new Date(ts).getTime();
+    if (ms < 0 || Number.isNaN(ms)) return '';
+    const sec = Math.floor(ms / 1000);
+    if (sec < 1) return '刚刚';
+    return sec + ' 秒前';
+}
+
+// classify maps one Status snapshot to the five states. Priority matches
+// app.go's applyDetail: 已断开 (manual) > 已连接 > 重连中 > 连接中 > 未配置.
+function classify(s) {
+    switch (s.conn_state) {
+    case 'disconnected': return 'disconnected';
+    case 'connected':
+        return s.connected ? 'connected' : 'reconnecting'; // detail-lag guard
+    case 'reconnecting': return 'reconnecting';
+    case 'connecting': return 'connecting';
+    case 'unconfigured': return 'unconfigured';
+    default:
+        // pre-startup snapshot: infer from identity/config fields
+        if (s.connected) return 'connected';
+        if (s.reconnect_attempt > 0 || s.last_error) return 'reconnecting';
+        if (s.client_id) return 'connecting';
+        return 'unconfigured';
+    }
+}
 
 // renderStatus maps one bridge:status snapshot onto the status card.
-// 连接中 (saving, not yet connected, no error) is derived here: the Go side
-// only pushes connected true/false, so "bridge built + waiting for the first
-// OnStatus" is exactly the connecting window.
+// The five states come from the Go side's conn_state (fed by the bridge
+// core's StatusDetail pushes + 3s poll); only the 心跳异常 sub-warning is
+// derived here, from last_pong_at vs wall clock.
 function renderStatus(s) {
     const card = $('statusCard');
     const big = $('statusBig');
     const sub = $('statusSub');
     const tag = $('statusTag');
     const ico = $('statusIco');
-    const ICO = { ok: '✔', err: '✕', conn: '', wait: '…' };
+    const ICO = {
+        connected: '✔', reconnecting: '✕', connecting: '', disconnected: '⏏', unconfigured: '…',
+    };
 
+    const st = classify(s);
     let cls, tagTxt;
-    if (s.connected) {
-        cls = 'ok'; tagTxt = '已连接';
-        big.textContent = '已连接';
-        sub.textContent = s.client_id ? '云端 AI 可访问本机白名单目录' : '';
-    } else if (s.last_error) {
-        cls = 'err'; tagTxt = '未连接';
-        big.textContent = '未连接';
-        sub.textContent = s.last_error;
-    } else if (state.saved || s.client_id) {
+    if (st === 'connected') {
+        // >90s without a pong = heartbeat trouble: still "connected" on the
+        // wire, but warn in yellow and say why.
+        const pongAge = s.last_pong_at ? (Date.now() - new Date(s.last_pong_at).getTime()) : Infinity;
+        const stale = pongAge > STALE_PONG_MS;
+        cls = stale ? 'warn' : 'ok';
+        tagTxt = stale ? '心跳异常' : '已连接';
+        big.textContent = stale ? '已连接（心跳异常）' : '已连接';
+        sub.textContent = stale
+            ? '超过 90 秒未收到服务器心跳回应，连接可能已失效，等待自动重连…'
+            : (s.client_id ? '云端 AI 可访问本机白名单目录 · 心跳 ' + (elapsedAgo(s.last_pong_at) || '从未') : '');
+    } else if (st === 'reconnecting') {
+        cls = 'err'; tagTxt = '重连中';
+        big.textContent = '重连中（第 ' + (s.reconnect_attempt || 1) + ' 次）';
+        sub.textContent = s.last_error || '连接中断，正在自动重连…';
+    } else if (st === 'connecting') {
         cls = 'conn'; tagTxt = '连接中';
-        big.textContent = '连接中';
+        big.textContent = '连接中…';
         sub.textContent = '正在与服务器建立连接…';
-    } else {
-        cls = 'wait'; tagTxt = '未连接';
-        big.textContent = '未连接';
-        sub.textContent = '等待保存配置';
+    } else if (st === 'disconnected') {
+        cls = 'off'; tagTxt = '已断开';
+        big.textContent = '已断开';
+        sub.textContent = '已手动断开，不会自动重连；点「连接」或保存配置可恢复。';
+    } else { // unconfigured
+        cls = 'wait'; tagTxt = '未配置';
+        big.textContent = '未配置';
+        sub.textContent = '填写服务器地址与令牌并保存后开始连接。';
     }
     card.className = 'card status-card ' + cls;
-    ico.textContent = ICO[cls];
-    tag.className = 'pill ' + (cls === 'ok' ? 'ok' : cls === 'err' ? 'err' : '');
+    ico.textContent = ICO[st];
+    tag.className = 'pill ' + (cls === 'ok' || cls === 'warn' ? 'ok' : cls === 'err' ? 'err' : '');
     tag.textContent = tagTxt;
 
     $('stClient').textContent = s.client_id || '—';
+    $('stAttempt').textContent = String(s.reconnect_attempt || 0);
     $('stReconn').textContent = String(s.reconnects || 0);
+    $('stPong').textContent = st === 'connected' ? (elapsedAgo(s.last_pong_at) || '从未') : '—';
     $('stServer').textContent = s.server_url || '—';
     $('stAudit').textContent = s.last_audit_ts ? fmtTime(s.last_audit_ts) : '—';
 
-    $('connDot').className = 'dot ' + (s.connected ? 'on' : 'off');
+    $('connDot').className = 'dot ' + (st === 'connected' ? 'on' : 'off');
     $('connText').textContent = tagTxt;
+
+    updateConnButtons(st);
+}
+
+// updateConnButtons: 连接 enabled unless already trying/online; 断开
+// enabled only while a bridge exists (connecting/connected/reconnecting).
+function updateConnButtons(st) {
+    $('connectBtn').disabled = (st === 'connecting' || st === 'connected');
+    $('disconnectBtn').disabled = !(st === 'connecting' || st === 'connected' || st === 'reconnecting');
+}
+
+/* ---------- manual connect / disconnect (0.6.0 T2) ---------- */
+
+async function doConnect() {
+    const btn = $('connectBtn');
+    btn.disabled = true;
+    try {
+        await goApp().Connect();
+        try { renderStatus(await goApp().GetStatus()); } catch { /* push follows */ }
+    } catch (err) {
+        flash($('saveMsg'), '连接失败：' + err, false);
+        btn.disabled = false;
+    }
+}
+
+async function doDisconnect() {
+    const btn = $('disconnectBtn');
+    btn.disabled = true;
+    try {
+        await goApp().Disconnect();
+        try { renderStatus(await goApp().GetStatus()); } catch { /* push follows */ }
+    } catch (err) {
+        flash($('saveMsg'), '断开失败：' + err, false);
+        btn.disabled = false;
+    }
 }
 
 /* ---------- dir list rendering ---------- */
@@ -448,6 +553,8 @@ async function boot() {
     wireTokenToggle();
     $('serverURL').addEventListener('change', onServerPick);
     $('cfgForm').addEventListener('submit', saveConfig);
+    $('connectBtn').addEventListener('click', doConnect);
+    $('disconnectBtn').addEventListener('click', doDisconnect);
     $('pickDirBtn').addEventListener('click', pickDirectory);
     $('addDirBtn').addEventListener('click', () => {
         if (addDir($('newDir').value)) $('newDir').value = '';

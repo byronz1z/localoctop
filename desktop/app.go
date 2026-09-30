@@ -12,6 +12,21 @@
 // M3 adds the resident-tray lifecycle: closing the window hides to tray
 // (onBeforeClose intercepts), and the tray's "退出" is the only real exit
 // path (plus an explicit "真的退出" answer in the close-confirm dialog).
+//
+// 0.6.0 (T2) makes the connection state REAL and user-steerable:
+//
+//   - five-state status card fed by the bridge core's OnStatusDetail
+//     (StatusDetail: connected / reconnect attempt / last error / ping-pong
+//     timestamps) plus a 3s polling fallback — the old Connected bool was a
+//     lie (it showed the last dial result; a dead session read "已连接");
+//   - manual 断开/连接: Disconnect() cancels the bridge AND raises the
+//     userIntent flag so neither the 3s poller nor a later save silently
+//     reconnects over the user's choice; Connect()/SaveConfig rebuild from
+//     config and clear the flag;
+//   - all UI pushes go through emitStatusUnlocked, which App.mu callers
+//     invoke WITHOUT the lock (the pre-T2 emitStatus re-locked a.mu and
+//     deadlocked every synchronous SaveConfig — fixed here, verified by
+//     app_test.go's no-deadlock case).
 package main
 
 import (
@@ -20,6 +35,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/byronz1z/localoctop"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -27,6 +43,28 @@ import (
 	"github.com/byronz1z/localoctop/internal/appcfg"
 	"github.com/byronz1z/localoctop/desktop/internal/tray"
 )
+
+// connState is the connection lifecycle the five-state card renders.
+type connState string
+
+const (
+	stateUnknown     connState = ""            // before startup: transient
+	stateConnecting  connState = "connecting"  // bridge built, first dial in flight
+	stateConnected   connState = "connected"   // Connected=true
+	stateReconnecting connState = "reconnecting" // attempt>0 after a drop
+	stateDisconnected connState = "disconnected" // user-initiated, stays down
+	stateUnconfigured connState = "unconfigured" // no server URL/token on file
+)
+
+// statusPollInterval is the fallback cadence for pulling
+// Bridge.StatusDetail() and re-emitting: catches anything the
+// OnStatusDetail push missed (e.g. the >90s stale-pong warning flipping on
+// with no event, since LastPongAt only changes on the next pong).
+const statusPollInterval = 3 * time.Second
+
+// stalePongAfter: connected but no pong for this long → 心跳异常 warning.
+// PongWait in the core is 60s; 90s gives one full missed ping before alarm.
+const stalePongAfter = 90 * time.Second
 
 // App is the single struct bound to the frontend (window.go.main.App).
 type App struct {
@@ -38,8 +76,9 @@ type App struct {
 	bridge        *localoctop.Bridge
 	cancel        context.CancelFunc // stops the current bridge's Run
 	quitting      bool               // user has decided to exit: onBeforeClose stops intercepting
+	userDisconnected bool            // manual 断开 in effect: no auto-reconnect until Connect/Save
 
-	st statusState // live connection state fed by OnStatus/OnAudit
+	st statusState // live connection state fed by OnStatusDetail/OnAudit
 }
 
 // statusState is the mutex-guarded holder behind Status snapshots. The mutex
@@ -49,14 +88,19 @@ type statusState struct {
 	cur Status
 }
 
-// Status is the structured connection state the UI banner renders. Field
-// semantics mirror the main repo's console.Status.
+// Status is the structured connection state the UI banner renders. The
+// 0.6.0 T2 additions (conn_state, reconnect_attempt, last_pong_at) come
+// straight from the bridge core's StatusDetail; legacy fields stay for the
+// header dot and stats row.
 type Status struct {
 	Connected  bool   `json:"connected"`
+	ConnState  string `json:"conn_state"`           // five-state card driver (connState values)
 	ClientID   string `json:"client_id"`
 	ServerURL  string `json:"server_url"`
 	LastError  string `json:"last_error,omitempty"`
 	Reconnects int    `json:"reconnects"`
+	ReconnectAttempt int `json:"reconnect_attempt"` // current attempt # from StatusDetail
+	LastPongAt  time.Time `json:"last_pong_at"`     // zero = never; drives the >90s warning
 	LastAudit  string `json:"last_audit_ts,omitempty"`
 }
 
@@ -104,9 +148,42 @@ func (a *App) startup(ctx context.Context) {
 	a.mu.Unlock()
 
 	// First bridge from the loaded settings (a.st is wired inside
-	// rebuildLocked so even startup errors reach the UI).
+	// rebuildLocked so even startup errors reach the UI). This is the
+	// zero-operation auto-connect: it only happens when the user has NOT
+	// disconnected manually this session — startup is always a fresh
+	// session, so userDisconnected is false here by construction.
 	_ = a.rebuild(cfg)
-	a.emitStatus()
+	a.emitStatusUnlocked()
+
+	// 3s polling fallback: pushes refreshes (stale-pong warnings flip on
+	// wall-clock, not events) and re-emits when OnStatusDetail was missed.
+	go a.statusPollLoop()
+}
+
+// statusPollLoop is the belt-and-suspenders half of the five-state card:
+// OnStatusDetail pushes every change, but some card-affecting facts only
+// change with the clock (a connected session whose pongs stopped 90s ago)
+// or might race the emitter (bridge swapped mid-push). Pull the snapshot,
+// fold it in, re-emit. Exits with the app context (Wails cancels it on
+// shutdown); the bridge pointer is read under App.mu.
+func (a *App) statusPollLoop() {
+	t := time.NewTicker(statusPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-t.C:
+			a.mu.Lock()
+			b := a.bridge
+			a.mu.Unlock()
+			if b == nil {
+				continue // unconfigured / user-disconnected: nothing to poll
+			}
+			a.applyDetail(b.StatusDetail())
+			a.emitStatusUnlocked()
+		}
+	}
 }
 
 // onBeforeClose is the Wails OnBeforeClose hook: closing the window hides to
@@ -195,9 +272,12 @@ func (a *App) LoadConfig() LoadConfigResult {
 // any failure the previous bridge keeps running and the error is returned
 // for the UI to show (semantics copied from cmd/bridge's apply closure +
 // rebuildLocked: validation/bridge failure → error, old bridge untouched).
+//
+// T2: saving is also an implicit (re)connect — it clears the manual-
+// disconnect intent, because "改配置后保存" is the user asking to connect
+// with the new settings (task spec: 断开只挡自动连接，不挡手动动作).
 func (a *App) SaveConfig(next appcfg.File) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	// Remember this connection (deduped, capped) so M2's server dropdown
 	// has the data — same call the main console makes on save.
@@ -209,13 +289,18 @@ func (a *App) SaveConfig(next appcfg.File) error {
 	cfg.RememberServer(next.ServerURL, next.Token)
 
 	if err := appcfg.Save(cfg); err != nil {
+		a.mu.Unlock()
 		return err
 	}
 	a.cfg = cfg
+	a.userDisconnected = false // save = connect intent
 	if err := a.rebuildLocked(cfg); err != nil {
+		a.mu.Unlock()
 		return err
 	}
-	a.emitStatus()
+	snap := a.st.snapshot()
+	a.mu.Unlock()
+	emitStatus(a.ctx, snap) // outside a.mu: the pre-T2 in-lock emit deadlocked
 	return nil
 }
 
@@ -224,6 +309,44 @@ func (a *App) GetStatus() Status {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.st.snapshot()
+}
+
+// Connect rebuilds the bridge from the current config — the manual
+// counterpart of Disconnect (settings page / status card button). Returns
+// an error (and changes nothing) when the config does not validate, e.g.
+// the unconfigured first run; the frontend gates the button on that state.
+func (a *App) Connect() error {
+	a.mu.Lock()
+	if a.userDisconnected {
+		a.userDisconnected = false
+	}
+	err := a.rebuildLocked(a.cfg)
+	snap := a.st.snapshot()
+	a.mu.Unlock()
+	emitStatus(a.ctx, snap)
+	return err
+}
+
+// Disconnect is the user's explicit 断开: cancel the bridge Run and switch
+// the card to 已断开. The userDisconnected flag keeps every auto path
+// (statusPollLoop, a later emit) from rebuilding until Connect or SaveConfig
+// clears it — 断开是用户意志，自动连接不得覆盖.
+func (a *App) Disconnect() {
+	a.mu.Lock()
+	a.userDisconnected = true
+	if a.cancel != nil {
+		a.cancel() // stops Run; the next poll sees bridge==nil-ish state below
+	}
+	a.bridge = nil
+	a.cancel = nil
+	a.st.update(func(s *Status) {
+		s.Connected = false
+		s.ConnState = string(stateDisconnected)
+		s.ReconnectAttempt = 0
+	})
+	snap := a.st.snapshot()
+	a.mu.Unlock()
+	emitStatus(a.ctx, snap)
 }
 
 // PickDirectory opens the Wails-native directory chooser and returns the
@@ -333,6 +456,8 @@ func (a *App) SetConfirmExit(on bool) error {
 // startup, before any UI is bound). Failure returns the error and leaves
 // state untouched.
 func (a *App) rebuild(cfg appcfg.File) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.rebuildLocked(cfg)
 }
 
@@ -350,27 +475,13 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 	bc.AuditLogPath = cfg.AuditLogPath
 	bc.Logger = localoctop.NewStderrLogger(false)
 
-	// Status/audit feeds: snapshot identity fields, bump the reconnect
-	// counter on disconnects, and push to the UI via Wails events.
-	bc.OnStatus = func(connected bool, err error) {
-		msg := ""
-		if err != nil {
-			msg = err.Error()
-		}
-		a.mu.Lock()
-		a.st.update(func(s *Status) {
-			s.Connected = connected
-			if !connected {
-				s.Reconnects++
-				if msg != "" {
-					s.LastError = msg
-				}
-			} else {
-				s.LastError = ""
-			}
-		})
-		a.mu.Unlock()
-		a.emitStatus()
+	// T2 status feed: the five-state card renders from StatusDetail pushes.
+	// applyDetail takes a.mu itself, so this callback must NOT hold it —
+	// rebuildLocked's callers (holding a.mu) never wait on a bridge callback
+	// (OnStatusDetail fires from Run/ping goroutines), so no cycle.
+	bc.OnStatusDetail = func(d localoctop.StatusDetail) {
+		a.applyDetail(d)
+		a.emitStatusUnlocked()
 	}
 	bc.OnAudit = func(ev localoctop.AuditEvent) {
 		a.mu.Lock()
@@ -383,10 +494,14 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 	if err != nil {
 		return err
 	}
-	// New identity for the status snapshot.
+	// New identity for the status snapshot + the connecting state: the card
+	// shows 连接中 from here until the first StatusDetail push says online.
 	a.st.update(func(s *Status) {
 		s.ClientID = b.ClientID()
 		s.ServerURL = bc.ServerURL
+		s.ConnState = string(stateConnecting)
+		s.ReconnectAttempt = 0
+		s.Connected = false
 	})
 
 	if a.cancel != nil {
@@ -398,20 +513,62 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 	return nil
 }
 
-// emitStatus pushes the status snapshot to the frontend and mirrors it into
-// the tray's status row. Safe to call from any goroutine; no-op before
-// startup wired the context.
-func (a *App) emitStatus() {
+// applyDetail folds one bridge-core StatusDetail into the UI Status.
+// Callers do NOT hold a.mu; it takes the lock itself, and derives the
+// five-state conn_state: 已断开 (manual) > 已连接 > 重连中 > 连接中.
+//
+// A manual 断开 is user intent and outranks every automatic path: while
+// userDisconnected is set, inbound details (a late push from the cancelled
+// bridge, or the 3s poller racing the teardown) are dropped — only the
+// manual Connect/SaveConfig entry points clear the flag and re-open the
+// auto feeds.
+func (a *App) applyDetail(d localoctop.StatusDetail) {
 	a.mu.Lock()
-	ctx := a.ctx
+	defer a.mu.Unlock()
+
+	if a.userDisconnected {
+		return // 用户意志：断开后不被自动状态覆盖
+	}
+
+	a.st.update(func(s *Status) {
+		s.Connected = d.Connected
+		s.ReconnectAttempt = d.ReconnectAttempt
+		s.LastPongAt = d.LastPongAt
+		if d.LastError != "" {
+			s.LastError = d.LastError
+		} else if d.Connected {
+			s.LastError = ""
+		}
+		switch {
+		case d.Connected:
+			s.ConnState = string(stateConnected)
+		case d.ReconnectAttempt > 0:
+			s.ConnState = string(stateReconnecting)
+		default:
+			s.ConnState = string(stateConnecting)
+		}
+	})
+}
+
+// emitStatusUnlocked pushes the current snapshot to the frontend + tray.
+// The caller must NOT hold a.mu (the emit path reads ctx/snapshot under
+// the lock, then emits outside it — the pre-T2 emitStatus re-locked a.mu
+// from SaveConfig and deadlocked).
+func (a *App) emitStatusUnlocked() {
+	a.mu.Lock()
 	snap := a.st.snapshot()
 	a.mu.Unlock()
-	if ctx == nil {
-		tray.SetStatus(localoctop.Version, snap.Connected, snap.ClientID)
-		return
+	emitStatus(a.ctx, snap)
+}
+
+// emitStatus is the lock-free emitter shared by all push paths. It mirrors
+// the real five-state into the tray (title + tooltip) instead of the old
+// binary up/down. Safe before startup wired the context (tray-only path).
+func emitStatus(ctx context.Context, snap Status) {
+	if ctx != nil {
+		runtime.EventsEmit(ctx, "bridge:status", snap)
 	}
-	runtime.EventsEmit(ctx, "bridge:status", snap)
-	tray.SetStatus(localoctop.Version, snap.Connected, snap.ClientID)
+	tray.SetStatus(localoctop.Version, snap.ConnState, snap.Connected, snap.ReconnectAttempt, snap.ClientID)
 }
 
 // emitAudit pushes one audit event to the frontend.

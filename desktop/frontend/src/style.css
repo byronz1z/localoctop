@@ -141,15 +141,29 @@ main { max-width: 760px; width: 100%; margin: 0 auto; padding: var(--s4) var(--s
 }
 .status-sub { margin-top: 2px; overflow-wrap: anywhere; }
 
-/* 状态语义 */
+/* 状态语义（0.6.0 五态：ok=已连接 / warn=已连接·心跳异常 / err=重连中 /
+   conn=连接中 / off=已断开 / wait=未配置） */
 .status-card.ok   .status-ico { background: var(--ok-soft);   color: var(--ok); }
 .status-card.ok   .status-big { color: var(--ok); }
+.status-card.warn .status-ico { background: var(--warn-soft); color: var(--warn); }
+.status-card.warn .status-big { color: var(--warn); }
 .status-card.err  .status-ico { background: var(--bad-soft);  color: var(--bad); }
 .status-card.err  .status-big { color: var(--bad); }
 .status-card.wait .status-ico { background: var(--accent-soft); color: var(--accent); }
 .status-card.wait .status-big { color: var(--accent); }
 .status-card.conn .status-ico { background: var(--warn-soft); color: var(--warn); }
 .status-card.conn .status-big { color: var(--warn); }
+.status-card.off  .status-ico { background: var(--bg); color: var(--muted); }
+.status-card.off  .status-big { color: var(--muted); }
+
+/* 手动连接/断开按钮行（0.6.0 T2） */
+.status-actions {
+    display: flex; align-items: center; gap: var(--s2);
+    padding-bottom: var(--s3);
+    border-bottom: 1px solid var(--line);
+    margin-bottom: var(--s3);
+}
+.status-actions .hint { margin: 0; }
 
 /* 连接中：状态点呼吸动画 */
 .status-card.conn .status-ico::after {

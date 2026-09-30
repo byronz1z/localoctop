@@ -1,4 +1,4 @@
-Unicode true
+﻿Unicode true
 
 ####
 ## Please note: Template replacements don't work in this file. They are provided with default defines like
@@ -28,7 +28,11 @@ Unicode true
 ## !define PRODUCT_EXECUTABLE  "Application.exe"      # Default "${INFO_PROJECTNAME}.exe"
 ## !define UNINST_KEY_NAME     "UninstKeyInRegistry"  # Default "${INFO_COMPANYNAME}${INFO_PRODUCTNAME}"
 ####
-## !define REQUEST_EXECUTION_LEVEL "admin"            # Default "admin"  see also https://nsis.sourceforge.io/Docs/Chapter4.html
+## 0.6.0 (T2): currentUser 安装 —— 员工机器无管理员权限，也不该写 HKLM。
+## wails_tools.nsh 的默认是 admin，在此定义后 tools 不覆盖（见其 !ifndef 守卫）。
+## SetShellVarContext current（wails.setShellContext）随之让 $SMPROGRAMS/$DESKTOP
+## 落在当前用户；快捷方式、Run 键、卸载键全部 per-user。
+!define REQUEST_EXECUTION_LEVEL "user"            # see also https://nsis.sourceforge.io/Docs/Chapter4.html
 ####
 ## Include the wails tools
 ####
@@ -54,6 +58,10 @@ ManifestDPIAware true
 !define MUI_UNICON "..\icon.ico"
 # !define MUI_WELCOMEFINISHPAGE_BITMAP "resources\leftimage.bmp" #Include this to add a bitmap on the left side of the Welcome Page. Must be a size of 164x314
 !define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
+# 0.6.0 (T2): 安装完成页「立即运行」默认勾上，装完即用（员工零操作）。
+# （只赋值、不裸 define：MUI.nsh 已预定义 MUI_FINISHPAGE_RUN，重复 !define 会中止。）
+!define MUI_FINISHPAGE_RUN_TEXT "立即运行 Octop 本地文件桥"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXECUTABLE}"
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
 
 !insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
@@ -72,7 +80,8 @@ ManifestDPIAware true
 
 Name "${INFO_PRODUCTNAME}"
 OutFile "..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the installer's file.
-InstallDir "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}" # Default installing folder ($PROGRAMFILES is Program Files folder).
+# 0.6.0 (T2): per-user 安装目录（无管理员权限可写）
+InstallDir "$LOCALAPPDATA\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}"
 ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
@@ -95,6 +104,19 @@ Section
     !insertmacro wails.associateCustomProtocols
 
     !insertmacro wails.writeUninstaller
+
+    # 0.6.0 (T2): 注册 HKCU Run 开机自启（与桌面端 autostart_windows.go 同一键）。
+    # 初次装机默认开——员工零操作；之后设置页勾选框可关（两端删同一值）。
+    # 值带 --minimized：开机直接进托盘不弹窗。
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "localoctop-desktop" '"$INSTDIR\${PRODUCT_EXECUTABLE}" --minimized'
+
+    # 0.6.0 (T2): per-user 卸载键（currentUser 下 HKLM 不可写）。
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "DisplayName" "${INFO_PRODUCTNAME}"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "UninstallString" '"$INSTDIR\uninstall.exe"'
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "Publisher" "${INFO_COMPANYNAME}"
 SectionEnd
 
 Section "uninstall"
@@ -111,4 +133,12 @@ Section "uninstall"
     !insertmacro wails.unassociateCustomProtocols
 
     !insertmacro wails.deleteUninstaller
+
+    # 0.6.0 (T2): 清开机自启与 per-user 卸载键（HKCU 同样可写）。
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "localoctop-desktop"
+    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}"
+
+    # 0.6.0 (T2): 用户数据不删 —— $APPDATA\localoctop（config.json 含令牌与
+    # 白名单、audit.jsonl 审计记录）整体保留，重装即恢复原配置。
+    # （此注释即「保留」的实现：明确不写任何 RMDir/Delete 指向它。）
 SectionEnd
