@@ -75,12 +75,12 @@ func setup(version string) {
 	systray.SetIcon(iconICO)
 	systray.SetTooltip(fmt.Sprintf("Octop 本地文件桥 v%s — 未连接", version))
 
-	statusItem = systray.AddMenuItem("未连接", "桥连接状态")
+	statusItem = systray.AddMenuItem("未连接", "连接状态")
 	statusItem.Disable()
 	systray.AddSeparator()
 	mOpen := systray.AddMenuItem("打开窗口", "显示主窗口")
 	systray.AddSeparator()
-	mQuit := systray.AddMenuItem("退出", "断开桥并退出程序")
+	mQuit := systray.AddMenuItem("退出", "退出并停止文件访问")
 
 	go func() {
 		for {
@@ -100,9 +100,10 @@ func setup(version string) {
 	}()
 }
 
-// TrayLabel maps the app's conn_state (+ attempt count) to the tray row
-// text and tooltip tail. Kept in sync with main.js's renderStatus — the
-// same five states, same words.
+// TrayLabel maps the app's conn_state to the tray row text and tooltip
+// tail. Kept in sync with main.js's renderStatus and docs/UI-COPY.md —
+// same five states, same words, no engineering metrics (attempt counts
+// stay in logs; the tray row just says 重连中…).
 func TrayLabel(connState string, connected bool, attempt int) (row, tail string) {
 	switch connState {
 	case "connected":
@@ -110,10 +111,9 @@ func TrayLabel(connState string, connected bool, attempt int) (row, tail string)
 	case "connecting":
 		return "连接中…", "连接中"
 	case "reconnecting":
-		row = fmt.Sprintf("重连中（第 %d 次）", attempt)
-		return row, row
+		return "重连中…", "重连中"
 	case "disconnected":
-		return "已断开", "已断开（手动）"
+		return "已断开", "已断开"
 	default: // "unconfigured" / pre-startup ""
 		if connected { // defensive: state lagging behind the bool
 			return "已连接", "已连接"

@@ -201,7 +201,7 @@ func (a *App) onBeforeClose(ctx context.Context) bool {
 		choice, err := runtime.MessageDialog(a.ctx, runtime.MessageDialogOptions{
 			Type:          runtime.QuestionDialog,
 			Title:         "要退出程序吗？",
-			Message:       "关闭窗口后程序将最小化到系统托盘继续运行，桥连接保持不断。\n\n点「是」完全退出：桥将断开，云端 AI 无法再访问本机文件。",
+			Message:       "关闭窗口后程序将最小化到系统托盘继续运行，云端 AI 的文件访问保持可用。\n\n点「是」完全退出：连接将断开，云端 AI 无法再访问本机文件。",
 			DefaultButton: "No", // Esc / default lands on "否" = 安全侧（留在托盘）
 		})
 		if err == nil && choice == "Yes" {

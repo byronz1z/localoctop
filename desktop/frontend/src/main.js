@@ -161,20 +161,11 @@ async function loadSettingsPage() {
 
 /* ---------- status card + header dot (five states, 0.6.0 T2) ---------- */
 
-// STALE_PONG: connected but last pong older than this (ms) → 心跳异常.
-// Mirrors the Go side's stalePongAfter (90s). Evaluated at render time so
-// the warning appears on the 3s poll tick even without a push event.
+// STALE_PONG: connected but the server's acknowledgement is older than this
+// (ms) → 连接不稳定. Mirrors the Go side's stalePongAfter (90s). Evaluated at
+// render time so the warning appears on the 3s poll tick even without a push
+// event. (User-facing wording per docs/UI-COPY.md — no mechanism talk.)
 const STALE_PONG_MS = 90 * 1000;
-
-// elapsedAgo formats "X 秒前" for the heartbeat row (0 → 刚刚).
-function elapsedAgo(ts) {
-    if (!ts) return '';
-    const ms = Date.now() - new Date(ts).getTime();
-    if (ms < 0 || Number.isNaN(ms)) return '';
-    const sec = Math.floor(ms / 1000);
-    if (sec < 1) return '刚刚';
-    return sec + ' 秒前';
-}
 
 // classify maps one Status snapshot to the five states. Priority matches
 // app.go's applyDetail: 已断开 (manual) > 已连接 > 重连中 > 连接中 > 未配置.
@@ -197,8 +188,8 @@ function classify(s) {
 
 // renderStatus maps one bridge:status snapshot onto the status card.
 // The five states come from the Go side's conn_state (fed by the bridge
-// core's StatusDetail pushes + 3s poll); only the 心跳异常 sub-warning is
-// derived here, from last_pong_at vs wall clock.
+// core's StatusDetail pushes + 3s poll); only the 连接不稳定 sub-warning is
+// derived here, from last_pong_at vs wall clock. Wording: docs/UI-COPY.md.
 function renderStatus(s) {
     const card = $('statusCard');
     const big = $('statusBig');
@@ -212,42 +203,48 @@ function renderStatus(s) {
     const st = classify(s);
     let cls, tagTxt;
     if (st === 'connected') {
-        // >90s without a pong = heartbeat trouble: still "connected" on the
-        // wire, but warn in yellow and say why.
+        // >90s without a server acknowledgement = unstable link: still
+        // "connected" on the wire, but warn in yellow and say what happens.
         const pongAge = s.last_pong_at ? (Date.now() - new Date(s.last_pong_at).getTime()) : Infinity;
         const stale = pongAge > STALE_PONG_MS;
         cls = stale ? 'warn' : 'ok';
-        tagTxt = stale ? '心跳异常' : '已连接';
-        big.textContent = stale ? '已连接（心跳异常）' : '已连接';
+        tagTxt = stale ? '连接不稳定' : '已连接';
+        big.textContent = stale ? '连接不稳定' : '已连接';
         sub.textContent = stale
-            ? '超过 90 秒未收到服务器心跳回应，连接可能已失效，等待自动重连…'
-            : (s.client_id ? '云端 AI 可访问本机白名单目录 · 心跳 ' + (elapsedAgo(s.last_pong_at) || '从未') : '');
+            ? '与服务器的联系时断时续，正在自动恢复…'
+            : '云端 AI 可正常访问白名单目录';
+        sub.title = '';
     } else if (st === 'reconnecting') {
         cls = 'err'; tagTxt = '重连中';
-        big.textContent = '重连中（第 ' + (s.reconnect_attempt || 1) + ' 次）';
-        sub.textContent = s.last_error || '连接中断，正在自动重连…';
+        big.textContent = '重连中…';
+        // Raw technical error stays out of the main copy; hover shows it.
+        sub.textContent = '连接中断，正在自动重连；若长时间未恢复，请检查网络。';
+        sub.title = s.last_error || '';
     } else if (st === 'connecting') {
         cls = 'conn'; tagTxt = '连接中';
         big.textContent = '连接中…';
         sub.textContent = '正在与服务器建立连接…';
+        sub.title = '';
     } else if (st === 'disconnected') {
         cls = 'off'; tagTxt = '已断开';
         big.textContent = '已断开';
-        sub.textContent = '已手动断开，不会自动重连；点「连接」或保存配置可恢复。';
+        sub.textContent = '已断开 · 云端 AI 暂时无法访问你的文件，点「连接」恢复。';
+        sub.title = '';
     } else { // unconfigured
         cls = 'wait'; tagTxt = '未配置';
         big.textContent = '未配置';
         sub.textContent = '填写服务器地址与令牌并保存后开始连接。';
+        sub.title = '';
     }
     card.className = 'card status-card ' + cls;
     ico.textContent = ICO[st];
     tag.className = 'pill ' + (cls === 'ok' || cls === 'warn' ? 'ok' : cls === 'err' ? 'err' : '');
     tag.textContent = tagTxt;
 
-    $('stClient').textContent = s.client_id || '—';
-    $('stAttempt').textContent = String(s.reconnect_attempt || 0);
-    $('stReconn').textContent = String(s.reconnects || 0);
-    $('stPong').textContent = st === 'connected' ? (elapsedAgo(s.last_pong_at) || '从未') : '—';
+    // Stats row (docs/UI-COPY.md): only actionable info — dir count,
+    // last operation time, server URL. Engineering metrics stay in logs.
+    const enabledDirs = (state.dirs || []).filter((d) => d.enabled).length;
+    $('stDirs').textContent = state.existed === false ? '—' : enabledDirs + ' 个';
     $('stServer').textContent = s.server_url || '—';
     $('stAudit').textContent = s.last_audit_ts ? fmtTime(s.last_audit_ts) : '—';
 

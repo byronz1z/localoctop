@@ -53,15 +53,12 @@
                             <button class="btn secondary" id="disconnectBtn" type="button">
                                 <span class="bi" aria-hidden="true">⏏</span>断开
                             </button>
-                            <span class="hint muted" id="manualHint">断开后不会自动重连，直到点「连接」或保存新配置。</span>
+                            <span class="hint muted" id="manualHint">断开后云端 AI 将无法访问你的文件，直到点「连接」或保存新配置。</span>
                         </div>
                         <div class="stats">
-                            <div class="stat"><div class="k">客户端 ID</div><div class="v mono" id="stClient">—</div></div>
-                            <div class="stat"><div class="k">当前尝试</div><div class="v" id="stAttempt">0</div></div>
-                            <div class="stat"><div class="k">累计重连</div><div class="v" id="stReconn">0</div></div>
-                            <div class="stat"><div class="k">最近心跳</div><div class="v mono" id="stPong">—</div></div>
+                            <div class="stat"><div class="k">白名单目录</div><div class="v" id="stDirs">—</div></div>
+                            <div class="stat"><div class="k">最近操作</div><div class="v mono" id="stAudit">—</div></div>
                             <div class="stat st-wide"><div class="k">服务器地址</div><div class="v mono" id="stServer">—</div></div>
-                            <div class="stat"><div class="k">最近审计</div><div class="v mono" id="stAudit">—</div></div>
                         </div>
                     </section>
 
@@ -142,7 +139,7 @@
                             <input id="confirmExit" type="checkbox" checked/>
                             <label for="confirmExit">
                                 <strong>关闭窗口时提示确认</strong>
-                                <span class="muted">（关闭窗口 = 最小化到托盘，桥连接保持不断；勾选后每次关窗会先询问是否真的要退出）</span>
+                                <span class="muted">（关闭窗口 = 最小化到托盘，连接保持不断；勾选后每次关窗会先询问是否真的要退出）</span>
                             </label>
                         </div>
                         <div class="chk">
@@ -154,21 +151,21 @@
                         </div>
                         <p class="hint muted" id="autostartHint" hidden></p>
                         <p class="hint muted">
-                            关闭窗口时程序将最小化到系统托盘继续运行，不会断开桥连接。要从托盘恢复窗口，右键托盘图标选择「打开窗口」；要完全退出（断开桥），请使用托盘菜单的「退出」。
+                            关闭窗口时程序将最小化到系统托盘继续运行，云端 AI 的文件访问不会中断。要从托盘恢复窗口，右键托盘图标选择「打开窗口」；要完全退出（停止文件访问），请使用托盘菜单的「退出」。
                         </p>
                     </section>
 
                     <section class="card">
-                        <h2>审计日志</h2>
-                        <div class="kv"><div class="k">日志文件</div><div class="v mono" id="setAuditPath">—</div></div>
-                        <p class="hint muted">审计日志由桥核心写入并自动轮转，桌面端仅展示路径。</p>
+                        <h2>操作记录</h2>
+                        <div class="kv"><div class="k">记录文件</div><div class="v mono" id="setAuditPath">—</div></div>
+                        <p class="hint muted">操作记录只保存在你自己的电脑上，自动滚动清理；此处仅展示文件位置。</p>
                     </section>
 
                     <section class="card">
                         <h2>关于</h2>
                         <div class="kv"><div class="k">版本</div><div class="v mono" id="setVersion">—</div></div>
                         <div class="kv"><div class="k">配置文件</div><div class="v mono" id="setConfigPath">—</div></div>
-                        <p class="hint muted">配置与主仓 bridge.exe 共享：修改任意一端，另一端下次启动生效。</p>
+                        <p class="hint muted">此配置同时供命令行版本使用：修改任意一端，另一端下次启动生效。</p>
                     </section>
                 </div>
             </main>
