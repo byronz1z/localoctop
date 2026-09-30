@@ -11,7 +11,7 @@
     !define INFO_COMPANYNAME "byron"
 !endif
 !ifndef INFO_PRODUCTNAME
-    !define INFO_PRODUCTNAME "Octop 本地文件桥"
+    !define INFO_PRODUCTNAME "localoctop"
 !endif
 !ifndef INFO_PRODUCTVERSION
     !define INFO_PRODUCTVERSION "0.6.0"

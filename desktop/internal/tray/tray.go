@@ -36,9 +36,13 @@
 // AddMenuItem) is mutex-guarded inside systray and safe from any goroutine.
 //
 // 0.6.0 (T2): SetStatus takes the app's conn_state string so the tray row
-// and tooltip mirror the same five states the status card renders
+// and tooltip mirror the same states the status card renders
 // (已连接 / 连接中 / 重连中 第 N 次 / 已断开 / 未配置) instead of the old
 // binary 已连接-未连接.
+//
+// 0.6.1 (T3'): sixth state parked — the token was taken over by another
+// device (server close code 4000, bridge core parks instead of fighting).
+// Tray says 已在别处登录, same words as the status card.
 package tray
 
 import (
@@ -73,7 +77,7 @@ func Register(version string, a Actions) {
 // setup builds the menu; runs on systray's ready goroutine.
 func setup(version string) {
 	systray.SetIcon(iconICO)
-	systray.SetTooltip(fmt.Sprintf("Octop 本地文件桥 v%s — 未连接", version))
+	systray.SetTooltip(fmt.Sprintf("localoctop v%s — 未连接", version))
 
 	statusItem = systray.AddMenuItem("未连接", "连接状态")
 	statusItem.Disable()
@@ -102,7 +106,7 @@ func setup(version string) {
 
 // TrayLabel maps the app's conn_state to the tray row text and tooltip
 // tail. Kept in sync with main.js's renderStatus and docs/UI-COPY.md —
-// same five states, same words, no engineering metrics (attempt counts
+// same six states, same words, no engineering metrics (attempt counts
 // stay in logs; the tray row just says 重连中…).
 func TrayLabel(connState string, connected bool, attempt int) (row, tail string) {
 	switch connState {
@@ -112,6 +116,9 @@ func TrayLabel(connState string, connected bool, attempt int) (row, tail string)
 		return "连接中…", "连接中"
 	case "reconnecting":
 		return "重连中…", "重连中"
+	case "parked":
+		// 被接管停泊：同令牌另一台设备在线，本机暂停；「连接」收回。
+		return "已在别处登录", "已在别处登录"
 	case "disconnected":
 		return "已断开", "已断开"
 	default: // "unconfigured" / pre-startup ""
@@ -122,7 +129,7 @@ func TrayLabel(connState string, connected bool, attempt int) (row, tail string)
 	}
 }
 
-// SetStatus updates the status row and tooltip from the app's five-state
+// SetStatus updates the status row and tooltip from the app's six-state
 // snapshot. Safe from any goroutine.
 func SetStatus(version, connState string, connected bool, attempt int, clientID string) {
 	row, tail := TrayLabel(connState, connected, attempt)
@@ -133,5 +140,5 @@ func SetStatus(version, connState string, connected bool, attempt int, clientID 
 	if statusItem != nil {
 		statusItem.SetTitle(text)
 	}
-	systray.SetTooltip(fmt.Sprintf("Octop 本地文件桥 v%s — %s", version, tail))
+	systray.SetTooltip(fmt.Sprintf("localoctop v%s — %s", version, tail))
 }

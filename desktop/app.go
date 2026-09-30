@@ -16,6 +16,9 @@
 // 0.6.0 (T2) makes the connection state REAL and user-steerable:
 //
 //   - five-state status card fed by the bridge core's OnStatusDetail
+//     (0.6.1 adds the sixth state, parked — 已在别处登录, surfaced once the
+//     bridge core reports token takeover; the constant + UI branches are
+//     in place ahead of the core's T2' landing)
 //     (StatusDetail: connected / reconnect attempt / last error / ping-pong
 //     timestamps) plus a 3s polling fallback — the old Connected bool was a
 //     lie (it showed the last dial result; a dead session read "已连接");
@@ -44,7 +47,7 @@ import (
 	"github.com/byronz1z/localoctop/desktop/internal/tray"
 )
 
-// connState is the connection lifecycle the five-state card renders.
+// connState is the connection lifecycle the six-state card renders.
 type connState string
 
 const (
@@ -52,6 +55,7 @@ const (
 	stateConnecting  connState = "connecting"  // bridge built, first dial in flight
 	stateConnected   connState = "connected"   // Connected=true
 	stateReconnecting connState = "reconnecting" // attempt>0 after a drop
+	stateParked      connState = "parked"      // 0.6.1: token taken over elsewhere (server 4000), auto-reconnect parked
 	stateDisconnected connState = "disconnected" // user-initiated, stays down
 	stateUnconfigured connState = "unconfigured" // no server URL/token on file
 )
@@ -94,7 +98,7 @@ type statusState struct {
 // header dot and stats row.
 type Status struct {
 	Connected  bool   `json:"connected"`
-	ConnState  string `json:"conn_state"`           // five-state card driver (connState values)
+	ConnState  string `json:"conn_state"`           // six-state card driver (connState values)
 	ClientID   string `json:"client_id"`
 	ServerURL  string `json:"server_url"`
 	LastError  string `json:"last_error,omitempty"`
@@ -475,7 +479,7 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 	bc.AuditLogPath = cfg.AuditLogPath
 	bc.Logger = localoctop.NewStderrLogger(false)
 
-	// T2 status feed: the five-state card renders from StatusDetail pushes.
+	// T2 status feed: the six-state card renders from StatusDetail pushes.
 	// applyDetail takes a.mu itself, so this callback must NOT hold it —
 	// rebuildLocked's callers (holding a.mu) never wait on a bridge callback
 	// (OnStatusDetail fires from Run/ping goroutines), so no cycle.
@@ -515,7 +519,8 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 
 // applyDetail folds one bridge-core StatusDetail into the UI Status.
 // Callers do NOT hold a.mu; it takes the lock itself, and derives the
-// five-state conn_state: 已断开 (manual) > 已连接 > 重连中 > 连接中.
+// six-state conn_state: 已断开 (manual) > 已在别处登录 (parked) > 已连接 >
+// 重连中 > 连接中.
 //
 // A manual 断开 is user intent and outranks every automatic path: while
 // userDisconnected is set, inbound details (a late push from the cancelled
@@ -547,6 +552,14 @@ func (a *App) applyDetail(d localoctop.StatusDetail) {
 		default:
 			s.ConnState = string(stateConnecting)
 		}
+		// 0.6.1: bridge core parks on server close code 4000 (token taken
+		// over by another device, no auto-reconnect). Once T2' adds the
+		// parked flag to StatusDetail, fold it here; until then the state
+		// arrives only via a parked conn_state string already set upstream.
+		if d.ReconnectAttempt == 0 && !d.Connected && d.LastError != "" &&
+			strings.Contains(d.LastError, "4000") {
+			s.ConnState = string(stateParked)
+		}
 	})
 }
 
@@ -562,7 +575,7 @@ func (a *App) emitStatusUnlocked() {
 }
 
 // emitStatus is the lock-free emitter shared by all push paths. It mirrors
-// the real five-state into the tray (title + tooltip) instead of the old
+// the real six-state into the tray (title + tooltip) instead of the old
 // binary up/down. Safe before startup wired the context (tray-only path).
 func emitStatus(ctx context.Context, snap Status) {
 	if ctx != nil {

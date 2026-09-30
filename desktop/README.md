@@ -1,6 +1,6 @@
 # localoctop-desktop
 
-Octop 本地文件桥 **桌面客户端**（Windows GUI）。基于 [Wails v2](https://wails.io)（Go + 系统 WebView2，无 Electron），复用主仓 [localoctop](https://github.com/byronz1z/localoctop) 的 Bridge 核心作为 Go 模块依赖（`github.com/byronz1z/localoctop`，当前 v0.5.0），为员工提供图形化的桥配置、启停与托盘驻留体验。
+localoctop **桌面客户端**（Windows GUI）。基于 [Wails v2](https://wails.io)（Go + 系统 WebView2，无 Electron），复用主仓 [localoctop](https://github.com/byronz1z/localoctop) 的 Bridge 核心作为 Go 模块依赖（`github.com/byronz1z/localoctop`，当前 v0.5.0），为员工提供图形化的桥配置、启停与托盘驻留体验。
 
 ## 项目定位
 

@@ -159,7 +159,7 @@ async function loadSettingsPage() {
     });
 }
 
-/* ---------- status card + header dot (five states, 0.6.0 T2) ---------- */
+/* ---------- status card + header dot (six states, 0.6.1 T3') ---------- */
 
 // STALE_PONG: connected but the server's acknowledgement is older than this
 // (ms) → 连接不稳定. Mirrors the Go side's stalePongAfter (90s). Evaluated at
@@ -167,11 +167,13 @@ async function loadSettingsPage() {
 // event. (User-facing wording per docs/UI-COPY.md — no mechanism talk.)
 const STALE_PONG_MS = 90 * 1000;
 
-// classify maps one Status snapshot to the five states. Priority matches
-// app.go's applyDetail: 已断开 (manual) > 已连接 > 重连中 > 连接中 > 未配置.
+// classify maps one Status snapshot to the six states. Priority matches
+// app.go's applyDetail: 已断开 (manual) > 已在别处登录 (parked) > 已连接 >
+// 重连中 > 连接中 > 未配置.
 function classify(s) {
     switch (s.conn_state) {
     case 'disconnected': return 'disconnected';
+    case 'parked': return 'parked'; // 被接管停泊（服务器 4000）：自动重连已停
     case 'connected':
         return s.connected ? 'connected' : 'reconnecting'; // detail-lag guard
     case 'reconnecting': return 'reconnecting';
@@ -187,7 +189,7 @@ function classify(s) {
 }
 
 // renderStatus maps one bridge:status snapshot onto the status card.
-// The five states come from the Go side's conn_state (fed by the bridge
+// The six states come from the Go side's conn_state (fed by the bridge
 // core's StatusDetail pushes + 3s poll); only the 连接不稳定 sub-warning is
 // derived here, from last_pong_at vs wall clock. Wording: docs/UI-COPY.md.
 function renderStatus(s) {
@@ -197,7 +199,8 @@ function renderStatus(s) {
     const tag = $('statusTag');
     const ico = $('statusIco');
     const ICO = {
-        connected: '✔', reconnecting: '✕', connecting: '', disconnected: '⏏', unconfigured: '…',
+        connected: '✔', reconnecting: '✕', connecting: '', disconnected: '⏏',
+        parked: '⏸', unconfigured: '…',
     };
 
     const st = classify(s);
@@ -214,6 +217,13 @@ function renderStatus(s) {
             ? '与服务器的联系时断时续，正在自动恢复…'
             : '云端 AI 可正常访问白名单目录';
         sub.title = '';
+    } else if (st === 'parked') {
+        // 已在别处登录：同令牌在另一台设备连接，本机被服务器停泊
+        // （自动重连已停）。点「连接」= 用户明示收回，属手动动作。
+        cls = 'warn'; tagTxt = '已在别处登录';
+        big.textContent = '已在别处登录';
+        sub.textContent = '该令牌已在另一台设备上接管，本机已暂停。点「连接」可从那台设备收回。';
+        sub.title = s.last_error || '';
     } else if (st === 'reconnecting') {
         cls = 'err'; tagTxt = '重连中';
         big.textContent = '重连中…';
@@ -256,6 +266,8 @@ function renderStatus(s) {
 
 // updateConnButtons: 连接 enabled unless already trying/online; 断开
 // enabled only while a bridge exists (connecting/connected/reconnecting).
+// parked（已在别处登录）时「连接」保持可用——点击即收回接管（手动动作，
+// app.go Connect 清停泊并重连）；断开置灰（本已停着，无桥可断）。
 function updateConnButtons(st) {
     $('connectBtn').disabled = (st === 'connecting' || st === 'connected');
     $('disconnectBtn').disabled = !(st === 'connecting' || st === 'connected' || st === 'reconnecting');
@@ -501,7 +513,7 @@ async function saveConfig(e) {
 
 function updateFormMode() {
     const first = state.existed === false;
-    $('formTitle').textContent = first ? '欢迎使用 Octop 本地文件桥' : '连接设置';
+    $('formTitle').textContent = first ? '欢迎使用 localoctop' : '连接设置';
     $('formHint').textContent = first
         ? '首次使用需要完成三步：添加白名单目录 → 填写服务器地址与令牌 → 保存并连接。'
         : '修改后保存即可热重连，无需重启应用。';

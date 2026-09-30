@@ -1,10 +1,10 @@
 package main
 
-// 0.6.0 (T2) self-tests: five-state derivation, manual connect/disconnect
-// lifecycle, the SaveConfig no-deadlock regression, and autostart's
-// appcfg round-trip. Run with:
+// 0.6.0 (T2) + 0.6.1 (T3') self-tests: five/six-state derivation, manual
+// connect/disconnect lifecycle, the SaveConfig no-deadlock regression, and
+// autostart's appcfg round-trip. Run with:
 //
-//	go test -run 'TestT2|TestSettingsBindings' -v ./...
+//	go test -run 'TestT2|TestT3|TestSettingsBindings' -v ./...
 //
 // The live config file is snapshotted and restored byte-for-byte around
 // each test (the autostart case writes both appcfg and HKCU), so a
@@ -108,6 +108,52 @@ func TestT2ApplyDetailFiveStates(t *testing.T) {
 	a.applyDetail(localoctop.StatusDetail{Connected: false, ReconnectAttempt: 1})
 	if got := get(); got != string(stateDisconnected) {
 		t.Fatalf("late push after disconnect: conn_state = %q, want disconnected (用户意志不可被自动路径覆盖)", got)
+	}
+}
+
+// TestT3ParkedState: the 0.6.1 sixth state. A takeover close (server 4000)
+// shows up as a not-connected, not-retrying detail whose error names the
+// code → conn_state must read parked (已在别处登录), not reconnecting —
+// and the classification must survive a follow-up detail with the same
+// error (the 3s poller re-pulls the parked snapshot while T2' has stopped
+// the reconnect loop).
+func TestT3ParkedState(t *testing.T) {
+	a := NewApp()
+
+	get := func() string {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.st.snapshot().ConnState
+	}
+
+	// Takeover detail: connected=false, attempt=0, close code in the error.
+	a.applyDetail(localoctop.StatusDetail{Connected: false, ReconnectAttempt: 0,
+		LastError: "websocket: close 4000 (replaced by reconnect)"})
+	if got := get(); got != string(stateParked) {
+		t.Fatalf("takeover 4000: conn_state = %q, want parked", got)
+	}
+
+	// The poller re-pulls the same parked snapshot: stays parked, no flapping
+	// back to connecting (which would re-enable auto-reconnect visuals).
+	a.applyDetail(localoctop.StatusDetail{Connected: false, ReconnectAttempt: 0,
+		LastError: "websocket: close 4000 (replaced by reconnect)"})
+	if got := get(); got != string(stateParked) {
+		t.Fatalf("parked re-poll: conn_state = %q, want parked", got)
+	}
+
+	// Recovery is a manual act: a fresh connecting detail (Connect clicked)
+	// flips the card to 连接中 — parked never overrides user intent.
+	a.applyDetail(localoctop.StatusDetail{Connected: false, ReconnectAttempt: 0, LastError: ""})
+	if got := get(); got != string(stateConnecting) {
+		t.Fatalf("manual reconnect: conn_state = %q, want connecting", got)
+	}
+
+	// Guard: an ordinary network error with no 4000 stays reconnecting,
+	// not parked (reverse case from T2' spec).
+	a.applyDetail(localoctop.StatusDetail{Connected: false, ReconnectAttempt: 1,
+		LastError: "dial tcp: connection refused"})
+	if got := get(); got != string(stateReconnecting) {
+		t.Fatalf("ordinary drop: conn_state = %q, want reconnecting", got)
 	}
 }
 

@@ -28,11 +28,12 @@
 ## !define PRODUCT_EXECUTABLE  "Application.exe"      # Default "${INFO_PROJECTNAME}.exe"
 ## !define UNINST_KEY_NAME     "UninstKeyInRegistry"  # Default "${INFO_COMPANYNAME}${INFO_PRODUCTNAME}"
 ####
-## 0.6.0 (T2): currentUser 安装 —— 员工机器无管理员权限，也不该写 HKLM。
-## wails_tools.nsh 的默认是 admin，在此定义后 tools 不覆盖（见其 !ifndef 守卫）。
-## SetShellVarContext current（wails.setShellContext）随之让 $SMPROGRAMS/$DESKTOP
-## 落在当前用户；快捷方式、Run 键、卸载键全部 per-user。
-!define REQUEST_EXECUTION_LEVEL "user"            # see also https://nsis.sourceforge.io/Docs/Chapter4.html
+## 0.6.1 (T3'): perMachine 安装（用户裁定）——装进 D:\Program Files\localoctop，
+## 需要管理员权限，NSIS 以 RequestExecutionLevel admin 启动时自动弹 UAC。
+## wails_tools.nsh 的默认即 admin，无需在此覆盖；SetShellVarContext all
+## （wails.setShellContext）随之让 $SMPROGRAMS/$DESKTOP 落到全体用户。
+## 卸载兼容：旧 0.6.0 currentUser 版（$LOCALAPPDATA\byron\ 下、以旧产品名命名
+## 的目录）不做自动清理——用户自行卸载旧版（任务书裁定），本脚本不碰那个目录。
 ####
 ## Include the wails tools
 ####
@@ -60,7 +61,7 @@ ManifestDPIAware true
 !define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
 # 0.6.0 (T2): 安装完成页「立即运行」默认勾上，装完即用（员工零操作）。
 # （只赋值、不裸 define：MUI.nsh 已预定义 MUI_FINISHPAGE_RUN，重复 !define 会中止。）
-!define MUI_FINISHPAGE_RUN_TEXT "立即运行 Octop 本地文件桥"
+!define MUI_FINISHPAGE_RUN_TEXT "立即运行 localoctop"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXECUTABLE}"
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
 
@@ -80,8 +81,9 @@ ManifestDPIAware true
 
 Name "${INFO_PRODUCTNAME}"
 OutFile "..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the installer's file.
-# 0.6.0 (T2): per-user 安装目录（无管理员权限可写）
-InstallDir "$LOCALAPPDATA\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}"
+# 0.6.1 (T3'): perMachine 安装目录（用户裁定）——Program Files 下 localoctop
+# 子文件夹；D 盘是员工机约定的数据盘。InstallDirRegKey 让升级安装记住上次位置。
+InstallDir "D:\Program Files\localoctop"
 ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
@@ -107,16 +109,9 @@ Section
 
     # 0.6.0 (T2): 注册 HKCU Run 开机自启（与桌面端 autostart_windows.go 同一键）。
     # 初次装机默认开——员工零操作；之后设置页勾选框可关（两端删同一值）。
-    # 值带 --minimized：开机直接进托盘不弹窗。
+    # 值带 --minimized：开机直接进托盘不弹窗。（0.6.1 perMachine 下保持 HKCU：
+    # 自启是当前用户的登录动作，per-user 语义正确，且升级/重装不互踩。）
     WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "localoctop-desktop" '"$INSTDIR\${PRODUCT_EXECUTABLE}" --minimized'
-
-    # 0.6.0 (T2): per-user 卸载键（currentUser 下 HKLM 不可写）。
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "DisplayName" "${INFO_PRODUCTNAME}"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "DisplayVersion" "${INFO_PRODUCTVERSION}"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "DisplayIcon" "$INSTDIR\${PRODUCT_EXECUTABLE}"
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
-    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}" "Publisher" "${INFO_COMPANYNAME}"
 SectionEnd
 
 Section "uninstall"
@@ -134,11 +129,15 @@ Section "uninstall"
 
     !insertmacro wails.deleteUninstaller
 
-    # 0.6.0 (T2): 清开机自启与 per-user 卸载键（HKCU 同样可写）。
+    # 0.6.0 (T2): 清开机自启（HKCU Run，安装与卸载两端删同一值）。
+    # 卸载注册键由 wails.deleteUninstaller 清（perMachine admin 下在 HKLM，
+    # SetRegView 64 已由该宏设置）。
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "localoctop-desktop"
-    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNINST_KEY_NAME}"
 
     # 0.6.0 (T2): 用户数据不删 —— $APPDATA\localoctop（config.json 含令牌与
     # 白名单、audit.jsonl 审计记录）整体保留，重装即恢复原配置。
     # （此注释即「保留」的实现：明确不写任何 RMDir/Delete 指向它。）
+
+    # 0.6.1 (T3'): 旧 0.6.0 currentUser 版装在 $LOCALAPPDATA\byron\ 下（旧产品名
+    # 目录），不做自动清理——用户自行卸载旧版（任务书裁定）；本脚本不写任何指令指向它。
 SectionEnd
