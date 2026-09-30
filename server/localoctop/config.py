@@ -19,6 +19,11 @@ Bootstrap (dev / single-tenant) via environment:
 
 Everything is read once at startup into a Settings dataclass; tests build a
 Settings directly and inject it.
+
+v0.6.0: the token env vars are additionally re-read on demand —
+`reload_tokens_from_env()` (wired to the background poller in app.py and to
+`POST /admin/tokens/reload`) reconciles the env-derived tokens into the live
+store; runtime-issued tokens for users absent from the env are preserved.
 """
 
 from __future__ import annotations
@@ -35,6 +40,10 @@ DEFAULT_MAX_WRITE_BYTES = 10 * 1024 * 1024  # 10 MB
 # 适配器整体响应 ≤20s。适配器侧的桥等待取 18s。
 DEFAULT_BRIDGE_TIMEOUT = 18.0               # A→B request/response budget
 DEFAULT_IDLE_TIMEOUT = 120.0                # drop a bridge with no traffic
+# v0.6.0: how often the background task re-reads the token env vars
+# (covers k8s/direct-process deployments where the process env can change
+# without a container rebuild; see T3-SERVER-HOTRELOAD).
+DEFAULT_TOKEN_POLL_INTERVAL = 30.0
 
 
 @dataclass
@@ -72,6 +81,8 @@ class Settings:
     # --- logging ---
     audit_log_path: str = "logs/calls.jsonl"
     log_level: str = "INFO"
+    # v0.6.0 热加载: background env-poll interval (0 disables the poller).
+    token_poll_interval: float = DEFAULT_TOKEN_POLL_INTERVAL
 
     # --- server ---
     host: str = "0.0.0.0"  # noqa: S104 — container bind, fronted by a proxy
@@ -106,43 +117,44 @@ class Settings:
         return self.allow_write or user_id in self.write_allowlist
 
 
+def _parse_token_pairs(raw: str) -> dict[str, str]:
+    """Parse "userA:tokA,userB:tokB" into {user_id: plaintext}.
+    Empty/malformed segments are skipped."""
+    out: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        user_id, _, tok = pair.partition(":")
+        user_id, tok = user_id.strip(), tok.strip()
+        if user_id and tok:
+            out[user_id] = tok
+    return out
+
+
+def _env_token_entries(e) -> tuple[dict[str, str], dict[str, str]]:
+    """Read the token env vars. Returns (mcp_entries, bridge_entries) where
+    the bridge side falls back to the MCP entries when
+    LOCALOCTOP_CLIENT_TOKENS is unset/empty (single-token back-compat)."""
+    mcp_entries = _parse_token_pairs(e.get("LOCALOCTOP_MCP_TOKENS", ""))
+    bridge_entries = _parse_token_pairs(e.get("LOCALOCTOP_CLIENT_TOKENS", ""))
+    if not bridge_entries:
+        bridge_entries = dict(mcp_entries)
+    return mcp_entries, bridge_entries
+
+
 def load_settings(env: os._Environ | dict | None = None) -> Settings:
     """Build Settings from the environment (or an injected mapping for tests)."""
     e = env if env is not None else os.environ
 
-    static: dict[str, str] = {}
-    raw_tokens = e.get("LOCALOCTOP_MCP_TOKENS", "")
-    for pair in raw_tokens.split(","):
-        pair = pair.strip()
-        if not pair or ":" not in pair:
-            continue
-        user_id, _, tok = pair.partition(":")
-        user_id, tok = user_id.strip(), tok.strip()
-        if user_id and tok:
-            static[user_id] = tok
-
-    bridge_static: dict[str, str] = {}
-    raw_bridge = e.get("LOCALOCTOP_CLIENT_TOKENS", "")
-    for pair in raw_bridge.split(","):
-        pair = pair.strip()
-        if not pair or ":" not in pair:
-            continue
-        user_id, _, tok = pair.partition(":")
-        user_id, tok = user_id.strip(), tok.strip()
-        if user_id and tok:
-            bridge_static[user_id] = tok
+    static = _parse_token_pairs(e.get("LOCALOCTOP_MCP_TOKENS", ""))
+    mcp_entries, bridge_entries = _env_token_entries(e)
 
     store = TokenStore()
-    for user_id, tok in static.items():
+    for user_id, tok in mcp_entries.items():
         store.seed(KIND_MCP, user_id, tok)
-    if bridge_static:
-        for user_id, tok in bridge_static.items():
-            store.seed(KIND_BRIDGE, user_id, tok)
-    else:
-        # Back-compat: a deployment that only set LOCALOCTOP_MCP_TOKENS keeps its
-        # clients connected until tokens are rotated to the split scheme.
-        for user_id, tok in static.items():
-            store.seed(KIND_BRIDGE, user_id, tok)
+    for user_id, tok in bridge_entries.items():
+        store.seed(KIND_BRIDGE, user_id, tok)
 
     write_allow: set[str] = set()
     for u in e.get("LOCALOCTOP_WRITE_ALLOWLIST", "").split(","):
@@ -162,6 +174,7 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
         idle_timeout=_float(e.get("LOCALOCTOP_IDLE_TIMEOUT"), DEFAULT_IDLE_TIMEOUT),
         audit_log_path=e.get("LOCALOCTOP_AUDIT_LOG", "logs/calls.jsonl"),
         log_level=e.get("LOCALOCTOP_LOG_LEVEL", "INFO"),
+        token_poll_interval=_float(e.get("LOCALOCTOP_TOKEN_POLL_INTERVAL"), DEFAULT_TOKEN_POLL_INTERVAL),
         host=e.get("LOCALOCTOP_HOST", "0.0.0.0"),
         port=_int(e.get("LOCALOCTOP_PORT"), 8080),
         ssl_port=_int(e.get("LOCALOCTOP_SSL_PORT"), 0),
@@ -170,6 +183,35 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
         mcp_path=e.get("LOCALOCTOP_MCP_PATH", "/mcp/localoctop/"),
         ws_path=e.get("LOCALOCTOP_WS_PATH", "/mcp/localoctop/ws"),
     )
+
+
+def reload_tokens_from_env(settings: Settings, env: os._Environ | dict | None = None,
+                           logger=None) -> dict[str, dict[str, list[str]]]:
+    """v0.6.0 热加载: re-read the token env vars and reconcile them into
+    `settings.token_store` (atomic swap per kind — see TokenStore.apply_env).
+
+    Returns {"mcp": {"added": [...], "removed": [...]}, "bridge": {...}}
+    with user ids only — plaintexts never appear in the result or logs.
+
+    Note: in Docker the process env is fixed at container creation, so a
+    changed .env on the host is only visible after `docker compose up -d`;
+    this poller covers k8s/direct-process deployments where the env of a
+    running process can actually change.
+    """
+    e = env if env is not None else os.environ
+    mcp_entries, bridge_entries = _env_token_entries(e)
+    result = {
+        "mcp": settings.token_store.apply_env(KIND_MCP, mcp_entries),
+        "bridge": settings.token_store.apply_env(KIND_BRIDGE, bridge_entries),
+    }
+    if logger is not None:
+        for kind in ("mcp", "bridge"):
+            added = result[kind]["added"]
+            removed = result[kind]["removed"]
+            if added or removed:
+                logger.info("token reload (%s): added users=%s removed users=%s",
+                            kind, added, removed)
+    return result
 
 
 def _env_flag(v: str | None, default: bool) -> bool:

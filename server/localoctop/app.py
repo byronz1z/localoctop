@@ -8,10 +8,16 @@ Wires together:
     GET     /healthz             liveness/readiness (bridge counts included)
     GET     /admin/sessions      ops view of connected bridges (loopback /
                                  admin-token guarded)
+    POST    /admin/tokens/reload v0.6.0 hot-reload of the env-derived tokens
+
+A background asyncio task (started in the lifespan) re-reads the token env
+vars every `token_poll_interval` seconds and reconciles them into the live
+token store — see config.reload_tokens_from_env and T3-SERVER-HOTRELOAD.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import Any
@@ -46,13 +52,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     mcp_router = build_mcp_router(settings, registry, audit, settings.mcp_path)
 
+    async def _token_poll_loop() -> None:
+        """v0.6.0 热加载 poller: every interval, re-read the token env vars
+        and reconcile them into the live store (no-op when unchanged).
+        Docker containers pin their env at creation, so this mainly covers
+        k8s / direct-process deployments; the reliable Docker path for a
+        changed .env is still `docker compose up -d` (or the admin reload
+        endpoint when the in-container env has already been updated)."""
+        from .config import reload_tokens_from_env
+
+        while True:
+            await asyncio.sleep(settings.token_poll_interval)
+            try:
+                reload_tokens_from_env(settings, logger=logger)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("token poll reload failed; retrying next interval")
+
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         # The MCP SDK session manager starts lazily on the first request (so
         # ASGI hosts that never emit lifespan events — e.g. httpx's
         # ASGITransport in tests — still work); the lifespan only owns the
         # orderly shutdown.
+        poll_task: asyncio.Task | None = None
+        if settings.token_poll_interval > 0:
+            poll_task = asyncio.create_task(_token_poll_loop())
+        app.state._token_poll_task = poll_task
         yield
+        if poll_task is not None:
+            poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll_task
         endpoint = getattr(mcp_router, "localoctop_endpoint", None)
         if endpoint is not None:
             await endpoint.shutdown()
@@ -172,6 +204,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if not user_id or rec["user_id"] == user_id:
                     tokens.append(rec)
         return JSONResponse({"tokens": tokens})
+
+    @app.post("/admin/tokens/reload")
+    async def admin_reload_tokens(request: Request) -> JSONResponse:
+        """v0.6.0 热加载: immediately re-read the token env vars and update
+        the live token table. Admin-guarded like the other /admin endpoints.
+
+        使用方式: 运维改宿主机 .env 后 `docker compose up -d` 一次性重建仍
+        是最可靠路径（docker 语义下 env 在容器创建时固定，宿主机改 .env
+        不会同步进运行中的容器）；本 API 用于同容器内 env 已更新的场景
+        （如 k8s ConfigMap 注入、自动化脚本 `docker exec` 改 env 后调用）
+        与 CI/自动化调用。
+
+        Response (user ids only — token plaintexts never appear):
+            {"reloaded": true,
+             "mcp_users": [...], "bridge_users": [...],
+             "added": {...}, "removed": {...}}
+        """
+        if not await _admin_guard(request):
+            err = BridgeProtocolError(CODE_AUTH_FAILED, "admin access denied")
+            return JSONResponse({"error": err.to_dict()}, status_code=403)
+
+        from .config import reload_tokens_from_env
+        from .tokens import KIND_BRIDGE, KIND_MCP
+
+        diff = reload_tokens_from_env(settings, logger=logger)
+
+        def _users(kind: str) -> list[str]:
+            table = settings.token_store._table_locked(kind)
+            return sorted({rec.user_id for rec in table.values() if not rec.revoked})
+
+        return JSONResponse({
+            "reloaded": True,
+            "mcp_users": _users(KIND_MCP),
+            "bridge_users": _users(KIND_BRIDGE),
+            "added": diff["mcp"]["added"] + diff["bridge"]["added"],
+            "removed": diff["mcp"]["removed"] + diff["bridge"]["removed"],
+        })
 
     return app
 
