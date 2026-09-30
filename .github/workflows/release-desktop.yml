@@ -67,6 +67,7 @@ jobs:
       - name: Package portable zip (EXE + README)
         run: |
           $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item desktop/README.md desktop/build/bin/
           Compress-Archive -Path desktop/build/bin/localoctop-desktop.exe,desktop/build/bin/README.md `
             -DestinationPath "dist/localoctop-desktop-$tag-windows-amd64.zip" -Force
