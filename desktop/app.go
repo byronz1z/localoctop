@@ -553,10 +553,14 @@ func (a *App) applyDetail(d localoctop.StatusDetail) {
 			s.ConnState = string(stateConnecting)
 		}
 		// 0.6.1: bridge core parks on server close code 4000 (token taken
-		// over by another device, no auto-reconnect). Once T2' adds the
-		// parked flag to StatusDetail, fold it here; until then the state
-		// arrives only via a parked conn_state string already set upstream.
-		if d.ReconnectAttempt == 0 && !d.Connected && d.LastError != "" &&
+		// over by another device, no auto-reconnect). Prefer the explicit
+		// contract fields from the bridge core (T2', StatusDetail.ConnState/
+		// ParkReason); keep the LastError heuristic as a fallback so older
+		// bridge cores still surface the state.
+		if d.ConnState == localoctop.ConnStateParked &&
+			(d.ParkReason == "" || d.ParkReason == localoctop.ParkReasonSuperseded) {
+			s.ConnState = string(stateParked)
+		} else if d.ReconnectAttempt == 0 && !d.Connected && d.LastError != "" &&
 			strings.Contains(d.LastError, "4000") {
 			s.ConnState = string(stateParked)
 		}

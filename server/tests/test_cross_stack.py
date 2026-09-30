@@ -40,12 +40,13 @@ BRIDGE_DIR = Path(os.environ.get("LOCALOCTOP_BRIDGE_DIR", str(REPO_ROOT.parent))
 
 def _it_token_store() -> TokenStore:
     """The integration test runs one legacy-style deployment: the same
-    secret seeded in both directions (the documented back-compat mode), so
-    the Go bridge (-token it-token) and the MCP probe (Bearer it-token)
-    both authenticate."""
+    secret on both sides of ONE strict pair (the documented back-compat
+    mode), so the Go bridge (-token it-token) and the MCP probe (Bearer
+    it-token) authenticate and route to each other. v0.6.1: seeding the
+    two kinds independently leaves them unpaired, and an unpaired mcp
+    token never routes — hence seed_pair."""
     store = TokenStore()
-    store.seed(KIND_MCP, "alice", "it-token")
-    store.seed(KIND_BRIDGE, "alice", "it-token")
+    store.seed_pair("alice", "it-token", "it-token")
     return store
 
 

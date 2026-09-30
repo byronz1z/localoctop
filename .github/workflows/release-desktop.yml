@@ -1,12 +1,12 @@
-# Desktop release pipeline — triggered by tags like desktop-v0.6.0.
+# Desktop release pipeline — triggered by tags like v0.6.1 (unified single tag).
 # Builds the Wails GUI (EXE) and the NSIS installer, asserts the PE
 # subsystem is windowsgui (no console window), and publishes both to a
-# GitHub Release. Server-side bundles ship from release.yml (tag v*).
+# GitHub Release. Both pipelines upload assets to the same Release.
 name: release-desktop
 
 on:
   push:
-    tags: ['desktop-v*']
+    tags: ['v*']
 
 permissions:
   contents: write
