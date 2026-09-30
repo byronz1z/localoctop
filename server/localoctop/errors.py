@@ -19,6 +19,7 @@ CODE_TIMEOUT = 4005          # operation exceeded request timeout
 
 CODE_NO_BRIDGE = 4101        # no bridge session registered for this user
 CODE_AUTH_FAILED = 4102      # bad or missing token
+CODE_MCP_UNPAIRED = 4103     # v0.6.1: mcp token has no paired bridge token
 
 CODE_DESCRIPTIONS = {
     CODE_INVALID_PARAMS: "invalid params",
@@ -32,6 +33,7 @@ CODE_DESCRIPTIONS = {
     CODE_TIMEOUT: "timeout",
     CODE_NO_BRIDGE: "no bridge connected",
     CODE_AUTH_FAILED: "authentication failed",
+    CODE_MCP_UNPAIRED: "mcp token not paired",
 }
 
 

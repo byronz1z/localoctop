@@ -19,15 +19,19 @@ from localoctop.config import Settings
 from localoctop.sessions import SessionRegistry
 from localoctop.tokens import KIND_BRIDGE, KIND_MCP, TokenStore
 
+__all__ = [
+    "make_token_store", "FakeWebSocket", "make_session", "bridge_pair_id",
+    "settings", "registry", "audit", "collecting_audit",
+]
+
 
 def make_token_store() -> TokenStore:
-    """Two users, each with an mcp_token and a bridge_token. The two kinds
-    are distinct secrets, so cross-direction misuse is testable."""
+    """Two users, each holding one strict pair (v0.6.1): an mcp_token and a
+    bridge_token bound 1:1 via seed_pair. The two kinds remain distinct
+    secrets, so cross-direction misuse is still testable."""
     store = TokenStore()
-    store.seed(KIND_MCP, "alice", "tok-alice")
-    store.seed(KIND_MCP, "bob", "tok-bob")
-    store.seed(KIND_BRIDGE, "alice", "btok-alice")
-    store.seed(KIND_BRIDGE, "bob", "btok-bob")
+    store.seed_pair("alice", "tok-alice", "btok-alice")
+    store.seed_pair("bob", "tok-bob", "btok-bob")
     return store
 
 
@@ -129,7 +133,10 @@ def collecting_audit() -> tuple[AuditLog, list[dict]]:
 
 
 def make_session(user_id: str, ws: FakeWebSocket, client_id: str = "c1",
-                 write_enabled: bool = False) -> Any:
+                 write_enabled: bool = False, pair_id: str = "") -> Any:
+    """Build a BridgeSession. `pair_id` marks the strict pair whose bridge
+    token "registered" this bridge (v0.6.1); MCP-pairing tests pass the
+    pair id the mcp token resolves to."""
     from localoctop.sessions import BridgeSession
 
     return BridgeSession(
@@ -140,4 +147,13 @@ def make_session(user_id: str, ws: FakeWebSocket, client_id: str = "c1",
         allowed_dirs=["/home/test/Documents/Work"],
         write_enabled=write_enabled,
         version="1.0.0",
+        pair_id=pair_id,
     )
+
+
+def bridge_pair_id(store: TokenStore, user_id: str, bridge_token: str) -> str:
+    """The pair id of a user's bridge token — the value a real bridge WS
+    registration records on its session."""
+    pair = store.pair_of(KIND_BRIDGE, bridge_token)
+    assert pair, f"{bridge_token} must belong to a pair"
+    return pair["pair_id"]

@@ -48,6 +48,9 @@ logger = logging.getLogger("localoctop.mcp")
 
 # Scope key under which the authenticated user id travels to the SDK handlers.
 SCOPE_USER_KEY = "localoctop_user"
+# v0.6.1: scope key for the strict pair id the mcp token belongs to —
+# tools/call routes ONLY to the bridge session registered with this pair.
+SCOPE_PAIR_KEY = "localoctop_pair"
 
 SERVER_INSTRUCTIONS = (
     "Access to the user's whitelisted local directories via the localoctop "
@@ -167,6 +170,13 @@ class MCPEndpoint:
             raise MCPError(code=CODE_AUTH_FAILED, message="missing bearer token")
         return user
 
+    @staticmethod
+    def _pair_from_ctx(ctx: Any) -> str:
+        """Recover the authenticated pair id inside SDK request handlers
+        (stashed alongside the user id by the ASGI entry)."""
+        request = getattr(ctx, "request", None)
+        return request.scope.get(SCOPE_PAIR_KEY) if request is not None else ""
+
     # ------------------------------------------------------------ ASGI entry
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":  # pragma: no cover - mounted on http only
@@ -175,8 +185,10 @@ class MCPEndpoint:
         token = self._bearer_from_scope(scope)
         try:
             # MCP direction only: a bridge_token (client WSS) never passes
-            # the connector Bearer check.
-            user_id = self.settings.authenticate_mcp(token)
+            # the connector Bearer check. v0.6.1: the token also resolves to
+            # its strict pair — unpaired mcp tokens are rejected here with
+            # CODE_MCP_UNPAIRED (they have no routing target).
+            user_id, pair_id = self.settings.pair_route_mcp(token)
         except BridgeProtocolError as exc:
             # Same wire shape as before the SDK swap: JSON-RPC error body with
             # our domain code, HTTP 401.
@@ -192,6 +204,7 @@ class MCPEndpoint:
         # the session manager binds each new session to this credential so a
         # session can never be used with a different token.
         scope[SCOPE_USER_KEY] = user_id
+        scope[SCOPE_PAIR_KEY] = pair_id
         scope["user"] = AuthenticatedUser(
             AccessToken(token=token or "", client_id=f"localoctop:{user_id}", scopes=[])
         )
@@ -218,9 +231,10 @@ class MCPEndpoint:
 
     async def _on_call_tool(self, ctx: Any, params: Any) -> mcp_types.CallToolResult:
         user_id = self._user_from_ctx(ctx)
+        pair_id = self._pair_from_ctx(ctx)
         arguments = params.arguments if isinstance(params.arguments, dict) else {}
         try:
-            result = await self.tools.call_tool(user_id, params.name, arguments)
+            result = await self.tools.call_tool(user_id, pair_id, params.name, arguments)
         except BridgeProtocolError as exc:
             # Routing/protocol failures ride in the JSON-RPC error object with
             # our domain codes (the connector probe parses them). Tool-level

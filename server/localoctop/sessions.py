@@ -5,6 +5,13 @@ this registry is what lets the MCP endpoint route a tools/call to the right
 employee machine. Invariant enforced here: **a user can only ever reach their
 own registered session** — sessions are keyed strictly by authenticated
 user_id, never by anything the caller supplies.
+
+v0.6.1 配对模型 ([用户裁定]): each session additionally records the **pair
+id** its bridge token belongs to. This is NOT device binding — it is just
+"which pair's bridge token registered this bridge". MCP tools/calls route by
+pair: a call authenticated with an mcp token is served only by the session
+whose pair_id matches (require_paired); there is no user-name fallback, so a
+paired bridge being offline is an explicit error, never a cross-pair detour.
 """
 
 from __future__ import annotations
@@ -32,6 +39,10 @@ class BridgeSession:
     allowed_dirs: list[str] = field(default_factory=list)
     write_enabled: bool = False
     version: str = ""
+    # v0.6.1: the strict pair whose bridge token authenticated this
+    # registration. "" for an unpaired bridge token (such a session is never
+    # an MCP routing target). MCP routing matches user AND pair.
+    pair_id: str = ""
     connected_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
 
@@ -61,6 +72,7 @@ class BridgeSession:
             "allowed_dirs": list(self.allowed_dirs),
             "write_enabled": self.write_enabled,
             "version": self.version,
+            "pair_id": self.pair_id or None,
             "connected_at": self.connected_at,
             "last_seen": self.last_seen,
             "pending": len(self._pending),
@@ -92,9 +104,10 @@ class SessionRegistry:
                 with contextlib.suppress(Exception):
                     await old.websocket.close(code=4000, reason="replaced by reconnect")
             self._sessions[session.user_id] = session
-            logger.info("bridge registered: user=%s client_id=%s host=%s dirs=%s write=%s",
+            logger.info("bridge registered: user=%s client_id=%s host=%s dirs=%s write=%s pair=%s",
                         session.user_id, session.client_id, session.hostname,
-                        session.allowed_dirs, session.write_enabled)
+                        session.allowed_dirs, session.write_enabled,
+                        session.pair_id or "(unpaired)")
 
     async def unregister(self, user_id: str, session: BridgeSession) -> None:
         """Remove a session, but only if it is still the registered one
@@ -118,6 +131,28 @@ class SessionRegistry:
             )
         return sess
 
+    def require_paired(self, user_id: str, pair_id: str) -> BridgeSession:
+        """v0.6.1: the routing resolution for MCP tools/calls.
+
+        The session must match BOTH the authenticated user and the strict
+        pair of the mcp token. The two failure shapes are distinct and both
+        are explicit — there is never a fallback to another pair's bridge:
+          * a session exists but belongs to a different pair → the paired
+            bridge is offline from this token's point of view
+            ("pair-bridge-offline: the paired bridge is not online");
+          * no session at all → the same pair-offline message (the session
+            registry cannot tell whether the paired machine is merely
+            disconnected).
+        """
+        sess = self._sessions.get(user_id)
+        if sess is None or sess.pair_id != pair_id:
+            raise BridgeProtocolError(
+                CODE_NO_BRIDGE,
+                "pair-bridge-offline: the bridge paired with this token is not online; "
+                "start the local bridge client on the paired machine",
+            )
+        return sess
+
     def snapshot(self) -> list[dict[str, Any]]:
         return [s.info() for s in self._sessions.values()]
 
@@ -135,6 +170,51 @@ class SessionRegistry:
         `result` payload on success.
         """
         sess = self.require(user_id)
+        timeout = timeout or self.request_timeout
+        req_id = sess.next_id()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        sess._pending[req_id] = fut
+
+        envelope = {"id": req_id, "method": method, "params": params or {}}
+        try:
+            await sess.websocket.send_json(envelope)
+        except Exception as exc:  # transport dead
+            sess._pending.pop(req_id, None)
+            raise BridgeProtocolError(CODE_NO_BRIDGE, f"bridge transport failed: {exc}") from exc
+
+        try:
+            reply = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise BridgeProtocolError(
+                CODE_TIMEOUT, f"bridge did not answer {method} within {timeout:.0f}s"
+            ) from exc
+        finally:
+            sess._pending.pop(req_id, None)
+
+        sess.touch()
+        if isinstance(reply, dict) and reply.get("error"):
+            err = reply["error"]
+            code = err.get("code", -32000)
+            msg = err.get("message", "bridge error")
+            raise BridgeProtocolError(int(code), str(msg))
+        if isinstance(reply, dict):
+            return reply.get("result")
+        return reply
+
+    async def call_paired(
+        self,
+        user_id: str,
+        pair_id: str,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """v0.6.1: like `call` but resolved through the strict pair — the
+        request goes only to the session registered by this pair's bridge
+        token (require_paired), never to some other online bridge of the
+        same user name."""
+        sess = self.require_paired(user_id, pair_id)
         timeout = timeout or self.request_timeout
         req_id = sess.next_id()
         loop = asyncio.get_running_loop()

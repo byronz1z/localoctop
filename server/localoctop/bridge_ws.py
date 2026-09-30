@@ -57,8 +57,12 @@ class BridgeWSEndpoint:
         token = self.extract_token(ws)
         try:
             # Bridge direction only: an mcp_token (Octop connector Bearer)
-            # never passes the client WSS auth.
-            user_id = self.settings.authenticate_bridge(token)
+            # never passes the client WSS auth. v0.6.1: also resolve the
+            # strict pair this bridge token belongs to — the session records
+            # it so MCP calls route by pair, not by user name. This is NOT
+            # device binding: it just says "this bridge was registered by
+            # that pair's bridge token".
+            user_id, pair_id = self.settings.pair_route_bridge(token)
         except BridgeProtocolError as exc:
             logger.warning("ws auth failed from %s: %s", ws.client, exc.message)
             # Reject before completing the handshake when possible.
@@ -69,6 +73,7 @@ class BridgeWSEndpoint:
         session: BridgeSession | None = None
         try:
             session = await self._await_register(ws, user_id)
+            session.pair_id = pair_id
             await self.registry.register(session)
             await self._read_loop(ws, session)
         except WebSocketDisconnect as exc:

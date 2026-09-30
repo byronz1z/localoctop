@@ -129,7 +129,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not authorized:
             err = BridgeProtocolError(CODE_AUTH_FAILED, "admin access denied")
             return JSONResponse({"error": err.to_dict()}, status_code=403)
-        return JSONResponse({"sessions": registry.snapshot()})
+        return JSONResponse({"sessions": registry.snapshot(), "pairs": settings.token_store.list_pairs()})
 
     # ---- token management (任务书 v1.1 §七: split mcp/bridge tokens) ----
 
@@ -143,9 +143,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/admin/tokens/issue")
     async def admin_issue_token(request: Request) -> JSONResponse:
-        """Mint one token. Body: {"user_id": str, "kind": "mcp"|"bridge"}.
-        The plaintext is returned exactly once; only its SHA-256 hash is kept."""
-        from .tokens import KIND_BRIDGE, KIND_MCP
+        """Mint one token. Body: {"user_id": str, "kind": "mcp"|"bridge"|"pair"}.
+        The plaintext is returned exactly once; only its SHA-256 hash is kept.
+        v0.6.1: kind="pair" mints one strict pair (mcp + bridge bound 1:1) —
+        the normal issuance mode; bare mcp/bridge remain for compatibility
+        but produce UNPAIRED tokens that cannot route ([用户裁定] 成对签发)."""
+        from .tokens import KIND_BRIDGE, KIND_MCP, KIND_PAIR
 
         if not await _admin_guard(request):
             err = BridgeProtocolError(CODE_AUTH_FAILED, "admin access denied")
@@ -158,9 +161,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         kind = str(body.get("kind", "")).strip().lower()
         if not user_id:
             return JSONResponse({"error": {"code": -32602, "message": "user_id is required"}}, status_code=400)
-        if kind not in (KIND_MCP, KIND_BRIDGE):
+        if kind not in (KIND_MCP, KIND_BRIDGE, KIND_PAIR):
             return JSONResponse(
-                {"error": {"code": -32602, "message": "kind must be 'mcp' or 'bridge'"}}, status_code=400)
+                {"error": {"code": -32602, "message": "kind must be 'mcp', 'bridge' or 'pair'"}}, status_code=400)
+        if kind == KIND_PAIR:
+            mcp_token, bridge_token = settings.token_store.issue_pair(user_id)
+            return JSONResponse({
+                "user_id": user_id,
+                "kind": KIND_PAIR,
+                # shown once; only the SHA-256 hashes are stored
+                "mcp_token": mcp_token,
+                "bridge_token": bridge_token,
+            })
         token = settings.token_store.issue(kind, user_id)
         return JSONResponse({
             "user_id": user_id,
@@ -171,7 +183,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/admin/tokens/revoke")
     async def admin_revoke_tokens(request: Request) -> JSONResponse:
         """Revoke tokens. Body: {"user_id": str, "kind": "mcp"|"bridge"} —
-        each direction is revoked independently."""
+        each direction is revoked independently; or {"pair_id": str} to
+        revoke one strict pair on both sides at once (v0.6.1 成对吊销)."""
         from .tokens import KIND_BRIDGE, KIND_MCP
 
         if not await _admin_guard(request):
@@ -181,18 +194,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": {"code": -32602, "message": "invalid JSON body"}}, status_code=400)
+        pair_id = str(body.get("pair_id", "")).strip()
+        if pair_id:
+            revoked = settings.token_store.revoke_pair(pair_id)
+            return JSONResponse({"pair_id": pair_id, "revoked": revoked})
         user_id = str(body.get("user_id", "")).strip()
         kind = str(body.get("kind", "")).strip().lower()
         if not user_id or kind not in (KIND_MCP, KIND_BRIDGE):
             return JSONResponse(
-                {"error": {"code": -32602, "message": "user_id and kind ('mcp'|'bridge') are required"}},
+                {"error": {"code": -32602, "message": "user_id and kind ('mcp'|'bridge'), or pair_id, are required"}},
                 status_code=400)
         revoked = settings.token_store.revoke_user(kind, user_id)
         return JSONResponse({"user_id": user_id, "kind": kind, "revoked": revoked})
 
     @app.get("/admin/tokens")
     async def admin_list_tokens(request: Request, user_id: str = "") -> JSONResponse:
-        """List token metadata (kind/hint/created/revoked — never plaintext)."""
+        """List token metadata (kind/hint/created/revoked — never plaintext),
+        plus the v0.6.1 pairing table: which mcp/bridge tokens form a pair
+        (pair_id), whether the pair is complete, and which pair's bridge is
+        currently online (resolved against the live session registry)."""
         from .tokens import KIND_BRIDGE, KIND_MCP
 
         if not await _admin_guard(request):
@@ -203,7 +223,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for rec in settings.token_store.list_user(kind, user_id):
                 if not user_id or rec["user_id"] == user_id:
                     tokens.append(rec)
-        return JSONResponse({"tokens": tokens})
+        online = {s["pair_id"] for s in registry.snapshot() if s.get("pair_id")}
+        pairs = [
+            {**p, "bridge_online": p["pair_id"] in online}
+            for p in settings.token_store.list_pairs()
+            if not user_id or p["user_id"] == user_id
+        ]
+        return JSONResponse({"tokens": tokens, "pairs": pairs})
 
     @app.post("/admin/tokens/reload")
     async def admin_reload_tokens(request: Request) -> JSONResponse:

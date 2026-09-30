@@ -92,9 +92,17 @@ class ToolService:
         self.registry = registry
         self.audit = audit
 
-    async def call_tool(self, user_id: str, name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    async def call_tool(self, user_id: str, pair_id: str, name: str,
+                        arguments: dict[str, Any] | None) -> dict[str, Any]:
         """Run one tools/call. Returns the MCP result object
         ({"content": [...], "isError": bool}).
+
+        v0.6.1: `pair_id` is the strict pair of the authenticated mcp token;
+        routing resolves to the bridge session registered with THAT pair
+        (registry.require_paired / call_paired) — same-name cross-pair
+        fallback does not exist. `pair_id=""` falls back to the legacy
+        user-name resolution; only reachable from non-pairing entry points
+        (kept so hand-built test/ops call paths keep working).
 
         Raises BridgeProtocolError for auth/routing/protocol problems; tool-
         level failures (denied path, missing file, ...) are returned as
@@ -119,7 +127,7 @@ class ToolService:
 
         # Extra gate: even when the server allows writes, the client session
         # must also have registered with write support (both switches matter).
-        session = self.registry.require(user_id)
+        session = self.registry.require_paired(user_id, pair_id) if pair_id else self.registry.require(user_id)
         if name in WRITE_TOOLS and not session.write_enabled:
             await self._audit(user_id, name, req_path, "deny", CODE_NOT_ALLOWED,
                               "client session has writes disabled", started, session.client_id)
@@ -139,7 +147,12 @@ class ToolService:
 
         # --- fan out to the bridge ----------------------------------------
         try:
-            result = await self.registry.call(user_id, name, arguments, timeout=self.settings.bridge_timeout)
+            if pair_id:
+                result = await self.registry.call_paired(
+                    user_id, pair_id, name, arguments, timeout=self.settings.bridge_timeout)
+            else:
+                result = await self.registry.call(
+                    user_id, name, arguments, timeout=self.settings.bridge_timeout)
         except BridgeProtocolError as exc:
             decision = "error" if exc.code == CODE_INTERNAL else "deny"
             await self._audit(user_id, name, req_path, decision, exc.code, exc.message,

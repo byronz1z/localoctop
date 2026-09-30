@@ -17,6 +17,12 @@ Bootstrap (dev / single-tenant) via environment:
     (when unset, LOCALOCTOP_MCP_TOKENS also seeds bridge tokens so existing
     single-token deployments keep working until they rotate)
 
+v0.6.1 严格一对一配对: entries sharing the **same user id** across the two
+env vars form one pair (the .env lines byron.mcp=yyy / byron.bridge=xxx);
+a second user id (byron2) is a second pair for the same human. The
+single-token back-compat mode self-pairs each user. MCP calls route by
+pair, not by user name — see TokenStore.pair_of and Settings.pair_route.
+
 Everything is read once at startup into a Settings dataclass; tests build a
 Settings directly and inject it.
 
@@ -31,8 +37,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .errors import BridgeProtocolError, CODE_AUTH_FAILED
-from .tokens import KIND_BRIDGE, KIND_MCP, TokenStore
+from .errors import BridgeProtocolError, CODE_AUTH_FAILED, CODE_MCP_UNPAIRED
+from .tokens import KIND_BRIDGE, KIND_MCP, TokenStore, new_pair_id
 
 DEFAULT_MAX_READ_BYTES = 20 * 1024 * 1024   # 20 MB
 DEFAULT_MAX_WRITE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -109,6 +115,39 @@ class Settings:
         user_id. An mcp_token never passes here."""
         return self.token_store.authenticate(KIND_BRIDGE, token)
 
+    # --------------------------------------------------- v0.6.1 pair routing
+    def pair_route_mcp(self, token: str | None) -> tuple[str, str]:
+        """Resolve an MCP Bearer token to its strict pair's routing target.
+
+        Returns (user_id, pair_id) — the tools/call must be served ONLY by
+        the bridge session that registered with `pair_id`. Raises:
+          * CODE_AUTH_FAILED  — unknown/revoked token (not an mcp token);
+          * CODE_MCP_UNPAIRED — the token is valid but belongs to no pair
+            (e.g. a runtime-issued single mcp token), so there is no routing
+            target: no fallback to "any online bridge of this user name".
+        """
+        # authenticate first: unknown/wrong-kind tokens are auth failures,
+        # not pairing failures.
+        user_id = self.authenticate_mcp(token)
+        pair = self.token_store.pair_of(KIND_MCP, token) if token else None
+        if not pair or not pair.get(KIND_BRIDGE):
+            raise BridgeProtocolError(
+                CODE_MCP_UNPAIRED,
+                "mcp-token-unpaired: this mcp token has no live paired bridge "
+                "token (unpaired, or the paired bridge token was revoked); "
+                "issue a token pair (kind='pair') instead",
+            )
+        return user_id, pair["pair_id"]
+
+    def pair_route_bridge(self, token: str | None) -> tuple[str, str]:
+        """Resolve a bridge WSS token to (user_id, pair_id) at registration.
+        Unpaired bridge tokens still authenticate (the bridge may dial in
+        for liveness) — pair_id is "" then, and such a session is never a
+        routing target for MCP calls."""
+        user_id = self.authenticate_bridge(token)
+        pair = self.token_store.pair_of(KIND_BRIDGE, token) if token else None
+        return user_id, (pair["pair_id"] if pair else "")
+
     # ------------------------------------------------------- write decisions
     def user_can_write(self, user_id: str) -> bool:
         """Whether write tools are enabled for this user right now."""
@@ -143,18 +182,41 @@ def _env_token_entries(e) -> tuple[dict[str, str], dict[str, str]]:
     return mcp_entries, bridge_entries
 
 
+def _env_pairs(mcp_entries: dict[str, str], bridge_entries: dict[str, str]) -> dict[str, dict[str, str]]:
+    """v0.6.1: map the env entries to strict one-to-one pairs.
+
+    The .env two-line form byron.mcp=yyy / byron.bridge=xxx arrives here as
+    mcp_entries["byron"] / bridge_entries["byron"] — same user id, so they
+    are one pair. A second machine (byron2) is simply another user id, i.e.
+    another pair; a user present in only one var has that side unpaired
+    (the pair entry keeps only the side that exists)."""
+    pairs: dict[str, dict[str, str]] = {}
+    for user_id in set(mcp_entries) | set(bridge_entries):
+        pair_id = new_pair_id()
+        pairs[user_id] = {
+            "pair_id": pair_id,
+            "mcp": mcp_entries.get(user_id, ""),
+            "bridge": bridge_entries.get(user_id, ""),
+        }
+    return pairs
+
+
+def _seed_pairs(store: TokenStore, pairs: dict[str, dict[str, str]]) -> None:
+    """Seed the env-derived pairs into the store (startup path)."""
+    for user_id, p in pairs.items():
+        store.seed_pair(user_id, p["mcp"], p["bridge"], pair_id=p["pair_id"])
+
+
 def load_settings(env: os._Environ | dict | None = None) -> Settings:
     """Build Settings from the environment (or an injected mapping for tests)."""
     e = env if env is not None else os.environ
 
     static = _parse_token_pairs(e.get("LOCALOCTOP_MCP_TOKENS", ""))
     mcp_entries, bridge_entries = _env_token_entries(e)
+    pairs = _env_pairs(mcp_entries, bridge_entries)
 
     store = TokenStore()
-    for user_id, tok in mcp_entries.items():
-        store.seed(KIND_MCP, user_id, tok)
-    for user_id, tok in bridge_entries.items():
-        store.seed(KIND_BRIDGE, user_id, tok)
+    _seed_pairs(store, pairs)
 
     write_allow: set[str] = set()
     for u in e.get("LOCALOCTOP_WRITE_ALLOWLIST", "").split(","):
@@ -200,9 +262,13 @@ def reload_tokens_from_env(settings: Settings, env: os._Environ | dict | None = 
     """
     e = env if env is not None else os.environ
     mcp_entries, bridge_entries = _env_token_entries(e)
+    # v0.6.1: the same pairing rule as startup — same user id across the two
+    # vars is one pair; reload reconciles the pairing table along with the
+    # token tables (runtime-issued pairs for users absent from env survive).
+    pairs = _env_pairs(mcp_entries, bridge_entries)
     result = {
-        "mcp": settings.token_store.apply_env(KIND_MCP, mcp_entries),
-        "bridge": settings.token_store.apply_env(KIND_BRIDGE, bridge_entries),
+        "mcp": settings.token_store.apply_env(KIND_MCP, mcp_entries, pairs),
+        "bridge": settings.token_store.apply_env(KIND_BRIDGE, bridge_entries, pairs),
     }
     if logger is not None:
         for kind in ("mcp", "bridge"):

@@ -23,7 +23,7 @@ from localoctop.errors import (
     CODE_NO_BRIDGE,
 )
 
-from conftest import FakeWebSocket, make_session, make_token_store
+from conftest import FakeWebSocket, bridge_pair_id, make_session, make_token_store
 
 INIT_PARAMS = {
     "protocolVersion": "2024-11-05",
@@ -58,6 +58,12 @@ async def _mk(settings: Settings):
 
 def _auth(token: str) -> dict:
     return {**JSON_HEADERS, "Authorization": f"Bearer {token}"}
+
+
+def _pair(app, user: str) -> str:
+    """The pair id of `user`'s tokens — what a real bridge WS registration
+    records on its session (v0.6.1 pairing model)."""
+    return bridge_pair_id(app.state.settings.token_store, user, f"btok-{user}")
 
 
 async def _handshake(client: httpx.AsyncClient, token: str) -> dict:
@@ -242,7 +248,7 @@ async def test_tools_call_routes_to_bridge_and_renders_text():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    session = make_session("alice", ws)
+    session = make_session("alice", ws, pair_id=_pair(app, "alice"))
     await registry.register(session)
 
     async def bridge_responder():
@@ -283,7 +289,7 @@ async def test_tools_call_client_denial_becomes_isError():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):
@@ -316,7 +322,11 @@ async def test_user_isolation_bob_cannot_reach_alice_bridge():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, client_id="alice-c1"))
+    # alice's session is registered with HER pair id — the strongest form of
+    # the invariant: even a paired, online bridge of alice must not serve
+    # bob, because bob's mcp token routes to bob's pair only.
+    await registry.register(make_session("alice", ws, client_id="alice-c1",
+                                         pair_id=_pair(app, "alice")))
 
     async with client:
         headers = await _handshake(client, "tok-bob")
@@ -335,7 +345,7 @@ async def test_write_tool_denied_while_disabled():
     client, app = await _mk(_settings(allow_write=False))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
     async with client:
         headers = await _handshake(client, "tok-alice")
         r = await client.post("/mcp/localoctop/", headers=headers, json={
@@ -354,7 +364,7 @@ async def test_write_tool_gated_by_client_session_flag():
     client, app = await _mk(_settings(allow_write=True))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, write_enabled=False))
+    await registry.register(make_session("alice", ws, write_enabled=False, pair_id=_pair(app, "alice")))
     async with client:
         headers = await _handshake(client, "tok-alice")
         r = await client.post("/mcp/localoctop/", headers=headers, json={
@@ -372,7 +382,7 @@ async def test_admin_killswitch_disables_everything():
     client, app = await _mk(_settings(disabled=True))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
     async with client:
         headers = await _handshake(client, "tok-alice")
         r = await client.post("/mcp/localoctop/", headers=headers, json={
@@ -454,7 +464,7 @@ async def test_binary_read_rendered_as_resource_blob():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):
@@ -486,7 +496,7 @@ async def test_bridge_timeout_surfaces_as_error_result():
     client, app = await _mk(_settings(bridge_timeout=0.2))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
     async with client:
         headers = await _handshake(client, "tok-alice")
         r = await client.post("/mcp/localoctop/", headers=headers, json={
@@ -516,7 +526,7 @@ async def test_read_media_file_rendered_as_typed_resource():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):
@@ -545,7 +555,7 @@ async def test_zip_files_rendered_as_zip_resource():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):
@@ -574,7 +584,7 @@ async def test_read_multiple_files_mixed_success_and_failure():
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws))
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):
@@ -606,7 +616,7 @@ async def test_edit_file_rendered_with_diff():
     client, app = await _mk(_settings(allow_write=True))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, write_enabled=True))
+    await registry.register(make_session("alice", ws, write_enabled=True, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):
@@ -639,7 +649,7 @@ async def test_delete_file_refused_when_client_write_off():
     client, app = await _mk(_settings(allow_write=True))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, write_enabled=False))
+    await registry.register(make_session("alice", ws, write_enabled=False, pair_id=_pair(app, "alice")))
     async with client:
         headers = await _handshake(client, "tok-alice")
         body = await _call_tool(client, headers, 24, "delete_file", {"path": "x.txt"})
@@ -653,7 +663,7 @@ async def test_unzip_file_routes_when_writes_on():
     client, app = await _mk(_settings(allow_write=True))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, write_enabled=True))
+    await registry.register(make_session("alice", ws, write_enabled=True, pair_id=_pair(app, "alice")))
 
     async def responder():
         for _ in range(50):

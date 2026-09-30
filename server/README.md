@@ -77,10 +77,15 @@ python -m localoctop.main
 # → http://127.0.0.1:8080/healthz
 ```
 
-> 只设 `LOCALOCTOP_MCP_TOKENS` 时两个方向共用同一组令牌（单令牌兼容模式），
-> 生产建议分开签发、独立轮换。运行时签发：`POST /admin/tokens/issue`
-> （body `{"user_id": "...", "kind": "mcp"|"bridge"}`，仅回环或
-> `LOCALOCTOP_ADMIN_TOKEN` 可调）。
+> **v0.6.1 严格一对一配对（[用户裁定]）**：两个环境变量里**同名**的条目互为一对
+> （`byron` 的 mcp 令牌 ↔ `byron` 的 bridge 令牌）；第二台机器用第二个用户名
+> （如 `byron2`）即第二对。MCP 工具调用**只路由到配对桥令牌注册的那台桥**；
+> 配对桥不在线时报 `pair-bridge-offline` 明确错误，绝不按用户名兜底。只设
+> `LOCALOCTOP_MCP_TOKENS` 时单令牌自成一对（兼容模式）。运行时签发：
+> `POST /admin/tokens/issue`（body `{"user_id": "...", "kind": "pair"}` 成对
+> 签发并互绑；单独签发的 mcp 令牌不配对、无法路由）；成对吊销：
+> `POST /admin/tokens/revoke`（body `{"pair_id": "..."}`）。仅回环或
+> `LOCALOCTOP_ADMIN_TOKEN` 可调。
 
 ### 验证 MCP 握手
 
@@ -146,7 +151,7 @@ compose。放在反向代理（Caddy/Nginx/Traefik）之后，对外提供
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LOCALOCTOP_MCP_TOKENS` | 空 | mcp 令牌（Octop 连接器 Bearer）`user:token,...` |
-| `LOCALOCTOP_CLIENT_TOKENS` | 空 | bridge 令牌（客户端拨入）`user:token,...`；未设时沿用 `LOCALOCTOP_MCP_TOKENS`（兼容模式） |
+| `LOCALOCTOP_CLIENT_TOKENS` | 空 | bridge 令牌（客户端拨入）`user:token,...`；**与 MCP 侧同名的条目互为配对**（v0.6.1）；未设时沿用 `LOCALOCTOP_MCP_TOKENS`（兼容模式，单令牌自成一对） |
 | `LOCALOCTOP_ALLOW_WRITE` | `false` | 写工具全局开关（默认关） |
 | `LOCALOCTOP_WRITE_ALLOWLIST` | 空 | 逗号分隔用户白名单：即使全局关也允许其写（灰度用） |
 | `LOCALOCTOP_DISABLED` | `false` | 管理员一键停用（所有 tools/call 拒绝） |
