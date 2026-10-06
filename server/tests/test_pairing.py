@@ -357,6 +357,32 @@ def test_env_reload_preserves_pairing():
     assert s.pair_route_bridge(b)[0] == "dave"
 
 
+def test_env_reload_pair_id_stable_when_tokens_unchanged():
+    """v0.6.1 hotfix 回归：令牌不变时，热加载轮询重复 reload 不得漂移 pair_id。
+
+    生产事故（2026-10-06）：_env_pairs 每次 reload 都 new_pair_id()，30s 轮询
+    令牌表 pair_id 漂移 → 已注册桥会话的 pair 立即过期 → 所有 MCP 调用
+    pair-bridge-offline。修复后 pair_id 由令牌内容确定性派生。"""
+    env = {"LOCALOCTOP_MCP_TOKENS": "byron:tok-byron",
+           "LOCALOCTOP_CLIENT_TOKENS": "byron:btok-byron"}
+    s = load_settings(env)
+    _, pair0 = s.pair_route_mcp("tok-byron")
+
+    for _ in range(3):  # 模拟热加载轮询多次（tokens 不变）
+        reload_tokens_from_env(s, env)
+        _, pair = s.pair_route_mcp("tok-byron")
+        assert pair == pair0
+        # 桥侧同一对也不变（会话注册的 pair_id 继续有效）
+        assert s.pair_route_bridge("btok-byron") == ("byron", pair0)
+
+    # 换令牌仍必须换 pair（旋转语义不受确定性派生影响）
+    env2 = dict(env, LOCALOCTOP_MCP_TOKENS="byron:tok-byron-v2",
+                LOCALOCTOP_CLIENT_TOKENS="byron:btok-byron-v2")
+    reload_tokens_from_env(s, env2)
+    _, pair_new = s.pair_route_mcp("tok-byron-v2")
+    assert pair_new != pair0
+
+
 # ------------------------------------------------------------- 桥注册记录配对
 
 @pytest.mark.asyncio

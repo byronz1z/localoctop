@@ -34,11 +34,12 @@ store; runtime-issued tokens for users absent from the env are preserved.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 
 from .errors import BridgeProtocolError, CODE_AUTH_FAILED, CODE_MCP_UNPAIRED
-from .tokens import KIND_BRIDGE, KIND_MCP, TokenStore, new_pair_id
+from .tokens import KIND_BRIDGE, KIND_MCP, TokenStore
 
 DEFAULT_MAX_READ_BYTES = 20 * 1024 * 1024   # 20 MB
 DEFAULT_MAX_WRITE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -192,7 +193,19 @@ def _env_pairs(mcp_entries: dict[str, str], bridge_entries: dict[str, str]) -> d
     (the pair entry keeps only the side that exists)."""
     pairs: dict[str, dict[str, str]] = {}
     for user_id in set(mcp_entries) | set(bridge_entries):
-        pair_id = new_pair_id()
+        # v0.6.1 hotfix: the pair_id MUST be deterministic in the token
+        # contents. The hot-reload poller calls this every interval; a random
+        # id here would churn every reload and instantly orphan every live
+        # bridge session (its registration carried the previous pair_id) —
+        # every MCP call would fail with pair-bridge-offline. Deriving the
+        # id from user+tokens means: same tokens → same pair_id across
+        # reloads/restarts; rotating a token → a new pair (intended).
+        material = "\x00".join((
+            user_id,
+            mcp_entries.get(user_id, ""),
+            bridge_entries.get(user_id, ""),
+        ))
+        pair_id = "pair-" + hashlib.sha256(material.encode()).hexdigest()[:16]
         pairs[user_id] = {
             "pair_id": pair_id,
             "mcp": mcp_entries.get(user_id, ""),
