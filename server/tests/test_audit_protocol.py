@@ -100,7 +100,10 @@ def test_tools_list_readonly_contract():
     tools = tools_list(write_enabled=False)
     names = [t["name"] for t in tools]
     assert names == list(READ_ONLY_TOOLS)
-    assert len(tools) == 10
+    # 9 read-only tools: the whole-file readers (read_media_file,
+    # read_multiple_files, zip_files) are retired from the catalog — a file
+    # must never ride inside a tool result (experiment branch).
+    assert len(tools) == 9
     for t in tools:
         assert t["inputSchema"]["type"] == "object"
         assert "properties" in t["inputSchema"]

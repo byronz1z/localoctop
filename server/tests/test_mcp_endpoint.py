@@ -18,6 +18,7 @@ import pytest
 from localoctop.app import create_app
 from localoctop.config import Settings
 from localoctop.errors import (
+    CODE_INVALID_PARAMS,
     CODE_METHOD_NOT_FOUND,
     CODE_NOT_ALLOWED,
     CODE_NO_BRIDGE,
@@ -133,10 +134,13 @@ async def test_tools_list_returns_readonly_tools():
         assert r.status_code == 200
         tools = r.json()["result"]["tools"]
         names = sorted(t["name"] for t in tools)
+        # 9 read-only tools (experiment branch): read_media_file /
+        # read_multiple_files / zip_files are retired — file content never
+        # travels inside a tool result; fetch_to_cloud moves it out of band.
         assert names == sorted([
             "get_file_info", "list_allowed_directories", "list_directory",
             "list_directory_with_sizes", "directory_tree", "read_file",
-            "read_media_file", "read_multiple_files", "search_files", "zip_files",
+            "search_files", "fetch_to_cloud", "transfer_status",
         ])
         for t in tools:
             assert "inputSchema" in t and t["inputSchema"]["type"] == "object"
@@ -154,7 +158,7 @@ async def test_tools_list_includes_write_when_enabled():
         })
         names = {t["name"] for t in r.json()["result"]["tools"]}
         assert {"write_file", "create_directory", "edit_file", "move_file",
-                "delete_file", "remove_directory", "unzip_file"} <= names
+                "delete_file", "remove_directory", "unzip_file", "deliver_to_local"} <= names
         assert len(names) == 17
 
 
@@ -238,8 +242,12 @@ async def test_tools_call_no_bridge_connected():
             "params": {"name": "read_file", "arguments": {"path": "a.txt"}},
         })
         assert r.status_code == 200
-        err = r.json()["error"]
-        assert err["code"] == CODE_NO_BRIDGE
+        body = r.json()
+        # Offline machine: a readable isError tool result, not a protocol
+        # error (the model should tell the user, not crash the call).
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "not connected" in body["result"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -258,11 +266,13 @@ async def test_tools_call_routes_to_bridge_and_renders_text():
                 break
             await asyncio.sleep(0.02)
         req = ws.outbox[0]
-        assert req["method"] == "read_file"
+        # read_file is served by the bridge's bounded line reader (read_text).
+        assert req["method"] == "read_text"
         assert req["params"] == {"path": "hello.txt"}
         registry.deliver("alice", req["id"], {"id": req["id"], "result": {
-            "path": "hello.txt", "text": "hi there\n", "encoding": "utf-8",
-            "size": 9, "truncated": False,
+            "path": "hello.txt", "text": "hi there\n", "size": 9,
+            "start_line": 1, "end_line": 1, "total_lines": 1, "eof": True,
+            "clipped_lines": 0,
         }})
 
     async with client:
@@ -335,8 +345,11 @@ async def test_user_isolation_bob_cannot_reach_alice_bridge():
             "params": {"name": "read_file", "arguments": {"path": "secret.txt"}},
         })
         body = r.json()
-        # bob has no bridge -> CODE_NO_BRIDGE, and nothing was sent to alice.
-        assert body["error"]["code"] == CODE_NO_BRIDGE
+        # bob has no bridge -> readable isError (offline machine), and nothing
+        # was sent to alice's socket.
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "not connected" in body["result"]["content"][0]["text"]
         assert ws.outbox == []
 
 
@@ -460,7 +473,10 @@ async def test_get_sse_stream_requires_session():
 
 
 @pytest.mark.asyncio
-async def test_binary_read_rendered_as_resource_blob():
+async def test_binary_read_refused_with_fetch_hint():
+    """Binary content must never enter a tool result (experiment branch):
+    the bridge's read_text refuses binary files, and the adapter relays that
+    refusal as an isError result pointing at fetch_to_cloud."""
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
@@ -472,9 +488,11 @@ async def test_binary_read_rendered_as_resource_blob():
                 break
             await asyncio.sleep(0.02)
         req = ws.outbox[0]
-        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
-            "path": "img.png", "base64": "aGk=", "encoding": "base64",
-            "size": 2, "truncated": False,
+        assert req["method"] == "read_text"
+        registry.deliver("alice", req["id"], {"id": req["id"], "error": {
+            "code": CODE_INVALID_PARAMS,
+            "message": "img.png is a binary file (2 bytes) and cannot be read as text; "
+                       "use fetch_to_cloud to send it to the cloud workspace and process it there",
         }})
 
     async with client:
@@ -485,10 +503,10 @@ async def test_binary_read_rendered_as_resource_blob():
             "params": {"name": "read_file", "arguments": {"path": "img.png"}},
         })
         await task
-        content = r.json()["result"]["content"][0]
-        assert content["type"] == "resource"
-        assert content["resource"]["blob"] == "aGk="
-        assert content["resource"]["mimeType"] == "application/octet-stream"
+        body = r.json()
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "fetch_to_cloud" in body["result"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -522,93 +540,22 @@ async def _call_tool(client, headers, req_id, name, arguments):
 
 
 @pytest.mark.asyncio
-async def test_read_media_file_rendered_as_typed_resource():
-    client, app = await _mk(_settings())
+@pytest.mark.parametrize("retired", ["read_media_file", "zip_files", "read_multiple_files"])
+async def test_retired_whole_file_tools_not_advertised(retired):
+    """read_media_file / zip_files / read_multiple_files returned whole files
+    inside tool results — straight into the model context. They are retired
+    from the advertised catalog (experiment branch); calling one is an
+    unknown-tool protocol error and nothing reaches the bridge."""
+    client, app = await _mk(_settings(allow_write=True))
     registry = app.state.registry
     ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
-
-    async def responder():
-        for _ in range(50):
-            if ws.outbox:
-                break
-            await asyncio.sleep(0.02)
-        req = ws.outbox[0]
-        assert req["method"] == "read_media_file"
-        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
-            "path": "photo.jpg", "base64": "aGk=", "mime": "image/jpeg", "size": 2,
-        }})
-
+    await registry.register(make_session("alice", ws, write_enabled=True,
+                                         pair_id=_pair(app, "alice")))
     async with client:
         headers = await _handshake(client, "tok-alice")
-        task = asyncio.create_task(responder())
-        body = await _call_tool(client, headers, 20, "read_media_file", {"path": "photo.jpg"})
-        await task
-        blocks = body["result"]["content"]
-        res = next(b for b in blocks if b["type"] == "resource")
-        assert res["resource"]["mimeType"] == "image/jpeg"
-        assert res["resource"]["blob"] == "aGk="
-
-
-@pytest.mark.asyncio
-async def test_zip_files_rendered_as_zip_resource():
-    client, app = await _mk(_settings())
-    registry = app.state.registry
-    ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
-
-    async def responder():
-        for _ in range(50):
-            if ws.outbox:
-                break
-            await asyncio.sleep(0.02)
-        req = ws.outbox[0]
-        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
-            "archive": "docs", "base64": "UEsDBA==", "size": 123, "entries": 2, "skipped": 1,
-        }})
-
-    async with client:
-        headers = await _handshake(client, "tok-alice")
-        task = asyncio.create_task(responder())
-        body = await _call_tool(client, headers, 21, "zip_files", {"paths": ["docs"]})
-        await task
-        blocks = body["result"]["content"]
-        res = next(b for b in blocks if b["type"] == "resource")
-        assert res["resource"]["mimeType"] == "application/zip"
-        note = next(b for b in blocks if b["type"] == "text")
-        assert "2 entries" in note["text"] and "1 skipped" in note["text"]
-
-
-@pytest.mark.asyncio
-async def test_read_multiple_files_mixed_success_and_failure():
-    client, app = await _mk(_settings())
-    registry = app.state.registry
-    ws = FakeWebSocket()
-    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
-
-    async def responder():
-        for _ in range(50):
-            if ws.outbox:
-                break
-            await asyncio.sleep(0.02)
-        req = ws.outbox[0]
-        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
-            "files": [
-                {"path": "ok.txt", "text": "contents here", "encoding": "utf-8"},
-                {"path": "missing.txt", "error": "not found"},
-            ],
-            "failed": 1, "truncated": False,
-        }})
-
-    async with client:
-        headers = await _handshake(client, "tok-alice")
-        task = asyncio.create_task(responder())
-        body = await _call_tool(client, headers, 22, "read_multiple_files", {"paths": ["ok.txt", "missing.txt"]})
-        await task
-        texts = [b["text"] for b in body["result"]["content"] if b["type"] == "text"]
-        assert any("contents here" in t for t in texts)
-        assert any("ERROR" in t for t in texts)
-        assert any("1 file(s) failed" in t for t in texts)
+        body = await _call_tool(client, headers, 20, retired, {"path": "x", "paths": ["x"]})
+        assert body["error"]["code"] == CODE_METHOD_NOT_FOUND
+        assert ws.outbox == []
 
 
 @pytest.mark.asyncio

@@ -16,9 +16,17 @@ Both directions are verified with SHA-256 before the file is put in place
 (written to a temporary name first, then renamed), so a half-transferred
 file is never visible under its real name.
 
-Landing layout:  {LOCALOCTOP_LANDING_DIR}/{user_id}/{path relative to the
-user's whitelist root}. The same local file always lands at the same cloud
-path, which makes "is the cloud copy still current?" a cheap size+mtime check.
+Landing layout (Octop per-user folder model): every user has exactly one
+folder on the cloud machine, {LOCALOCTOP_USERS_DIR}/<user_id>/, and that
+user's agent sees that folder as "/". The user_id of the token IS the folder
+name, verbatim (Chinese names included). Uploads land at
+
+    {LOCALOCTOP_USERS_DIR}/<user_id>/{LOCALOCTOP_LANDING_SUBDIR}/<rel>
+
+and the agent sees them as "/{LOCALOCTOP_LANDING_SUBDIR}/<rel>". Downloads
+can only read paths inside the user's own folder — the folder of the token
+owner, nobody else's. The user folder must already exist (it belongs to the
+Octop platform); this module never creates it.
 """
 
 from __future__ import annotations
@@ -62,7 +70,38 @@ STALL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_STALL_SECONDS", 420))
 # Finished transfer records are kept this long for transfer_status lookups.
 RECORD_TTL_SECONDS = 3600.0
 
-_SAFE_USER = re.compile(r"[^A-Za-z0-9._-]")
+# A user name (== the token's user_id == the Octop folder name) must not
+# contain anything that could break the one-folder-per-user confinement.
+_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _check_user_name(user_id: str) -> str:
+    """Validate that user_id is safe to use as a folder name, verbatim.
+
+    Allowed: any non-blank name without path separators, control characters,
+    or "." / ".." — Chinese names such as '马威' are fine and kept as-is.
+    """
+    if not user_id or not user_id.strip():
+        raise BridgeProtocolError(
+            CODE_INVALID_PARAMS,
+            "the token's user name is empty or all whitespace; it cannot be used "
+            "as a folder name on the cloud machine")
+    if user_id in (".", ".."):
+        raise BridgeProtocolError(
+            CODE_INVALID_PARAMS,
+            f"the token's user name {user_id!r} is not a valid folder name "
+            "(it would escape the per-user folder)")
+    if "/" in user_id or "\\" in user_id:
+        raise BridgeProtocolError(
+            CODE_INVALID_PARAMS,
+            f"the token's user name {user_id!r} contains a path separator; "
+            "a user name must be a single folder name")
+    if _CTRL.search(user_id):
+        raise BridgeProtocolError(
+            CODE_INVALID_PARAMS,
+            f"the token's user name {user_id!r} contains control characters; "
+            "a user name must be plain text")
+    return user_id
 
 
 @dataclass
@@ -108,18 +147,12 @@ class TransferManager:
         self.registry = registry
         self.url_base = url_base.rstrip("/")
         e = os.environ
-        self.landing = Path(e.get("LOCALOCTOP_LANDING_DIR", "/landing"))
-        # The path under which the *agent* sees the landing dir (it differs
-        # from ours when the two containers mount the volume differently).
-        self.visible = PurePosixPath(e.get("LOCALOCTOP_LANDING_VISIBLE", str(self.landing)))
+        # Mount point of all per-user Octop folders: {users_dir}/<user_id>/.
+        self.users_dir = Path(e.get("LOCALOCTOP_USERS_DIR", "/users"))
+        # Sub-folder inside each user's folder where fetched files land (the
+        # agent sees it as "/{landing_subdir}").
+        self.landing_subdir = e.get("LOCALOCTOP_LANDING_SUBDIR", "localoctop").strip("/") or "localoctop"
         self.max_bytes = int(e.get("LOCALOCTOP_MAX_TRANSFER_BYTES", DEFAULT_MAX_TRANSFER_BYTES))
-        # Extra cloud directories deliver_to_local may read from, as
-        # "ourpath=agentpath" pairs separated by ';' (e.g. agent workspaces).
-        self.read_roots: list[tuple[Path, PurePosixPath]] = []
-        for item in e.get("LOCALOCTOP_CLOUD_READ_ROOTS", "").split(";"):
-            if "=" in item:
-                ours, _, theirs = item.partition("=")
-                self.read_roots.append((Path(ours.strip()), PurePosixPath(theirs.strip())))
         self._transfers: dict[str, Transfer] = {}
         self._index_lock = asyncio.Lock()
         self._sweep_stale_parts()
@@ -127,66 +160,66 @@ class TransferManager:
     def _sweep_stale_parts(self) -> None:
         """Transfers live in memory, so after a restart every half-received
         '.part-<id>' file is an orphan nobody will finish. Remove them, or
-        each interrupted transfer would leak its size in disk space."""
+        each interrupted transfer would leak its size in disk space. Sweep
+        every existing user's landing sub-folder."""
         try:
-            for p in self.landing.rglob("*.part-*"):
-                if p.is_file():
-                    try:
-                        p.unlink()
-                        logger.info("removed orphaned partial file %s", p)
-                    except OSError:
-                        logger.warning("could not remove orphaned partial file %s", p)
+            users = list(self.users_dir.iterdir())
         except OSError:
-            pass
+            return
+        for u in users:
+            try:
+                parts_dir = u / self.landing_subdir
+                if not parts_dir.is_dir():
+                    continue
+                for p in parts_dir.rglob("*.part-*"):
+                    if p.is_file():
+                        try:
+                            p.unlink()
+                            logger.info("removed orphaned partial file %s", p)
+                        except OSError:
+                            logger.warning("could not remove orphaned partial file %s", p)
+            except OSError:
+                continue
 
     # ------------------------------------------------------------ helpers
-    def _user_dir(self, user_id: str) -> Path:
-        return self.landing / (_SAFE_USER.sub("_", user_id) or "_")
+    def _user_root(self, user_id: str) -> Path:
+        """The real path of the user's Octop folder.
 
-    def _visible(self, p: Path) -> str:
-        """Translate one of our paths to the path the agent should use."""
+        The folder must already exist as a real directory (it belongs to the
+        platform) and must not itself be a symlink — otherwise a planted
+        link would smuggle one user's traffic into another's folder. We
+        never create it: an account without a folder simply cannot transfer.
+        """
+        name = _check_user_name(user_id)
+        root = self.users_dir / name
+        if root.is_symlink():
+            raise BridgeProtocolError(
+                CODE_NOT_ALLOWED,
+                f"the folder for user {user_id!r} on the cloud machine is a link, "
+                "not a real folder; refusing to transfer (platform misconfiguration)")
+        if not root.is_dir():
+            raise BridgeProtocolError(
+                CODE_NOT_FOUND,
+                f"this account has no folder on the cloud machine yet "
+                f"(no Octop user named {user_id!r}); the transfer was not started. "
+                "Create the Octop user first, then try again.")
+        return root.resolve()
+
+    def _inside(self, p: Path, root: Path) -> bool:
         try:
-            return str(self.visible / p.relative_to(self.landing).as_posix())
+            p.relative_to(root)
+            return True
         except ValueError:
-            pass
-        for ours, theirs in self.read_roots:
-            try:
-                return str(theirs / p.relative_to(ours).as_posix())
-            except ValueError:
-                continue
-        return str(p)
+            return False
 
-    def _from_visible(self, user_id: str, raw: str) -> Path:
-        """Map an agent-side path to ours and confine it to an allowed root."""
-        if not raw or "\x00" in raw:
-            raise BridgeProtocolError(CODE_INVALID_PARAMS, "cloud_path is required")
-        pp = PurePosixPath(raw)
-        candidates: list[tuple[Path, Path]] = []  # (mapped path, root it must stay in)
-        user_root = self._user_dir(user_id)
-        try:
-            candidates.append((self.landing / pp.relative_to(self.visible), user_root))
-        except ValueError:
-            pass
-        for ours, theirs in self.read_roots:
-            try:
-                candidates.append((ours / pp.relative_to(theirs), ours))
-            except ValueError:
-                continue
-        for mapped, root in candidates:
-            try:
-                real = mapped.resolve(strict=True)
-                real.relative_to(root.resolve())
-            except (OSError, ValueError):
-                continue
-            return real
-        raise BridgeProtocolError(
-            CODE_NOT_ALLOWED,
-            f"{raw!r} is not a file inside a cloud folder this connector may read "
-            f"(allowed: {self.visible}/{user_root.name}/…"
-            + "".join(f", {t}/…" for _, t in self.read_roots) + ")")
+    def _dest_for(self, user_id: str, rel: str, name: str) -> tuple[Path, PurePosixPath]:
+        """Cloud landing path for a local file (stable per local path).
 
-    def _dest_for(self, user_id: str, rel: str, name: str) -> Path:
-        """Cloud landing path for a local file (stable per local path)."""
+        Returns (absolute path on disk, path the agent sees). The parent
+        directory chain is created only after each step is proven to stay
+        inside the user's folder, so a symlink planted by the agent cannot
+        steer the write into someone else's folder."""
+        root = self._user_root(user_id)
         rel = rel.replace("\\", "/")
         parts = [p for p in PurePosixPath(rel).parts if p not in ("", ".", "..", "/")]
         # An absolute local path (file outside every whitelist root should
@@ -194,12 +227,45 @@ class TransferManager:
         if not parts or re.match(r"^[A-Za-z]:", parts[0]) or rel.startswith("/"):
             parts = [name or "file"]
         clean = [re.sub(r'[<>:"|?*\x00-\x1f]', "_", p) for p in parts]
-        dest = self._user_dir(user_id).joinpath(*clean)
-        dest.resolve().relative_to(self._user_dir(user_id).resolve())
-        return dest
+        visible = PurePosixPath("/") / self.landing_subdir / PurePosixPath(*clean)
+        dest = root.joinpath(self.landing_subdir, *clean)
+        self._check_path_chain(dest, root)
+        return dest, visible
+
+    def _check_path_chain(self, dest: Path, root: Path) -> None:
+        """Write-side symlink defence: walk from the user's real folder down
+        to `dest`; every component that already exists (including a dangling
+        symlink, which Path.exists() would miss) must resolve to a place
+        still inside the user's folder. A planted link pointing at another
+        user's folder fails the check and nothing is written or created."""
+        rel = dest.relative_to(root)
+        probe = root
+        for part in rel.parts:
+            probe = probe / part
+            if probe.is_symlink() or probe.exists():
+                if not self._inside(probe.resolve(), root):
+                    raise BridgeProtocolError(
+                        CODE_NOT_ALLOWED,
+                        f"the landing path contains a link that points outside your own "
+                        f"folder ({part!r}); the transfer was not started. Remove the "
+                        "link and try again.")
+
+    def _ensure_parent(self, dest: Path, root: Path) -> Path:
+        """Create dest's parent directories, then prove the real location of
+        the parent is still inside the user's folder (nothing was written
+        through a planted link)."""
+        parent = dest.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        real_parent = parent.resolve()
+        if not self._inside(real_parent, root):
+            raise BridgeProtocolError(
+                CODE_NOT_ALLOWED,
+                "the destination folder resolves outside your own folder via a link; "
+                "the transfer was not started")
+        return real_parent
 
     def _index_path(self, user_id: str) -> Path:
-        return self._user_dir(user_id) / ".localoctop-index.json"
+        return self._user_root(user_id) / self.landing_subdir / ".localoctop-index.json"
 
     def _index_load(self, user_id: str) -> dict[str, Any]:
         try:
@@ -209,7 +275,7 @@ class TransferManager:
 
     def _index_save(self, user_id: str, idx: dict[str, Any]) -> None:
         p = self._index_path(user_id)
-        tmp = p.with_suffix(".tmp")
+        tmp = p.with_name(p.name + ".tmp")
         tmp.write_text(json.dumps(idx, ensure_ascii=False), "utf-8")
         os.replace(tmp, p)
 
@@ -248,29 +314,65 @@ class TransferManager:
                                                    timeout=self.settings.bridge_timeout)
         return await self.registry.call(user_id, method, params, timeout=self.settings.bridge_timeout)
 
+    def _resolve_agent_path(self, user_id: str, raw: str) -> Path:
+        """Map an agent-visible absolute path ("/..." inside the user's
+        folder) to a real file on disk, confined to the user's own folder.
+
+        The path must stay inside the user's real folder after every link is
+        resolved, and it must be a regular file — anything else is refused.
+        Only the token owner's folder is ever readable; there are no other
+        read roots."""
+        if not raw or "\x00" in raw:
+            raise BridgeProtocolError(CODE_INVALID_PARAMS, "cloud_path is required")
+        pp = PurePosixPath(raw)
+        if not pp.is_absolute():
+            raise BridgeProtocolError(
+                CODE_INVALID_PARAMS,
+                f"cloud_path must be an absolute path the agent sees, starting with '/' "
+                f"(your folder is the root), got {raw!r}")
+        root = self._user_root(user_id)
+        parts = [p for p in pp.parts if p not in ("/", "")]
+        mapped = root.joinpath(*parts)
+        try:
+            real = mapped.resolve(strict=True)
+        except OSError:
+            raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
+        if not self._inside(real, root):
+            raise BridgeProtocolError(
+                CODE_NOT_ALLOWED,
+                f"{raw!r} points outside your own folder on the cloud machine; "
+                "only files inside your own folder can be sent to the user's machine")
+        if not real.is_file():
+            raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
+        return real
+
     # ------------------------------------------------------- start: upload
     async def start_upload(self, user_id: str, pair_id: str, local_path: str,
                            force: bool = False) -> Transfer:
-        # 1) Ask the machine what the file looks like right now.
+        # 1) Resolve the user's folder first: no folder, no transfer (and
+        #    nothing is created on disk for unknown accounts).
+        root = self._user_root(user_id)
+        # 2) Ask the machine what the file looks like right now.
         info = await self._call(user_id, pair_id, "transfer_upload",
                                 {"path": local_path, "stat_only": True, "max_bytes": self.max_bytes})
         size, mtime = int(info.get("size", 0)), int(info.get("mtime_unix", 0))
         rel = str(info.get("path") or local_path)
-        dest = self._dest_for(user_id, rel, str(info.get("name") or ""))
+        dest, visible = self._dest_for(user_id, rel, str(info.get("name") or ""))
 
-        # 2) Already have exactly this version in the cloud? Then do nothing.
+        # 3) Already have exactly this version in the cloud? Then do nothing.
         key = f"{pair_id}|{rel}"
         idx = self._index_load(user_id)
         ent = idx.get(key)
         if (not force and ent and ent.get("size") == size and ent.get("mtime") == mtime
-                and dest.is_file() and dest.stat().st_size == size):
+                and dest.is_file() and not dest.is_symlink() and dest.stat().st_size == size):
             t = self._new(user_id=user_id, pair_id=pair_id, direction="up", local_path=rel,
                           cloud_path=dest, size=size, mtime_unix=mtime, received=size)
-            t.result = {"sha256": ent.get("sha256", ""), "fresh": True}
+            t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
+                        "visible": str(visible)}
             t.finish(True)
             return t
 
-        # 3) An identical transfer already running? Join it instead of
+        # 4) An identical transfer already running? Join it instead of
         #    starting a second copy (the model may call the tool twice).
         for other in self._transfers.values():
             if (other.state == "active" and other.direction == "up" and other.user_id == user_id
@@ -279,9 +381,14 @@ class TransferManager:
                 if other.state == "active":
                     return other
 
-        # 4) Room on the cloud disk?
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        free = shutil.disk_usage(dest.parent).free
+        # 5) Room on the cloud disk?
+        real_parent = self._ensure_parent(dest, root)
+        if dest.is_symlink():
+            raise BridgeProtocolError(
+                CODE_NOT_ALLOWED,
+                f"the landing path {dest.name!r} is a link; the transfer was not started "
+                "(it would write outside your own folder)")
+        free = shutil.disk_usage(real_parent).free
         if size + DISK_RESERVE_BYTES > free:
             raise BridgeProtocolError(
                 CODE_TOO_LARGE,
@@ -290,6 +397,7 @@ class TransferManager:
 
         t = self._new(user_id=user_id, pair_id=pair_id, direction="up", local_path=rel,
                       cloud_path=dest, size=size, mtime_unix=mtime)
+        t.result = {"visible": str(visible)}
         t.part_path = dest.with_name(dest.name + f".part-{t.id}")
         t.sha = hashlib.sha256()
         t.part_path.write_bytes(b"")
@@ -304,9 +412,7 @@ class TransferManager:
     # ----------------------------------------------------- start: download
     async def start_download(self, user_id: str, pair_id: str, cloud_path: str,
                              local_path: str, overwrite: bool) -> Transfer:
-        src = self._from_visible(user_id, cloud_path)
-        if not src.is_file():
-            raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {cloud_path}")
+        src = self._resolve_agent_path(user_id, cloud_path)
         size = src.stat().st_size
         if size > self.max_bytes:
             raise BridgeProtocolError(
@@ -349,13 +455,19 @@ class TransferManager:
             except asyncio.TimeoutError:
                 continue
 
+    def _agent_view(self, t: Transfer) -> str:
+        """The path the agent should use, as seen from inside its folder."""
+        if t.direction == "up":
+            return str(t.result.get("visible") or "")
+        return t.local_path
+
     def describe(self, t: Transfer) -> str:
         """Plain-text status for the model. Short on purpose."""
         what = "local → cloud" if t.direction == "up" else "cloud → local"
         if t.state == "done" and t.direction == "up":
             fresh = " (cloud copy was already up to date — nothing re-sent)" if t.result.get("fresh") else ""
             return (f"DONE {what}{fresh}\n"
-                    f"cloud_path: {self._visible(t.cloud_path)}\n"
+                    f"cloud_path: {self._agent_view(t)}\n"
                     f"local_path: {t.local_path}\n"
                     f"size: {t.size:,} bytes\n"
                     f"sha256: {t.result.get('sha256', '')}\n"
@@ -518,6 +630,15 @@ class TransferManager:
                     self._abort(t, "integrity check failed — the copy that reached the cloud does not match "
                                    "the local file; please fetch it again")
                     return {"state": t.state}
+                # Final write-side check: the landing path must still be a
+                # real path inside the user's folder (a link planted while
+                # the transfer ran must not be followed by the rename).
+                root = self._user_root(t.user_id)
+                parent_real = t.cloud_path.parent.resolve()
+                if not self._inside(parent_real, root) or t.cloud_path.is_symlink():
+                    self._abort(t, "the landing path no longer resolves inside your own folder; "
+                                   "the transfer was aborted")
+                    return {"state": t.state}
                 try:
                     os.replace(t.part_path, t.cloud_path)
                     if t.mtime_unix:
@@ -530,7 +651,7 @@ class TransferManager:
                     idx[f"{t.pair_id}|{t.local_path}"] = {
                         "size": t.size, "mtime": t.mtime_unix, "sha256": digest, "at": int(time.time())}
                     self._index_save(t.user_id, idx)
-                t.result = {"sha256": digest}
+                t.result = {**t.result, "sha256": digest}
                 t.finish(True)
             return {"state": t.state}
 

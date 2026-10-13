@@ -165,20 +165,23 @@ async def test_second_pair_routes_to_second_machine():
 
 @pytest.mark.asyncio
 async def test_paired_bridge_offline_returns_explicit_error():
-    """配对桥不在线（用户名下没有任何会话）→ 明确错误 pair-bridge-offline，
-    码 4101，绝不兜底."""
+    """配对桥不在线（用户名下没有任何会话）→ 明确拒绝，绝不兜底.
+
+    实验分支约定：本机不在线不再是协议错误，而是 isError 的可读文字结果
+    （模型据此转告用户），底层仍由 CODE_NO_BRIDGE (4101) 触发、绝不兜底."""
     client, app = await _mk(_settings(token_store=_multi_pair_store()))
     async with client:
         headers = await _handshake(client, "tok-byron")
         body = await _call(client, headers, 12)
-        assert body["error"]["code"] == CODE_NO_BRIDGE
-        assert "pair-bridge-offline" in body["error"]["message"]
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "not connected" in body["result"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio
 async def test_no_user_name_fallback_to_online_other_pair():
     """关键反例：byron 的配对桥离线，但 byron2 的桥在线（老模型会按用户名
-    兜底打到它）→ 新模型必须报错，绝不把调用串到另一对的桥."""
+    兜底打到它）→ 新模型必须按离线处理（isError），绝不把调用串到另一对的桥."""
     client, app = await _mk(_settings(token_store=_multi_pair_store()))
     registry = app.state.registry
 
@@ -189,8 +192,9 @@ async def test_no_user_name_fallback_to_online_other_pair():
     async with client:
         headers = await _handshake(client, "tok-byron")
         body = await _call(client, headers, 13)
-        assert body["error"]["code"] == CODE_NO_BRIDGE
-        assert "pair-bridge-offline" in body["error"]["message"]
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "not connected" in body["result"]["content"][0]["text"]
         # The online bridge of the OTHER pair was never touched.
         assert ws2.outbox == []
 
@@ -210,8 +214,9 @@ async def test_same_name_session_wrong_pair_is_offline():
     async with client:
         headers = await _handshake(client, "tok-byron")
         body = await _call(client, headers, 14)
-        assert body["error"]["code"] == CODE_NO_BRIDGE
-        assert "pair-bridge-offline" in body["error"]["message"]
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "not connected" in body["result"]["content"][0]["text"]
         assert ws.outbox == []
 
 
@@ -434,12 +439,14 @@ async def test_unpaired_bridge_token_registers_without_pair():
     session = registry.get("byron")
     assert session is not None and session.pair_id == ""
 
-    # The paired mcp token must NOT route to this unpaired session.
+    # The paired mcp token must NOT route to this unpaired session (offline
+    # handling: readable isError, not a protocol error).
     async with client:
         headers = await _handshake(client, "tok-byron")
         body = await _call(client, headers, 20)
-        assert body["error"]["code"] == CODE_NO_BRIDGE
-        assert "pair-bridge-offline" in body["error"]["message"]
+        assert "error" not in body
+        assert body["result"]["isError"] is True
+        assert "not connected" in body["result"]["content"][0]["text"]
         assert ws.outbox == []
 
     ws.feed_disconnect()
