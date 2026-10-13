@@ -72,6 +72,7 @@ from .errors import (
     CODE_INVALID_PARAMS,
     CODE_NOT_ALLOWED,
     CODE_NOT_FOUND,
+    CODE_TOO_LARGE,
 )
 from .tokens import KIND_BRIDGE
 
@@ -588,9 +589,13 @@ class TransferManager:
         #    nothing is created on disk for unknown accounts).
         root_fd = self._user_root_fd(user_id)
         try:
-            # 2) Ask the machine what the file looks like right now.
+            # 2) Ask the machine what the file looks like right now. No
+            #    max_bytes here: the real bridge refuses an over-limit file
+            #    with a 4003 error before reporting its size, and deciding
+            #    what an over-limit answer looks like is OUR job (a normal
+            #    advisory below, not an error).
             info = await self._call(user_id, pair_id, "transfer_upload",
-                                    {"path": local_path, "stat_only": True, "max_bytes": self.max_bytes})
+                                    {"path": local_path, "stat_only": True})
             size, mtime = int(info.get("size", 0)), int(info.get("mtime_unix", 0))
             rel = str(info.get("path") or local_path)
             comps, visible = self._dest_for(user_id, rel, str(info.get("name") or ""))
@@ -689,9 +694,23 @@ class TransferManager:
                 dirs.close()
                 raise
             try:
+                # max_bytes rides along as the bridge-side last line of
+                # defence: if the file grew past the limit between the stat
+                # probe and now, the bridge refuses with 4003 instead of
+                # streaming an over-limit file. That refusal is turned into
+                # the same advisory the probe-time check produces.
                 await self._call(user_id, pair_id, "transfer_upload",
                                  {"path": local_path, "max_bytes": self.max_bytes, **self._bridge_params(t)})
             except BridgeProtocolError as exc:
+                if exc.code == CODE_TOO_LARGE:
+                    # Release this transfer's handles before handing back a
+                    # fresh advisory record (finish() unlinks any
+                    # materialized name, closes the temp fd and the dirs).
+                    t.finish(False, exc.message)
+                    return self._advisory(
+                        user_id, pair_id, "up", rel, str(visible), size,
+                        f"file is over the {self.max_bytes:,}-byte transfer limit "
+                        "(it grew between the size check and the upload start)")
                 self._abort(t, exc.message)
                 raise
             return t

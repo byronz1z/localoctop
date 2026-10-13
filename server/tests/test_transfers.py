@@ -26,6 +26,7 @@ from localoctop.errors import (
     CODE_INVALID_PARAMS,
     CODE_NOT_ALLOWED,
     CODE_NOT_FOUND,
+    CODE_TOO_LARGE,
 )
 from localoctop.transfers import TransferManager
 
@@ -46,7 +47,13 @@ class _Settings:
 class FakeRegistry:
     """Answers bridge calls the way the Go bridge does: transfer_upload
     (stat_only) returns size/mtime; transfer_download accepts and reports a
-    final path. Recorded calls let tests assert what was requested."""
+    final path. Recorded calls let tests assert what was requested.
+
+    Like the real bridge (transfer.go), a transfer_upload carrying
+    max_bytes is refused with error 4003 when the file is over that limit —
+    stat_only probes carry no max_bytes, so they always answer. A fake that
+    ignored max_bytes would hide exactly the round-4 bug (the adapter
+    asking for a stat WITH max_bytes and dying on the 4003)."""
 
     def __init__(self, files: dict[str, tuple[bytes, int]] | None = None):
         # files: local_path -> (content, mtime_unix)
@@ -60,6 +67,11 @@ class FakeRegistry:
         self.calls.append((method, params))
         if method == "transfer_upload":
             content, mtime = self.files[params["path"]]
+            max_bytes = int(params.get("max_bytes") or 0)
+            if max_bytes > 0 and len(content) > max_bytes:
+                raise BridgeProtocolError(
+                    CODE_TOO_LARGE,
+                    f"file is {len(content)} bytes, larger than the {max_bytes}-byte transfer limit")
             return {"accepted": True, "path": params["path"], "name": os.path.basename(params["path"]),
                     "size": len(content), "mtime_unix": mtime}
         if method == "transfer_download":
@@ -669,6 +681,73 @@ class TestTransferLimits:
         assert t.state == "failed" and t.result.get("advisory") is True
         text = mgr.describe(t)
         assert "NOT TRANSFERRED" in text and "100" in text and "10" in text
+
+    async def test_upload_over_limit_real_bridge_4003_still_advisory(self, users_dir, mgr, monkeypatch):
+        """Round-4 regression: the REAL bridge refuses a stat request that
+        carries max_bytes with error 4003 before it ever reports the size
+        (that is what the live bridge + adapter produced). The probe must
+        therefore go out WITHOUT max_bytes; the adapter judges the limit
+        itself. FakeRegistry now mimics the real bridge, so this test would
+        fail with isError-style behaviour if the probe carried max_bytes."""
+        monkeypatch.setenv("LOCALOCTOP_MAX_TRANSFER_BYTES", "100")
+        mgr = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        _mk_user(users_dir, "alice")
+        reg = FakeRegistry({"big.bin": (b"x" * 500, 1000)})
+        mgr.registry = reg
+        t = await mgr.start_upload("alice", "pair-1", "big.bin")
+        assert t.state == "failed" and t.result.get("advisory") is True
+        text = mgr.describe(t)
+        assert "NOT TRANSFERRED" in text
+        assert "500" in text and "100" in text
+        assert "split or compress" in text
+        # The probe reached the bridge without max_bytes (a real bridge
+        # answers it); NO real upload start ever left the adapter.
+        assert len(reg.calls) == 1
+        assert reg.calls[0][1].get("stat_only") is True
+        assert "max_bytes" not in reg.calls[0][1]
+        landing = users_dir / "alice" / "localoctop"
+        assert not landing.exists() or list(landing.iterdir()) == []
+
+    async def test_upload_start_4003_after_probe_becomes_advisory(self, users_dir, mgr, monkeypatch):
+        """The file fit under the limit at probe time but the bridge refuses
+        the real upload start with 4003 (the file grew in between, or the
+        bridge's own limit is tighter). Same outcome as a probe-time
+        refusal: an advisory, no error, nothing landed, no leftover temp
+        names, and the partially-prepared transfer's handles are released."""
+        monkeypatch.setenv("LOCALOCTOP_MAX_TRANSFER_BYTES", "100")
+        mgr = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        _mk_user(users_dir, "alice")
+
+        class GrowsAtStart(FakeRegistry):
+            async def call(self, user_id, method, params, timeout=None):
+                if method == "transfer_upload" and not params.get("stat_only"):
+                    # The file grew past the limit after the probe: the
+                    # bridge does what transfer.go does with max_bytes.
+                    self.calls.append((method, params))
+                    raise BridgeProtocolError(
+                        CODE_TOO_LARGE,
+                        "file is 150 bytes, larger than the 100-byte transfer limit")
+                return await super().call(user_id, method, params, timeout=timeout)
+
+        reg = GrowsAtStart({"f.bin": (b"x" * 50, 1000)})  # 50 < 100 at probe time
+        mgr.registry = reg
+        t = await mgr.start_upload("alice", "pair-1", "f.bin")
+        assert t.state == "failed" and t.result.get("advisory") is True
+        text = mgr.describe(t)
+        assert "NOT TRANSFERRED" in text and "100" in text
+        # Probe + refused start: exactly two bridge calls, no chunk traffic.
+        assert len(reg.calls) == 2
+        assert reg.calls[0][1].get("stat_only") is True
+        assert reg.calls[1][1].get("stat_only") is not True
+        # Nothing appeared in the cloud and no temp/materialized name leaks.
+        landing = users_dir / "alice" / "localoctop"
+        if landing.exists():
+            assert not [p for p in landing.rglob("*") if p.name == "f.bin"]
+            assert not [p for p in landing.rglob("*") if p.name.startswith(".localoctop-link-")]
+        # The refused transfer's record was finished (handles released), and
+        # the record we hand back is the advisory one.
+        actives = [x for x in mgr._transfers.values() if x.state == "active"]
+        assert actives == []
 
     async def test_fetch_tool_renders_advisory_as_not_error(self, users_dir, mgr, monkeypatch):
         """End-to-end at the tools layer: isError is False for an advisory."""

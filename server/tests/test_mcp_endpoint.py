@@ -545,6 +545,12 @@ async def test_not_utf8_read_is_normal_result_with_fetch_hint():
         assert body["result"]["isError"] is False
         text = body["result"]["content"][0]["text"]
         assert "notes-gbk.txt" in text and "UTF-8" in text
+        # The neutral wording covers binary formats too (a small PDF has no
+        # NUL bytes in its head) and must NOT push the model towards
+        # transcoding by claiming "a different character encoding".
+        assert "not directly readable text" in text
+        assert "binary format" in text
+        assert "a different character encoding" not in text
         assert "fetch_to_cloud" in text
 
 

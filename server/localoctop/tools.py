@@ -482,7 +482,13 @@ class ToolService:
             if not_text == "binary":
                 why = "it is a binary file (it contains NUL bytes, like a PDF, image, Office document or archive)"
             else:
-                why = "its content is not valid UTF-8 text (a different character encoding)"
+                # not_utf8: could be text in another encoding, but just as
+                # often a binary format whose head simply has no NUL bytes
+                # (a small PDF is the common case). Naming "a different
+                # character encoding" would send the model off trying to
+                # transcode a PDF — stay neutral.
+                why = ("it is not directly readable text (a binary format such as PDF, Office, "
+                       "image or archive, or text in an encoding other than UTF-8)")
             text = (f"== {path} ({size:,} bytes): cannot be shown as text — {why}. ==\n"
                     f"Nothing was read. Next step: call fetch_to_cloud with path={path!r} to copy the "
                     "file to the cloud machine, then process it there with your own file and "
