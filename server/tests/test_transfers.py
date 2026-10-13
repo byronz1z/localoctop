@@ -361,7 +361,11 @@ class TestWriteSideSymlinkDefence:
         assert list(bob.iterdir()) == []
 
     @needs_symlink
-    async def test_existing_symlink_at_destination_refused(self, users_dir, mgr):
+    async def test_existing_symlink_at_destination_saved_aside(self, users_dir, mgr):
+        """Round 7: a symlink planted at the final name must neither be
+        written through nor deleted — the upload lands under
+        "<name>.uploaded", bob's file is untouched, and the result says so
+        (replaces round 2's "refused" behaviour)."""
         home = _mk_user(users_dir, "alice")
         bob = _mk_user(users_dir, "bob")
         (bob / "target.txt").write_bytes(b"bob-file")
@@ -369,10 +373,14 @@ class TestWriteSideSymlinkDefence:
         landing.mkdir()
         (landing / "evil.txt").symlink_to(bob / "target.txt")
         mgr.registry = FakeRegistry({"evil.txt": (b"pwned", 1000)})
-        with pytest.raises(BridgeProtocolError) as ei:
-            await mgr.start_upload("alice", "pair-1", "evil.txt")
-        assert ei.value.code == CODE_NOT_ALLOWED
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "evil.txt", b"pwned")
+        assert t.state == "done", t.error
+        assert (landing / "evil.txt").is_symlink()
+        assert os.readlink(landing / "evil.txt") == str(bob / "target.txt")
         assert (bob / "target.txt").read_bytes() == b"bob-file"
+        assert (landing / "evil.txt.uploaded").read_bytes() == b"pwned"
+        assert "cloud_path: /localoctop/evil.txt.uploaded" in mgr.describe(t)
 
     @needs_symlink
     async def test_landing_dir_swapped_mid_upload(self, users_dir, mgr):
@@ -1263,7 +1271,7 @@ class TestFifoNeverBlocks:
         assert (landing / "f.bin").read_bytes() == b"data"
 
     @needs_fifo
-    async def test_fifo_at_landing_name_fails_complete_fast(self, users_dir, mgr):
+    async def test_fifo_at_landing_name_saved_aside_complete_fast(self, users_dir, mgr):
         home = _mk_user(users_dir, "alice")
         landing = home / "localoctop"
         landing.mkdir()
@@ -1274,9 +1282,13 @@ class TestFifoNeverBlocks:
             async with _client_for(mgr) as client:
                 return await _push_upload(mgr, client, "alice", "f.bin", b"data")
         t, _ = await asyncio.wait_for(go(), timeout=2.0)
-        assert t.state == "failed"
+        assert t.state == "done", t.error
         import stat as statmod
+        assert (landing / "f.bin.uploaded").read_bytes() == b"data"
         assert statmod.S_ISFIFO((landing / "f.bin").stat().st_mode)
+        desc = mgr.describe(t)
+        assert "f.bin.uploaded" in desc and "named pipe" in desc
+        assert "cloud_path: /localoctop/f.bin.uploaded" in desc
 
 
 class TestIndexBadData:
@@ -1326,6 +1338,9 @@ class TestReservedIndexName:
         assert "pair-1|.localoctop-index.json" in idx
         assert "saved as" in mgr.describe(t)
         assert ".localoctop-index.json.uploaded" in mgr.describe(t)
+        # The rendered cloud_path must be the path where the file actually
+        # landed, not the reserved original name.
+        assert "cloud_path: /localoctop/.localoctop-index.json.uploaded" in mgr.describe(t)
         # Tool layer: not an error (no advisory flag, state done).
         assert not t.result.get("advisory")
 
@@ -1345,6 +1360,97 @@ class TestReservedIndexName:
         assert foreign[0].read_text("utf-8") == '{"my": "notes"}'
         idx = _read_index(users_dir, "alice")
         assert "pair-1|f.bin" in idx
+
+
+class TestNonRegularOccupantSavedAside:
+    """A final landing name occupied by anything that is not a regular file
+    (round 7): the upload must succeed, land under "<name>.uploaded", leave
+    the occupant completely untouched, and the result must name both the
+    occupant's kind and the file's real cloud_path."""
+
+    async def test_directory_at_landing_name_saved_aside(self, users_dir, mgr):
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir(parents=True)
+        (landing / "f.bin").mkdir()
+        (landing / "f.bin" / "inner.txt").write_text("inner", "utf-8")
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+
+        async def go():
+            async with _client_for(mgr) as client:
+                return await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        t, _ = await asyncio.wait_for(go(), timeout=2.0)
+        assert t.state == "done", t.error
+        assert (landing / "f.bin.uploaded").read_bytes() == b"data"
+        # The directory and its content are exactly as they were.
+        assert (landing / "f.bin").is_dir()
+        assert (landing / "f.bin" / "inner.txt").read_text("utf-8") == "inner"
+        desc = mgr.describe(t)
+        assert "directory" in desc and "f.bin.uploaded" in desc
+        assert "cloud_path: /localoctop/f.bin.uploaded" in desc
+
+    @pytest.mark.skipif(not hasattr(os, "symlink"), reason="symlink unavailable")
+    async def test_symlink_at_landing_name_saved_aside(self, users_dir, mgr):
+        home = _mk_user(users_dir, "alice")
+        landing = home / "localoctop"
+        landing.mkdir()
+        other = home / "somewhere-else"
+        other.mkdir()
+        target = other / "real.txt"
+        target.write_bytes(b"original-target")
+        os.symlink(target, landing / "f.bin")
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+
+        async def go():
+            async with _client_for(mgr) as client:
+                return await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        t, _ = await asyncio.wait_for(go(), timeout=2.0)
+        assert t.state == "done", t.error
+        assert (landing / "f.bin.uploaded").read_bytes() == b"data"
+        # The link itself is untouched, still a link, same target; the file
+        # it points at was never written through.
+        assert (landing / "f.bin").is_symlink()
+        assert os.readlink(landing / "f.bin") == str(target)
+        assert target.read_bytes() == b"original-target"
+        desc = mgr.describe(t)
+        assert "symbolic link" in desc and "f.bin.uploaded" in desc
+        assert "cloud_path: /localoctop/f.bin.uploaded" in desc
+
+    async def test_saved_aside_rupload_never_deletes_occupant(self, users_dir, mgr):
+        """After a save-aside upload, re-uploading the same local file —
+        content unchanged and content changed — must never remove the
+        occupant and must never remove the saved-aside copy either."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir(parents=True)
+        (landing / "f.bin").mkdir()
+        mgr.registry = FakeRegistry({"f.bin": (b"v1", 1000)})
+
+        async def go(content: bytes):
+            async with _client_for(mgr) as client:
+                return await _push_upload(mgr, client, "alice", "f.bin", content)
+        t1, _ = await asyncio.wait_for(go(b"v1"), timeout=2.0)
+        assert t1.state == "done", t1.error
+        assert (landing / "f.bin").is_dir()
+        assert (landing / "f.bin.uploaded").read_bytes() == b"v1"
+
+        # Same content again: the index records the saved-aside name's
+        # landed stats, so "already up to date" fires against the copy
+        # actually on disk — and nothing is removed.
+        t2 = await asyncio.wait_for(mgr.start_upload("alice", "pair-1", "f.bin"), timeout=2.0)
+        assert t2.state == "done" and t2.result.get("fresh") is True
+        assert (landing / "f.bin").is_dir()
+        assert (landing / "f.bin.uploaded").read_bytes() == b"v1"
+        assert not list(landing.glob("f.bin.uploaded-*"))
+
+        # Changed content: the occupant is not a regular file, so it is
+        # never moved/deleted; the new copy lands on a suffixed name.
+        mgr.registry = FakeRegistry({"f.bin": (b"v2-changed", 2000)})
+        t3, _ = await asyncio.wait_for(go(b"v2-changed"), timeout=2.0)
+        assert t3.state == "done", t3.error
+        assert (landing / "f.bin").is_dir()
+        assert (landing / "f.bin.uploaded").read_bytes() == b"v1"
+        assert (landing / "f.bin.uploaded-1").read_bytes() == b"v2-changed"
 
 
 class TestHashRaceDefence:

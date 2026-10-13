@@ -907,19 +907,43 @@ class TransferManager:
             if dirs is not None:
                 try:
                     ent = self._index_load(dirs).get(key)
-                    st = _stat_name(dirs.fd, comps[-1]) if ent else None
-                    if (not force and ent and ent.get("size") == size and ent.get("mtime") == mtime
-                            and st is not None and statmod.S_ISREG(st.st_mode)
-                            and st.st_size == ent.get("landed_size")
-                            and st.st_mtime_ns == ent.get("landed_mtime_ns")
-                            and await self._hash_matches(dirs, comps[-1], ent.get("sha256"))):
-                        t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
-                                      local_path=rel, cloud_path=Path(visible),
-                                      size=size, mtime_unix=mtime, received=size)
-                        t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
-                                    "visible": str(visible)}
-                        t.finish(True)
-                        return t
+                    if not force and ent and ent.get("size") == size \
+                            and ent.get("mtime") == mtime and ent.get("landed_name"):
+                        # The last upload of this file was saved aside: the
+                        # untouched copy check must look at the name the file
+                        # ACTUALLY landed under (never at the original name,
+                        # which may hold a fifo/directory/link or somebody
+                        # else's content). The recorded name is a bare
+                        # filename validated by _index_save on the way in.
+                        landed = ent["landed_name"]
+                        if "/" not in landed and "\0" not in landed:
+                            st = _stat_name(dirs.fd, landed)
+                            if (st is not None and statmod.S_ISREG(st.st_mode)
+                                    and st.st_size == ent.get("landed_size")
+                                    and st.st_mtime_ns == ent.get("landed_mtime_ns")
+                                    and await self._hash_matches(dirs, landed, ent.get("sha256"))):
+                                t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
+                                              local_path=rel, cloud_path=Path(visible),
+                                              size=size, mtime_unix=mtime, received=size)
+                                t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
+                                            "visible": str(visible)}
+                                t.finish(True)
+                                return t
+                        ent = None  # the saved-aside copy is gone or changed: normal upload
+                    if ent is not None:
+                        st = _stat_name(dirs.fd, comps[-1])
+                        if (not force and ent.get("size") == size and ent.get("mtime") == mtime
+                                and st is not None and statmod.S_ISREG(st.st_mode)
+                                and st.st_size == ent.get("landed_size")
+                                and st.st_mtime_ns == ent.get("landed_mtime_ns")
+                                and await self._hash_matches(dirs, comps[-1], ent.get("sha256"))):
+                            t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
+                                          local_path=rel, cloud_path=Path(visible),
+                                          size=size, mtime_unix=mtime, received=size)
+                            t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
+                                        "visible": str(visible)}
+                            t.finish(True)
+                            return t
                 finally:
                     dirs.close()
 
@@ -945,15 +969,10 @@ class TransferManager:
             except _NotAFolder as exc:
                 raise exc.refuse() from None
             try:
-                # A symlink at the final name must never be written through;
-                # refuse up front (a regular file is fine — it gets replaced
-                # by the landing rename, which never follows links).
-                st = _stat_name(dirs.fd, comps[-1])
-                if st is not None and statmod.S_ISLNK(st.st_mode):
-                    raise BridgeProtocolError(
-                        CODE_NOT_ALLOWED,
-                        f"the landing path {comps[-1]!r} is a link; the transfer was not "
-                        "started (it would write outside your own folder)")
+                # A symlink at the final name must never be written through
+                # or replaced: the upload lands under a free
+                # "<name>.uploaded" name instead, the link is left exactly
+                # as it is, and the result says so (see _land).
                 free = shutil.disk_usage(f"/proc/self/fd/{dirs.fd}").free
                 if size + DISK_RESERVE_BYTES > free:
                     t = self._advisory(
@@ -1145,6 +1164,34 @@ class TransferManager:
                 return cand
         raise OSError(f"no free alternative name for {name!r}")
 
+    @staticmethod
+    def _describe_kind(st_mode: int) -> str:
+        """Best-effort type word for a non-regular occupant."""
+        if statmod.S_ISFIFO(st_mode):
+            return "a named pipe (fifo)"
+        if statmod.S_ISDIR(st_mode):
+            return "a directory"
+        if statmod.S_ISLNK(st_mode):
+            return "a symbolic link"
+        if statmod.S_ISSOCK(st_mode):
+            return "a socket"
+        if statmod.S_ISCHR(st_mode):
+            return "a character device"
+        if statmod.S_ISBLK(st_mode):
+            return "a block device"
+        return "not a regular file"
+
+    def _save_aside(self, t: Transfer, final: str, reason: str) -> str:
+        """Pick a free "<final>.uploaded" name, point the transfer's visible
+        cloud_path at it so tools render the path where the file actually
+        landed, and record the explanation for the result text."""
+        saved = self._free_name(t.dirs, f"{final}.uploaded")  # type: ignore[arg-type]
+        old_vis = str(t.result.get("visible") or str(t.cloud_path))
+        base = old_vis.rsplit("/", 1)[0]
+        t.result["visible"] = f"{base}/{saved}" if base else f"/{saved}"
+        t.result["saved_as"] = f"{reason}; the file was saved as {saved!r} instead"
+        return saved
+
     async def _land(self, t: Transfer, digest: str) -> tuple[os.stat_result, list[str]]:
         """Give the verified anonymous upload file its final name, never
         overwriting anything: the linkat fails with EEXIST while the name is
@@ -1157,6 +1204,11 @@ class TransferManager:
         (the index, or an index temp prefix) never receives user content:
         the file lands as "<name>.uploaded" (numeric suffix when taken) and
         the result tells the agent so — a normal outcome, not an error.
+        The same applies when the name is occupied by anything that is not
+        a regular file (a fifo, directory, symlink, socket or device): that
+        thing is never moved, deleted or opened; the upload lands under a
+        free "<name>.uploaded" name instead (the transfer's cloud_path then
+        points at the file's real location), and the result says so.
 
         No visible intermediate name ever exists: the file goes straight
         from anonymous (O_TMPFILE) to the final name. Returns (fstat of the
@@ -1166,10 +1218,20 @@ class TransferManager:
         assert dirs is not None
         final = t.cloud_path.name
         if final == _INDEX_NAME or final.startswith(_INDEX_TMP_PREFIX):
-            final = self._free_name(dirs, f"{final}.uploaded")
-            t.result["saved_as"] = (
-                f"the name {t.cloud_path.name!r} is reserved for the connector itself; "
-                f"the file was saved as {final!r} instead")
+            final = self._save_aside(
+                t, final,
+                f"the name {t.cloud_path.name!r} is reserved for the connector itself")
+        else:
+            st_occ = _stat_name(dirs.fd, final)
+            if st_occ is not None and not statmod.S_ISREG(st_occ.st_mode):
+                # Never touched: not moved, not deleted, not opened. The
+                # upload lands under a free name; the result names both the
+                # occupant's kind and the new name, and the transfer's
+                # cloud_path now points at the file's real location.
+                final = self._save_aside(
+                    t, final,
+                    f"the name {final!r} is occupied by "
+                    f"{self._describe_kind(st_occ.st_mode)}")
         idx_prev = self._index_load(dirs).get(f"{t.pair_id}|{t.local_path}")
         kept_list: list[str] = []
         for _ in range(20):
@@ -1177,6 +1239,10 @@ class TransferManager:
                 os.link(f"/proc/self/fd/{t.file_fd}", final,
                         dst_dir_fd=dirs.fd, follow_symlinks=True)
                 st = os.fstat(t.file_fd)
+                # The bare name the file actually landed under: the index
+                # stores it so the "still our untouched copy" shortcut
+                # checks the file's real location, not the original name.
+                t.result["landed_name"] = final
                 if kept_list:
                     # The agent-visible paths of the kept copies: the
                     # transfer's visible path with the final component
@@ -1193,7 +1259,14 @@ class TransferManager:
             if st_dst is None:
                 continue  # the occupant vanished between the two syscalls
             if not statmod.S_ISREG(st_dst.st_mode):
-                raise OSError(f"the landing path {final!r} is not a regular file")
+                # A non-regular file appeared at the name after we checked
+                # (or mid-retry): same rule as above — never touch it, save
+                # the upload aside under a free name and keep landing.
+                final = self._save_aside(
+                    t, final,
+                    f"the name {final!r} is occupied by "
+                    f"{self._describe_kind(st_dst.st_mode)}")
+                continue
             try:
                 kept_as = self._keep_cloud_edited(dirs, final)
             except FileNotFoundError:
@@ -1445,6 +1518,12 @@ class TransferManager:
                             "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
                             "landed_size": st_final.st_size,
                             "landed_mtime_ns": st_final.st_mtime_ns,
+                            # The bare filename the file actually landed
+                            # under: when the upload was saved aside this is
+                            # the .uploaded name, and the "still our
+                            # untouched copy" shortcut must check THAT name,
+                            # never the original one.
+                            "landed_name": t.result.get("landed_name") or t.cloud_path.name,
                             "at": int(time.time())}
                         self._index_save(t.dirs, idx)
                 except Exception:  # noqa: BLE001
