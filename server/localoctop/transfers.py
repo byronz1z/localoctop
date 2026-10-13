@@ -922,11 +922,35 @@ class TransferManager:
                                     and st.st_size == ent.get("landed_size")
                                     and st.st_mtime_ns == ent.get("landed_mtime_ns")
                                     and await self._hash_matches(dirs, landed, ent.get("sha256"))):
+                                if landed != comps[-1]:
+                                    # The copy on disk is under a saved-aside
+                                    # name: the path handed to the agent must
+                                    # be the file's REAL location, and the
+                                    # result must say why the name differs.
+                                    occ = _stat_name(dirs.fd, comps[-1])
+                                    if comps[-1] == _INDEX_NAME \
+                                            or comps[-1].startswith(_INDEX_TMP_PREFIX):
+                                        reason = (f"the name {comps[-1]!r} is reserved for "
+                                                  f"the connector itself")
+                                    elif occ is not None:
+                                        reason = (f"the name {comps[-1]!r} is occupied by "
+                                                  f"{self._describe_kind(occ.st_mode)}")
+                                    else:
+                                        reason = (f"the name {comps[-1]!r} is not where the "
+                                                  f"file landed (it is at {landed!r})")
+                                    base = str(visible).rsplit("/", 1)[0]
+                                    real_visible = f"{base}/{landed}" if base else f"/{landed}"
+                                    saved_as = (f"{reason}; the file is at {landed!r}")
+                                else:
+                                    real_visible = str(visible)
+                                    saved_as = None
                                 t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
-                                              local_path=rel, cloud_path=Path(visible),
+                                              local_path=rel, cloud_path=Path(real_visible),
                                               size=size, mtime_unix=mtime, received=size)
                                 t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
-                                            "visible": str(visible)}
+                                            "visible": real_visible}
+                                if saved_as:
+                                    t.result["saved_as"] = saved_as
                                 t.finish(True)
                                 return t
                         ent = None  # the saved-aside copy is gone or changed: normal upload

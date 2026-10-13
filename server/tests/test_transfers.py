@@ -1344,6 +1344,24 @@ class TestReservedIndexName:
         # Tool layer: not an error (no advisory flag, state done).
         assert not t.result.get("advisory")
 
+    async def test_rupload_named_like_index_fresh_reports_real_path(self, users_dir, mgr):
+        """Round 7 续: after a save-aside upload of the index-named file, a
+        same-content re-upload takes the 'already up to date' shortcut — and
+        its cloud_path must be the saved-aside path, never the reserved
+        original name."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({".localoctop-index.json": (b"user-content", 1000)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", ".localoctop-index.json", b"user-content")
+        assert t1.state == "done", t1.error
+        t2 = await asyncio.wait_for(
+            mgr.start_upload("alice", "pair-1", ".localoctop-index.json"), timeout=2.0)
+        assert t2.state == "done" and t2.result.get("fresh") is True
+        desc = mgr.describe(t2)
+        assert "cloud_path: /localoctop/.localoctop-index.json.uploaded" in desc
+        assert "cloud_path: /localoctop/.localoctop-index.json\n" not in desc
+        assert ".localoctop-index.json.uploaded" in desc
+
     async def test_foreign_json_at_index_name_preserved(self, users_dir, mgr):
         """Somebody's own JSON file sits at the index name: after one upload
         it must survive under a .foreign- name, content intact, and the
@@ -1433,12 +1451,21 @@ class TestNonRegularOccupantSavedAside:
         assert t1.state == "done", t1.error
         assert (landing / "f.bin").is_dir()
         assert (landing / "f.bin.uploaded").read_bytes() == b"v1"
+        # transfer_status on the finished transfer (what the agent sees when
+        # it queries by id later) must also point at the real location.
+        assert "cloud_path: /localoctop/f.bin.uploaded" in mgr.describe(t1)
 
         # Same content again: the index records the saved-aside name's
         # landed stats, so "already up to date" fires against the copy
-        # actually on disk — and nothing is removed.
+        # actually on disk — and nothing is removed. The rendered
+        # cloud_path must be the file's real location, not the original
+        # name (which the directory still occupies).
         t2 = await asyncio.wait_for(mgr.start_upload("alice", "pair-1", "f.bin"), timeout=2.0)
         assert t2.state == "done" and t2.result.get("fresh") is True
+        desc2 = mgr.describe(t2)
+        assert "cloud_path: /localoctop/f.bin.uploaded" in desc2
+        assert "cloud_path: /localoctop/f.bin\n" not in desc2
+        assert "f.bin.uploaded" in desc2 and "directory" in desc2
         assert (landing / "f.bin").is_dir()
         assert (landing / "f.bin.uploaded").read_bytes() == b"v1"
         assert not list(landing.glob("f.bin.uploaded-*"))
