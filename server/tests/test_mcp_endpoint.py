@@ -18,7 +18,6 @@ import pytest
 from localoctop.app import create_app
 from localoctop.config import Settings
 from localoctop.errors import (
-    CODE_INVALID_PARAMS,
     CODE_METHOD_NOT_FOUND,
     CODE_NOT_ALLOWED,
     CODE_NO_BRIDGE,
@@ -473,10 +472,11 @@ async def test_get_sse_stream_requires_session():
 
 
 @pytest.mark.asyncio
-async def test_binary_read_refused_with_fetch_hint():
+async def test_binary_read_is_normal_result_with_fetch_hint():
     """Binary content must never enter a tool result (experiment branch):
-    the bridge's read_text refuses binary files, and the adapter relays that
-    refusal as an isError result pointing at fetch_to_cloud."""
+    the bridge's read_text answers binary files with a normal result
+    (not_text="binary", no body), and the adapter renders that as an
+    isError=false text naming the file, the reason, and fetch_to_cloud."""
     client, app = await _mk(_settings())
     registry = app.state.registry
     ws = FakeWebSocket()
@@ -489,10 +489,9 @@ async def test_binary_read_refused_with_fetch_hint():
             await asyncio.sleep(0.02)
         req = ws.outbox[0]
         assert req["method"] == "read_text"
-        registry.deliver("alice", req["id"], {"id": req["id"], "error": {
-            "code": CODE_INVALID_PARAMS,
-            "message": "img.png is a binary file (2 bytes) and cannot be read as text; "
-                       "use fetch_to_cloud to send it to the cloud workspace and process it there",
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "path": "img.png", "size": 2, "start_line": 1, "end_line": 0,
+            "total_lines": -1, "eof": False, "text": "", "not_text": "binary",
         }})
 
     async with client:
@@ -505,8 +504,85 @@ async def test_binary_read_refused_with_fetch_hint():
         await task
         body = r.json()
         assert "error" not in body
-        assert body["result"]["isError"] is True
-        assert "fetch_to_cloud" in body["result"]["content"][0]["text"]
+        assert body["result"]["isError"] is False
+        text = body["result"]["content"][0]["text"]
+        assert "img.png" in text and "binary" in text
+        assert "fetch_to_cloud" in text
+        assert "'img.png'" in text  # the path written out for the next call
+
+
+@pytest.mark.asyncio
+async def test_not_utf8_read_is_normal_result_with_fetch_hint():
+    """A file whose bytes are not valid UTF-8 is likewise a normal result
+    (not_text="not_utf8") pointing at fetch_to_cloud."""
+    client, app = await _mk(_settings())
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        assert req["method"] == "read_text"
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "path": "notes-gbk.txt", "size": 1234, "start_line": 1, "end_line": 0,
+            "total_lines": -1, "eof": False, "text": "", "not_text": "not_utf8",
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        r = await client.post("/mcp/localoctop/", headers=headers, json={
+            "jsonrpc": "2.0", "id": 14, "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "notes-gbk.txt"}},
+        })
+        await task
+        body = r.json()
+        assert "error" not in body
+        assert body["result"]["isError"] is False
+        text = body["result"]["content"][0]["text"]
+        assert "notes-gbk.txt" in text and "UTF-8" in text
+        assert "fetch_to_cloud" in text
+
+
+@pytest.mark.asyncio
+async def test_read_file_default_window_is_100_lines():
+    """max_lines defaults to 100, matching the platform's own read tool."""
+    client, app = await _mk(_settings())
+    registry = app.state.registry
+    ws = FakeWebSocket()
+    await registry.register(make_session("alice", ws, pair_id=_pair(app, "alice")))
+
+    async def responder():
+        for _ in range(50):
+            if ws.outbox:
+                break
+            await asyncio.sleep(0.02)
+        req = ws.outbox[0]
+        assert req["method"] == "read_text"
+        # The adapter forwards arguments as-is; the bridge applies the
+        # default. Assert the adapter does not inject a stale 200 default.
+        assert "max_lines" not in req["params"] or req["params"].get("max_lines") in (None, 100)
+        registry.deliver("alice", req["id"], {"id": req["id"], "result": {
+            "path": "big.txt", "size": 9999, "start_line": 1, "end_line": 100,
+            "total_lines": 500, "eof": False,
+            "text": "".join(f"line {i}\n" for i in range(1, 101)),
+        }})
+
+    async with client:
+        headers = await _handshake(client, "tok-alice")
+        task = asyncio.create_task(responder())
+        r = await client.post("/mcp/localoctop/", headers=headers, json={
+            "jsonrpc": "2.0", "id": 15, "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "big.txt"}},
+        })
+        await task
+        body = r.json()
+        assert body["result"]["isError"] is False
+        assert "lines 1-100" in body["result"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio

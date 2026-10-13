@@ -94,20 +94,61 @@ func TestReadTextUTF8NotSplit(t *testing.T) {
 	}
 }
 
-func TestReadTextBinaryRefused(t *testing.T) {
+func TestReadTextBinaryIsNormalResult(t *testing.T) {
 	tl, root := newTestTools(t, false, 0)
 	bin := append([]byte("MZ"), make([]byte, 100)...) // NUL bytes early on
 	must(t, os.WriteFile(filepath.Join(root, "app.exe"), bin, 0o644))
 
-	_, berr := tl.readText(map[string]any{"path": "app.exe"})
-	if berr == nil {
-		t.Fatal("binary file must be refused")
+	res, berr := tl.readText(map[string]any{"path": "app.exe"})
+	if berr != nil {
+		t.Fatalf("a binary file is a normal result, not an error: %v", berr)
 	}
-	if berr.Code != CodeInvalidParams {
-		t.Fatalf("expected CodeInvalidParams, got %d", berr.Code)
+	if res.NotText != "binary" {
+		t.Fatalf("expected not_text=binary, got %q", res.NotText)
 	}
-	if !strings.Contains(berr.Message, "binary") || !strings.Contains(berr.Message, "fetch_to_cloud") {
-		t.Fatalf("refusal must name the file type and the way out: %q", berr.Message)
+	if res.Text != "" {
+		t.Fatalf("a not-text result carries no body, got %d bytes", len(res.Text))
+	}
+	if res.Path != "app.exe" || res.Size != int64(len(bin)) {
+		t.Fatalf("path/size must still be reported: %+v", res)
+	}
+}
+
+func TestReadTextNonUTF8IsNormalResult(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	// GBK-encoded Chinese text is not valid UTF-8.
+	must(t, os.WriteFile(filepath.Join(root, "gbk.txt"), []byte{'\xc4', '\xe3', '\xba', '\xc3', '\n'}, 0o644))
+
+	res, berr := tl.readText(map[string]any{"path": "gbk.txt"})
+	if berr != nil {
+		t.Fatalf("a non-UTF-8 file is a normal result, not an error: %v", berr)
+	}
+	if res.NotText != "not_utf8" {
+		t.Fatalf("expected not_text=not_utf8, got %q", res.NotText)
+	}
+	if res.Text != "" {
+		t.Fatalf("a not-text result carries no body, got %d bytes", len(res.Text))
+	}
+}
+
+func TestReadTextDefaultLinesIs100(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	var sb strings.Builder
+	for i := 0; i < 150; i++ {
+		sb.WriteString(sprintf("line %d\n", i+1))
+	}
+	must(t, os.WriteFile(filepath.Join(root, "many.txt"), []byte(sb.String()), 0o644))
+
+	// No max_lines: the official platform read tool defaults to 100 lines.
+	res, berr := tl.readText(map[string]any{"path": "many.txt"})
+	if berr != nil {
+		t.Fatalf("readText failed: %v", berr)
+	}
+	if res.EndLine != 100 || res.StartLine != 1 {
+		t.Fatalf("default window must be 100 lines, got %d-%d", res.StartLine, res.EndLine)
+	}
+	if res.EOF || res.TotalLines != 150 {
+		t.Fatalf("150-line file must not be EOF after 100 lines: %+v", res)
 	}
 }
 

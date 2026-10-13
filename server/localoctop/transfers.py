@@ -72,7 +72,6 @@ from .errors import (
     CODE_INVALID_PARAMS,
     CODE_NOT_ALLOWED,
     CODE_NOT_FOUND,
-    CODE_TOO_LARGE,
 )
 from .tokens import KIND_BRIDGE
 
@@ -80,7 +79,7 @@ logger = logging.getLogger("localoctop.transfers")
 
 CHUNK_BYTES = 4 * 1024 * 1024
 MAX_CHUNK_BYTES = 16 * 1024 * 1024
-DEFAULT_MAX_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+DEFAULT_MAX_TRANSFER_BYTES = 1024 * 1024 * 1024  # 1024 MiB
 # Keep this much disk free after a transfer lands, so one big file cannot
 # fill the volume the rest of the platform lives on.
 DISK_RESERVE_BYTES = 1024 * 1024 * 1024
@@ -449,6 +448,31 @@ class TransferManager:
                 pass
             raise
 
+    def _keep_cloud_edited(self, dirs: _Dirs, name: str) -> str:
+        """Rename `name` (a regular file at the landing position that is NOT
+        the copy we landed last time — the agent edited it, or we have no
+        record of it) to "<stem>.cloud-edited-<YYYYMMDD-HHMMSS><ext>" so a
+        re-fetch never destroys cloud-side work.
+
+        Everything happens relative to the verified dir handle: the rename
+        never follows links (rename of a symlink renames the link itself),
+        and a candidate name that already exists gets a numeric suffix —
+        nothing is ever overwritten. Returns the kept-as name."""
+        stem, dot, ext = name.rpartition(".")
+        if not dot:  # no extension, or a dotfile like ".env"
+            stem, ext = name, ""
+        else:
+            ext = "." + ext
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        base = f"{stem}.cloud-edited-{stamp}"
+        for i in range(0, 1000):
+            cand = f"{base}{'' if i == 0 else f'-{i}'}{ext}"
+            if _stat_name(dirs.fd, cand) is None:
+                os.rename(name, cand, src_dir_fd=dirs.fd, dst_dir_fd=dirs.fd)
+                logger.info("cloud copy of %s was modified; kept as %s", name, cand)
+                return cand
+        raise OSError(f"no free keep-as name for the modified cloud copy of {name!r}")
+
     def _gc(self) -> None:
         now = time.monotonic()
         for tid, t in list(self._transfers.items()):
@@ -467,6 +491,17 @@ class TransferManager:
         self._gc()
         t = Transfer(id=secrets.token_urlsafe(9), ticket=secrets.token_urlsafe(24), **kw)
         self._transfers[t.id] = t
+        return t
+
+    def _advisory(self, user_id: str, pair_id: str, direction: str, local_path: str,
+                  visible: str, size: int, message: str) -> Transfer:
+        """A finished, not-transferred record for a call that hit a limit.
+        Hitting a limit is a normal answer with a way forward, not a failure:
+        tools.py renders it as isError=false (result['advisory'])."""
+        t = self._new(user_id=user_id, pair_id=pair_id, direction=direction,
+                      local_path=local_path, cloud_path=Path(visible or local_path), size=size)
+        t.result = {"advisory": True, "visible": visible}
+        t.finish(False, message)
         return t
 
     def _bridge_params(self, t: Transfer) -> dict[str, Any]:
@@ -560,6 +595,14 @@ class TransferManager:
             rel = str(info.get("path") or local_path)
             comps, visible = self._dest_for(user_id, rel, str(info.get("name") or ""))
 
+            # 2b) Over the transfer limit? A normal answer with the way
+            #     forward, not an error — and the machine is never asked to
+            #     send a single byte.
+            if size > self.max_bytes:
+                return self._advisory(
+                    user_id, pair_id, "up", rel, str(visible), size,
+                    f"file is {size:,} bytes, over the {self.max_bytes:,}-byte transfer limit")
+
             # 3) Already have exactly this version in the cloud? Then do
             #    nothing — but only if the cloud file is still the very copy
             #    we landed: its current size and mtime (nanoseconds) must
@@ -626,10 +669,12 @@ class TransferManager:
                         "started (it would write outside your own folder)")
                 free = shutil.disk_usage(f"/proc/self/fd/{dirs.fd}").free
                 if size + DISK_RESERVE_BYTES > free:
-                    raise BridgeProtocolError(
-                        CODE_TOO_LARGE,
+                    t = self._advisory(
+                        user_id, pair_id, "up", rel, str(visible), size,
                         f"not enough space in the cloud to receive this file ({size:,} bytes needed, "
                         f"{free:,} free, {DISK_RESERVE_BYTES:,} kept in reserve)")
+                    dirs.close()
+                    return t
 
                 t = self._new(user_id=user_id, pair_id=pair_id, direction="up", local_path=rel,
                               cloud_path=Path(str(visible)), size=size, mtime_unix=mtime)
@@ -662,8 +707,10 @@ class TransferManager:
         if size > self.max_bytes:
             os.close(fd)
             dirs.close()
-            raise BridgeProtocolError(
-                CODE_TOO_LARGE, f"file is {size:,} bytes, larger than the {self.max_bytes:,}-byte transfer limit")
+            return self._advisory(
+                user_id, pair_id, "down", local_path or cloud_path.rsplit("/", 1)[-1] or "file",
+                cloud_path, size,
+                f"file is {size:,} bytes, over the {self.max_bytes:,}-byte transfer limit")
         t = self._new(user_id=user_id, pair_id=pair_id, direction="down",
                       local_path=local_path or cloud_path.rsplit("/", 1)[-1] or "file",
                       cloud_path=Path(cloud_path), size=size)
@@ -713,15 +760,38 @@ class TransferManager:
     def describe(self, t: Transfer) -> str:
         """Plain-text status for the model. Short on purpose."""
         what = "local → cloud" if t.direction == "up" else "cloud → local"
+        if t.result.get("advisory"):
+            # A limit was hit: nothing moved, and the text must hand the
+            # model a concrete next step, not a dead end.
+            if t.direction == "up":
+                path_line = f"local_path: {t.local_path}\n"
+                alt = ("What you can do instead: ask the user to split or compress the file on their "
+                       "machine and fetch the smaller part(s), or ask the administrator to raise the "
+                       "transfer limit / free up cloud space.")
+            else:
+                path_line = f"cloud_path: {t.cloud_path}\n"
+                alt = ("What you can do instead: split or compress the file here in the cloud "
+                       "(with your command-line tools) and deliver the smaller part(s), or ask the "
+                       "administrator to raise the transfer limit.")
+            return (f"NOT TRANSFERRED {what}: {t.error}\n"
+                    f"{path_line}"
+                    f"size: {t.size:,} bytes\n"
+                    f"{alt}")
         if t.state == "done" and t.direction == "up":
             fresh = " (cloud copy was already up to date — nothing re-sent)" if t.result.get("fresh") else ""
+            kept = t.result.get("kept_as")
+            kept_line = (f"The previous cloud copy had been modified and was kept as {kept}.\n"
+                         if kept else "")
             return (f"DONE {what}{fresh}\n"
                     f"cloud_path: {self._agent_view(t)}\n"
                     f"local_path: {t.local_path}\n"
                     f"size: {t.size:,} bytes\n"
                     f"sha256: {t.result.get('sha256', '')}\n"
+                    f"{kept_line}"
                     "The file is now on the cloud machine at cloud_path. Work on it there with your own "
-                    "file/shell tools. It is a copy: the user's original stays untouched on their machine.")
+                    "file/shell tools. It is a copy: the user's original stays untouched on their machine.\n"
+                    "If the file is larger than 10 MB, process it with command-line tools (execute): "
+                    "the platform's built-in search skips files over 10 MB.")
         if t.state == "done":
             note = " The previous version was moved to the recycle bin." if t.result.get("replaced") else ""
             return (f"DONE {what}\n"
@@ -897,6 +967,9 @@ class TransferManager:
                     # file gets any name the user could swap.
                     if t.mtime_unix:
                         os.utime(t.file_fd, ns=(t.mtime_unix * 1_000_000_000,) * 2)
+                    # Match the platform's other files (0644), not the 0600
+                    # an anonymous O_TMPFILE starts with.
+                    os.fchmod(t.file_fd, 0o644)
                     # Give the anonymous file a name (a random one), then
                     # move it to the final name — both relative to the
                     # verified landing dir handle, neither following links.
@@ -907,9 +980,30 @@ class TransferManager:
                     st_dst = _stat_name(t.dirs.fd, final)
                     if st_dst is not None and not statmod.S_ISREG(st_dst.st_mode):
                         raise OSError(f"the landing path {final!r} is not a regular file")
+                    kept_as = ""
+                    if st_dst is not None:
+                        # A file already sits at the final name. If it is NOT
+                        # the very copy we landed last time (the agent may
+                        # have edited it), it is somebody's work: rename it
+                        # aside instead of overwriting it. The copy matching
+                        # our index record carries no one else's work and may
+                        # be replaced directly.
+                        idx_prev = self._index_load(t.dirs).get(f"{t.pair_id}|{t.local_path}")
+                        ours = (idx_prev is not None
+                                and st_dst.st_size == idx_prev.get("landed_size")
+                                and st_dst.st_mtime_ns == idx_prev.get("landed_mtime_ns"))
+                        if not ours:
+                            kept_as = self._keep_cloud_edited(t.dirs, final)
                     os.rename(t.link_name, final, src_dir_fd=t.dirs.fd, dst_dir_fd=t.dirs.fd)
                     t.link_name = ""
                     st_final = os.stat(final, dir_fd=t.dirs.fd, follow_symlinks=False)
+                    if kept_as:
+                        # The agent-visible path of the kept copy: the
+                        # transfer's visible path with the final component
+                        # swapped for the kept-as name.
+                        vis = str(t.result.get("visible") or "")
+                        base = vis.rsplit("/", 1)[0] if "/" in vis else ""
+                        t.result["kept_as"] = f"{base}/{kept_as}" if base else f"/{kept_as}"
                 except OSError as exc:
                     self._abort(t, f"could not put the file in place in the cloud: {exc}")
                     return {"state": t.state}

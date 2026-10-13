@@ -614,8 +614,174 @@ class TestFreshCheck:
         assert t2.state == "done" and not t2.result.get("fresh")
 
 
-# ------------------------------------------------------------ housekeeping
+# ------------------------------------------------------------ limits (LOX-002 round 3)
 
+class TestTransferLimits:
+    async def test_upload_over_limit_is_advisory_not_sent(self, users_dir, mgr, monkeypatch):
+        """A file over the transfer limit is a normal (isError=false) answer
+        that names the size and the limit; the bridge is only asked for a
+        stat, never to send bytes, and nothing appears in the cloud."""
+        monkeypatch.setenv("LOCALOCTOP_MAX_TRANSFER_BYTES", "100")
+        # Rebuild the manager so the env var is picked up.
+        mgr = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        _mk_user(users_dir, "alice")
+        reg = FakeRegistry({"big.bin": (b"x" * 500, 1000)})
+        mgr.registry = reg
+        t = await mgr.start_upload("alice", "pair-1", "big.bin")
+        assert t.state == "failed" and t.result.get("advisory") is True
+        text = mgr.describe(t)
+        assert "NOT TRANSFERRED" in text
+        assert "500" in text and "100" in text  # file size and the limit
+        assert "split or compress" in text
+        # Only the stat_only probe reached the bridge; no upload start.
+        assert len(reg.calls) == 1 and reg.calls[0][1].get("stat_only") is True
+        landing = users_dir / "alice" / "localoctop"
+        assert not landing.exists() or list(landing.iterdir()) == []
+
+    async def test_upload_over_default_1024mib_limit(self, users_dir, monkeypatch):
+        """The default limit is 1024 MiB (was 2 GiB)."""
+        monkeypatch.delenv("LOCALOCTOP_MAX_TRANSFER_BYTES", raising=False)
+        mgr = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        assert mgr.max_bytes == 1024 * 1024 * 1024
+
+    async def test_cloud_disk_shortage_is_advisory(self, users_dir, mgr, monkeypatch):
+        """Not enough free space in the cloud -> normal advisory, no bytes
+        requested, nothing landed."""
+        import localoctop.transfers as tr
+        monkeypatch.setattr(tr, "DISK_RESERVE_BYTES", 1 << 62)  # absurd reserve forces the branch
+        _mk_user(users_dir, "alice")
+        reg = FakeRegistry({"f.bin": (b"data", 1000)})
+        mgr.registry = reg
+        t = await mgr.start_upload("alice", "pair-1", "f.bin")
+        assert t.state == "failed" and t.result.get("advisory") is True
+        text = mgr.describe(t)
+        assert "NOT TRANSFERRED" in text and "not enough space" in text
+        assert len(reg.calls) == 1  # stat only
+        landing = users_dir / "alice" / "localoctop"
+        assert not [p for p in landing.iterdir() if p.name == "f.bin"]
+
+    async def test_download_over_limit_is_advisory(self, users_dir, mgr, monkeypatch):
+        monkeypatch.setenv("LOCALOCTOP_MAX_TRANSFER_BYTES", "10")
+        mgr = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        home = _mk_user(users_dir, "alice")
+        (home / "big.dat").write_bytes(b"x" * 100)
+        t = await mgr.start_download("alice", "pair-1", "/big.dat", "", False)
+        assert t.state == "failed" and t.result.get("advisory") is True
+        text = mgr.describe(t)
+        assert "NOT TRANSFERRED" in text and "100" in text and "10" in text
+
+    async def test_fetch_tool_renders_advisory_as_not_error(self, users_dir, mgr, monkeypatch):
+        """End-to-end at the tools layer: isError is False for an advisory."""
+        import time as _time
+        from localoctop.tools import ToolService
+        monkeypatch.setenv("LOCALOCTOP_MAX_TRANSFER_BYTES", "100")
+        store = make_token_store()
+
+        class S:
+            bridge_timeout = 2.0
+
+            def __init__(self):
+                self.token_store = store
+
+        reg = FakeRegistry({"big.bin": (b"x" * 500, 1000)})
+        tm = TransferManager(S(), reg, "/mcp/localoctop/transfer")
+        _mk_user(users_dir, "alice")
+        svc = ToolService(S(), None, None)
+        svc.transfers = tm
+
+        class _Audit:
+            async def record(self, **kw):
+                pass
+        svc.audit = _Audit()
+        res = await svc._transfer_tool("alice", "pair-1", "fetch_to_cloud", {"path": "big.bin"},
+                                       "big.bin", _time.monotonic(), "")
+        assert res["isError"] is False
+        text = res["content"][0]["text"]
+        assert "NOT TRANSFERRED" in text and "500" in text
+
+
+# ------------------------------------------------- cloud-edited keep-aside
+
+class TestCloudEditedKept:
+    async def test_edited_cloud_copy_kept_aside(self, users_dir, mgr):
+        """The agent edited the landed cloud copy; re-fetching must rename
+        the edited file aside (never overwrite it) and land the new version
+        under the real name."""
+        _mk_user(users_dir, "alice")
+        reg = FakeRegistry({"doc.txt": (b"v1", 1000)})
+        mgr.registry = reg
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1")
+            assert t1.state == "done"
+            dest = users_dir / "alice" / "localoctop" / "doc.txt"
+            # The cloud AI edits the copy.
+            dest.write_bytes(b"cloud-edited-content")
+            # The local file also moved on -> a real second transfer.
+            reg.files["doc.txt"] = (b"v2", 2000)
+            t2, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v2")
+        assert t2.state == "done"
+        # The edited copy survives under a .cloud-edited- name with its content.
+        kept = [p for p in dest.parent.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1
+        assert kept[0].name.startswith("doc.cloud-edited-") and kept[0].name.endswith(".txt")
+        assert kept[0].read_bytes() == b"cloud-edited-content"
+        # The real name now holds the new version.
+        assert dest.read_bytes() == b"v2"
+        # The success text mentions the kept-as name (agent view).
+        assert "kept as" in mgr.describe(t2)
+        assert ".cloud-edited-" in mgr.describe(t2)
+
+    async def test_untouched_cloud_copy_replaced_without_keep(self, users_dir, mgr):
+        """The cloud copy is exactly what we landed last time and the local
+        file changed: a plain replace, no .cloud-edited- file appears."""
+        _mk_user(users_dir, "alice")
+        reg = FakeRegistry({"doc.txt": (b"v1", 1000)})
+        mgr.registry = reg
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1")
+            assert t1.state == "done"
+            reg.files["doc.txt"] = (b"v2", 2000)
+            t2, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v2")
+        assert t2.state == "done"
+        landing = users_dir / "alice" / "localoctop"
+        assert not [p for p in landing.iterdir() if ".cloud-edited-" in p.name]
+        assert (landing / "doc.txt").read_bytes() == b"v2"
+        assert "kept as" not in mgr.describe(t2)
+
+    async def test_unknown_cloud_file_kept_aside(self, users_dir, mgr):
+        """A file at the landing name that the index has no record of (the
+        agent created it) is somebody's work too: kept aside, not overwritten."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir()
+        (landing / "doc.txt").write_bytes(b"agent-made")
+        reg = FakeRegistry({"doc.txt": (b"fresh", 1000)})
+        mgr.registry = reg
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"fresh")
+        assert t.state == "done"
+        kept = [p for p in landing.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1 and kept[0].read_bytes() == b"agent-made"
+        assert (landing / "doc.txt").read_bytes() == b"fresh"
+
+
+# ------------------------------------------------------------ permissions
+
+class TestLandedFilePermissions:
+    async def test_landed_file_is_0644_index_stays_0600(self, users_dir, mgr):
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.txt": (b"hello", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "f.txt", b"hello")
+        assert t.state == "done"
+        import stat as statmod
+        dest = users_dir / "alice" / "localoctop" / "f.txt"
+        assert statmod.S_IMODE(dest.stat().st_mode) == 0o644
+        idx = users_dir / "alice" / "localoctop" / ".localoctop-index.json"
+        assert statmod.S_IMODE(idx.stat().st_mode) == 0o600
+
+
+# ------------------------------------------------------------ housekeeping
 class TestHousekeeping:
     def test_orphan_link_files_swept_per_user(self, users_dir, monkeypatch):
         for name in ("alice", "bob"):

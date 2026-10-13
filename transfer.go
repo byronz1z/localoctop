@@ -41,7 +41,7 @@ const (
 	// A download stream with no bytes for this long is treated as dead.
 	transferIdleTimeout = 120 * time.Second
 
-	defaultTextLines = 200
+	defaultTextLines = 100
 	maxTextLines     = 2000
 	maxTextBytes     = 48 << 10 // hard cap on text returned to the model per call
 	maxTextLineBytes = 2000     // one very long line must not eat the whole budget
@@ -74,7 +74,8 @@ type ReadTextResult struct {
 	TotalLines int    `json:"total_lines"` // -1 when the file is too big to count cheaply
 	EOF        bool   `json:"eof"`
 	Text       string `json:"text"`
-	Clipped    int    `json:"clipped_lines"` // lines cut at maxTextLineBytes
+	Clipped    int    `json:"clipped_lines"`       // lines cut at maxTextLineBytes
+	NotText    string `json:"not_text,omitempty"` // "binary" | "not_utf8": not readable text, no body delivered
 }
 
 type transferJob struct {
@@ -556,9 +557,11 @@ func (t *tools) readText(params map[string]any) (*ReadTextResult, *BridgeError) 
 	head := make([]byte, 8192)
 	hn, _ := io.ReadFull(f, head)
 	if hasBinaryMarker(head[:hn]) {
-		return nil, errInvalidParams(sprintf(
-			"%s is a binary file (%d bytes) and cannot be read as text; use fetch_to_cloud to send it to the cloud workspace and process it there",
-			relDisplay(t.cfg.AllowedDirs, abs), st.Size()))
+		// Not an error: a normal result that says "not readable text" and
+		// carries no body — the adapter renders the fetch_to_cloud way out.
+		return &ReadTextResult{Path: relDisplay(t.cfg.AllowedDirs, abs),
+			Size: st.Size(), StartLine: startLine, TotalLines: -1,
+			NotText: "binary"}, nil
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, errInternal("seek failed", err)
@@ -578,7 +581,9 @@ func (t *tools) readText(params map[string]any) (*ReadTextResult, *BridgeError) 
 			line++
 			if line >= startLine {
 				if !utf8.Valid(s) {
-					return nil, errInvalidParams("file is not UTF-8 text; use fetch_to_cloud and process it in the cloud workspace")
+					return &ReadTextResult{Path: relDisplay(t.cfg.AllowedDirs, abs),
+						Size: st.Size(), StartLine: startLine, TotalLines: -1,
+						NotText: "not_utf8"}, nil
 				}
 				if taken >= maxLines || sb.Len()+len(s) > maxTextBytes {
 					stopped = true // this line was read but not delivered

@@ -64,20 +64,23 @@ logger = logging.getLogger("localoctop.tools")
 # apply on the client (MaxReadBytes/MaxMediaBytes), this is the outer bound.
 SERVER_MAX_RESULT_BYTES = 48 * 1024 * 1024
 
-# 任务书 v1.1 §七 timeout budget: the adapter's overall response to one
-# tools/call must land within 20s. The bridge round-trip itself is capped at
-# settings.bridge_timeout (≤18s); this outer bound also covers validation,
-# rendering and audit overhead, so the connector never waits past the budget.
-ADAPTER_RESPONSE_BUDGET = 20.0
+# Timeout budget: the platform's MCP client times out a single request at
+# 30s (langchain-mcp-adapters default), so the adapter's overall response to
+# one tools/call must land well within that. The bridge round-trip itself is
+# capped at settings.bridge_timeout (≤18s); this outer bound also covers
+# validation, rendering and audit overhead, so the connector never waits
+# past the budget.
+ADAPTER_RESPONSE_BUDGET = 25.0
 
 # Experiment branch. Everything a tool returns is fed to the model verbatim,
 # so the ceiling that matters is the model's context, not the network frame.
-# 64 KiB of text is roughly 15-25K tokens. Anything larger is replaced by a
-# short instruction on how to narrow the request.
+# 64 KiB of text is roughly 15-25K tokens. Anything larger is cut on a line
+# boundary with a note on how to narrow the request.
 MODEL_RESULT_CAP_BYTES = int(os.environ.get("LOCALOCTOP_MODEL_RESULT_CAP", 64 * 1024))
 # How long one fetch/deliver/status call waits for the transfer before
-# answering "IN PROGRESS" — must stay well inside ADAPTER_RESPONSE_BUDGET.
-TRANSFER_WAIT_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_WAIT", 12))
+# answering "IN PROGRESS" — the platform MCP client times out one request at
+# 30s, so this keeps a 10s margin inside it (and inside the response budget).
+TRANSFER_WAIT_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_WAIT", 20))
 TRANSFER_TOOLS = (M_FETCH_TO_CLOUD, M_DELIVER_TO_LOCAL, M_TRANSFER_STATUS)
 
 
@@ -234,24 +237,57 @@ class ToolService:
         text = tm.describe(t)
         await self._audit(user_id, name, req_path or t.local_path, "error" if t.state == "failed" else "allow",
                           0, f"{t.direction} {t.state} {t.received}/{t.size}", started, client_id)
-        return {"content": [{"type": "text", "text": text}], "isError": t.state == "failed"}
+        # A limit advisory is a normal answer with a way forward, not an error.
+        is_err = t.state == "failed" and not t.result.get("advisory")
+        return {"content": [{"type": "text", "text": text}], "isError": is_err}
 
     def _cap(self, name: str, rendered: dict[str, Any]) -> dict[str, Any]:
         """Last line of defence: no tool result larger than the model can
-        reasonably take, and no embedded binary, whatever the bridge sent."""
+        reasonably take, and no embedded binary, whatever the bridge sent.
+        Hitting a limit is NOT an error: the answer is a normal result that
+        keeps what fits and explains the way forward."""
         total = 0
         for block in rendered.get("content", []):
             if block.get("type") != "text":
-                return self._error_result(
+                return {"content": [{"type": "text", "text": (
                     f"{name} produced binary content, which cannot be shown in the conversation. "
-                    "Use fetch_to_cloud to copy the file to the cloud machine and process it there.")
+                    "Use fetch_to_cloud to copy the file to the cloud machine and process it there "
+                    "with your own file and command-line tools.")}], "isError": False}
             total += len(str(block.get("text", "")).encode("utf-8", "replace"))
         if total <= MODEL_RESULT_CAP_BYTES:
             return rendered
-        return self._error_result(
-            f"{name} matched too much to show ({total:,} bytes; the limit is {MODEL_RESULT_CAP_BYTES:,}). "
-            "Nothing was returned. Narrow the request: point at a sub-directory, lower depth/limit, "
-            "use a more specific pattern or add excludePatterns.")
+        # Keep the head that fits: cut on a character boundary (never half a
+        # multi-byte character) and then on a line boundary, with a closing
+        # note saying how much was dropped and how to narrow the request.
+        budget = MODEL_RESULT_CAP_BYTES - 512
+        out_blocks: list[dict[str, Any]] = []
+        kept = 0
+        for block in rendered.get("content", []):
+            text = str(block.get("text", ""))
+            data = text.encode("utf-8", "replace")
+            if kept + len(data) > budget:
+                take = max(budget - kept, 0)
+                part = data[:take].decode("utf-8", "ignore")
+                # Drop the last, possibly partial line so nothing shown is cut mid-line.
+                nl = part.rfind("\n")
+                if nl >= 0:
+                    part = part[:nl]
+                else:
+                    part = ""
+                if part:
+                    out_blocks.append({"type": "text", "text": part})
+                    kept += len(part.encode("utf-8"))
+                break
+            out_blocks.append(block)
+            kept += len(data)
+        if not out_blocks:
+            out_blocks.append({"type": "text", "text": ""})
+        note = (f"[result too large to show in full: {total:,} bytes, only the first part above is shown. "
+                "Narrow the request: point at a sub-directory, lower depth/limit, use a more specific "
+                "pattern or add excludePatterns — or use fetch_to_cloud to copy the file to the cloud "
+                "machine and process it there.]")
+        out_blocks.append({"type": "text", "text": note})
+        return {"content": out_blocks, "isError": False}
 
     # --- rendering ---------------------------------------------------------
 
@@ -436,7 +472,22 @@ class ToolService:
         return {"content": [{"type": "text", "text": text}], "isError": False}
 
     def _render_read(self, result: dict[str, Any]) -> dict[str, Any]:
-        """read_file: a window of whole lines plus an explicit 'what next'."""
+        """read_file: a window of whole lines plus an explicit 'what next'.
+        A file that is not readable text is a normal answer with the way
+        forward (fetch_to_cloud), never an error."""
+        not_text = result.get("not_text")
+        if not_text:
+            path = str(result.get("path", ""))
+            size = int(result.get("size", 0))
+            if not_text == "binary":
+                why = "it is a binary file (it contains NUL bytes, like a PDF, image, Office document or archive)"
+            else:
+                why = "its content is not valid UTF-8 text (a different character encoding)"
+            text = (f"== {path} ({size:,} bytes): cannot be shown as text — {why}. ==\n"
+                    f"Nothing was read. Next step: call fetch_to_cloud with path={path!r} to copy the "
+                    "file to the cloud machine, then process it there with your own file and "
+                    "command-line tools (execute).")
+            return {"content": [{"type": "text", "text": text}], "isError": False}
         text = result.get("text", "")
         if not isinstance(text, str):
             raise BridgeProtocolError(CODE_INTERNAL, "bad text field from bridge")
