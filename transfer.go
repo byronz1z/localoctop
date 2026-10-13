@@ -350,7 +350,10 @@ func (b *Bridge) transferDownload(params map[string]any) (*TransferAccept, *Brid
 
 func (b *Bridge) runDownload(job transferJob, abs string, size int64, wantSHA string, overwrite bool) {
 	start := time.Now()
-	part := abs + ".localoctop-part"
+	// The temp name is unique per transfer and created O_EXCL: two downloads
+	// landing in the same folder never share one temp file, and a file that
+	// happens to sit at a candidate name is never opened or clobbered.
+	part := sprintf("%s.localoctop-part-%s", abs, job.id)
 	fail := func(msg string) {
 		os.Remove(part)
 		b.log.Warnf("transfer %s download failed: %s", job.id, msg)
@@ -358,7 +361,7 @@ func (b *Bridge) runDownload(job transferJob, abs string, size int64, wantSHA st
 		b.audit.Record(AuditEvent{Method: MethodTransferDownload, Path: relDisplay(b.cfg.AllowedDirs, abs),
 			Decision: "error", Code: CodeInternal, Detail: msg, Duration: time.Since(start).String(), ClientID: b.clientID})
 	}
-	out, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644) // #nosec G304,G302 - validated path
+	out, err := os.OpenFile(part, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644) // #nosec G304,G302 - validated path
 	if err != nil {
 		fail("cannot create file in the destination folder: " + err.Error())
 		return
@@ -402,23 +405,29 @@ func (b *Bridge) runDownload(job transferJob, abs string, size int64, wantSHA st
 	}
 	final := abs
 	replaced := false
-	if _, err := os.Stat(final); err == nil {
-		if overwrite {
-			// Keep the old version recoverable: recycle bin when the platform
-			// has one, otherwise a timestamped sibling.
-			if ok, terr := trashPath(final); terr != nil || !ok {
-				bak := final + time.Now().Format(".bak-20060102-150405")
-				if rerr := os.Rename(final, bak); rerr != nil {
-					fail("could not set aside the existing file: " + rerr.Error())
-					return
-				}
+	if _, err := os.Stat(final); err == nil && overwrite {
+		// Keep the old version recoverable: recycle bin when the platform
+		// has one, otherwise a timestamped sibling.
+		if ok, terr := trashPath(final); terr != nil || !ok {
+			bak := final + time.Now().Format(".bak-20060102-150405")
+			if rerr := os.Rename(final, bak); rerr != nil {
+				fail("could not set aside the existing file: " + rerr.Error())
+				return
 			}
-			replaced = true
-		} else {
-			final = freeName(final)
 		}
+		replaced = true
 	}
-	if err := os.Rename(part, final); err != nil {
+	if !replaced {
+		// Claim a free name atomically (link the temp file to the candidate
+		// name, O_EXCL-style): no check-then-rename race, so two deliveries
+		// aiming at the same path each get their own intact file.
+		claimed, err := claimFreeName(part, final)
+		if err != nil {
+			fail("could not put the file in place: " + err.Error())
+			return
+		}
+		final = claimed
+	} else if err := os.Rename(part, final); err != nil {
 		fail("could not put the file in place: " + err.Error())
 		return
 	}
@@ -472,18 +481,42 @@ func (b *Bridge) getRange(job transferJob, offset int64, w io.Writer) (int64, er
 	}
 }
 
-// freeName returns "name (1).ext", "name (2).ext", ... — the first that does
-// not exist, so a delivery never overwrites the user's file by accident.
-func freeName(p string) string {
-	ext := filepath.Ext(p)
-	stem := strings.TrimSuffix(p, ext)
+// claimFreeName puts `part` in place at the first free candidate among
+// "name.ext", "name (1).ext", "name (2).ext", ... and returns the claimed
+// path. Claiming is atomic — os.Link fails with EEXIST when the name is
+// taken — so two concurrent deliveries for the same target each end up with
+// their own intact file instead of racing one rename. After a successful
+// claim the temp path is unlinked (the data keeps living under the claimed
+// name; a stray unlink failure only leaves a hard-linked duplicate, which
+// is removed best effort).
+func claimFreeName(part, target string) (string, error) {
+	ext := filepath.Ext(target)
+	stem := strings.TrimSuffix(target, ext)
+	candidates := make([]string, 0, 1001)
+	candidates = append(candidates, target)
 	for i := 1; i < 1000; i++ {
-		cand := sprintf("%s (%d)%s", stem, i, ext)
-		if _, err := os.Stat(cand); os.IsNotExist(err) {
-			return cand
-		}
+		candidates = append(candidates, sprintf("%s (%d)%s", stem, i, ext))
 	}
-	return stem + time.Now().Format(" 20060102-150405") + ext
+	candidates = append(candidates, stem+time.Now().Format(" 20060102-150405")+ext)
+	var lastErr error
+	for _, cand := range candidates {
+		err := os.Link(part, cand)
+		if err == nil {
+			// The data now lives under the claimed name; dropping the temp
+			// alias is best effort (a leftover alias is only a duplicate
+			// name for the same bytes, never data loss).
+			os.Remove(part)
+			return cand, nil
+		}
+		if os.IsExist(err) {
+			continue
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("no free name for %q", target)
 }
 
 // ---- read_text: bounded, line-based text reading ----

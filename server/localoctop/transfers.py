@@ -27,6 +27,25 @@ and the agent sees them as "/{LOCALOCTOP_LANDING_SUBDIR}/<rel>". Downloads
 can only read paths inside the user's own folder — the folder of the token
 owner, nobody else's. The user folder must already exist (it belongs to the
 Octop platform); this module never creates it.
+
+Threat model (why every path operation goes through a dir_fd): the user's
+own AI can create, delete, rename and symlink anything inside its folder at
+any moment, including between our checks and our writes. A path we verified
+a millisecond ago can point somewhere else now. So every path operation this
+module performs inside a user folder is anchored to directory handles that
+were opened without following links (os.open with O_DIRECTORY | O_NOFOLLOW,
+one component at a time from the user root), and every create / read /
+rename / unlink happens relative to such a handle (dir_fd=…). Once we hold
+the handle of the landing directory, swapping names around it cannot move
+our reads or writes anywhere else.
+
+Upload temp files are anonymous (O_TMPFILE): they have no name at all, so
+nothing the user does to their folder can touch them. On completion the fd
+is materialized to a random name via a /proc/self/fd linkat and then renamed
+to the final name relative to the verified directory handle. Orphans of the
+materialize step keep the pattern ".localoctop-link-<id>" and are swept at
+startup; the sweep also goes through dir_fd walking, so a user folder that
+was replaced by a symlink is skipped instead of followed.
 """
 
 from __future__ import annotations
@@ -39,6 +58,7 @@ import os
 import re
 import secrets
 import shutil
+import stat as statmod
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -70,16 +90,33 @@ STALL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_STALL_SECONDS", 420))
 # Finished transfer records are kept this long for transfer_status lookups.
 RECORD_TTL_SECONDS = 3600.0
 
+_INDEX_NAME = ".localoctop-index.json"
+_INDEX_TMP_PREFIX = ".localoctop-index.json.tmp-"
+# Materialized-but-not-yet-renamed upload files (see module docstring).
+_LINK_PREFIX = ".localoctop-link-"
+
 # A user name (== the token's user_id == the Octop folder name) must not
 # contain anything that could break the one-folder-per-user confinement.
-_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+# Includes C0, DEL and the C1 block (U+0080-U+009F).
+_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+_O_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_dir(parent_fd: int, name: str) -> int:
+    """Open one directory component relative to a parent handle without
+    following links. A symlink (or anything that is not a directory) raises
+    NotADirectoryError; a missing name raises FileNotFoundError."""
+    return os.open(name, _O_DIR_FLAGS, dir_fd=parent_fd)
 
 
 def _check_user_name(user_id: str) -> str:
     """Validate that user_id is safe to use as a folder name, verbatim.
 
     Allowed: any non-blank name without path separators, control characters,
-    or "." / ".." — Chinese names such as '马威' are fine and kept as-is.
+    or a leading "." (which would collide with hidden directories such as
+    the per-user index) — Chinese names such as '马威' are fine and kept
+    as-is.
     """
     if not user_id or not user_id.strip():
         raise BridgeProtocolError(
@@ -91,6 +128,11 @@ def _check_user_name(user_id: str) -> str:
             CODE_INVALID_PARAMS,
             f"the token's user name {user_id!r} is not a valid folder name "
             "(it would escape the per-user folder)")
+    if user_id.startswith("."):
+        raise BridgeProtocolError(
+            CODE_INVALID_PARAMS,
+            f"the token's user name {user_id!r} starts with a dot; "
+            "a user name must not look like a hidden directory")
     if "/" in user_id or "\\" in user_id:
         raise BridgeProtocolError(
             CODE_INVALID_PARAMS,
@@ -104,6 +146,118 @@ def _check_user_name(user_id: str) -> str:
     return user_id
 
 
+def _stat_name(dir_fd: int, name: str) -> os.stat_result | None:
+    """lstat of one name relative to a dir handle; None when absent."""
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return None
+
+
+class _NotAFolder(Exception):
+    """A path component that must be a directory is a symlink or file."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.name = name
+
+    def refuse(self) -> BridgeProtocolError:
+        # A symlink (or a file) sits where a directory must be: following it
+        # could land outside the user's folder.
+        return BridgeProtocolError(
+            CODE_NOT_ALLOWED,
+            f"the landing path {self.name!r} is a link or not a folder; "
+            "the transfer was not started (it could point outside "
+            "your own folder). Remove it and try again.")
+
+
+class _Dirs:
+    """A chain of verified directory handles for one user.
+
+    `_Dirs(root_fd, comps)` opens each component of comps below root_fd with
+    O_NOFOLLOW; `enter(name, create=…)` descends one more verified component
+    as a new chain that shares the parent's fds. Once a handle is open it
+    keeps naming the directory it was opened on — nothing the user swaps in
+    their folder afterwards can redirect our operations.
+    """
+
+    def __init__(self, root_fd: int, comps: list[str], create: bool = False):
+        self._fds = [root_fd]
+        self.path: list[str] = []
+        try:
+            self._open(comps, create)
+        except BaseException:
+            # Construction failed: close only the fds this chain opened
+            # itself; root_fd stays with the caller, which owns it.
+            for fd in self._fds[1:]:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._fds = []
+            raise
+
+    @classmethod
+    def _child(cls, parent: _Dirs, name: str, create: bool) -> _Dirs:
+        child = cls.__new__(cls)
+        child._fds = list(parent._fds)
+        child.path = parent.path + [name]
+        try:
+            child._open([name], create)
+        except BaseException:
+            # Only the fd this level added is ours to close; the shared
+            # parent fds stay with the parent chain.
+            for fd in child._fds[len(parent._fds):]:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            child._fds = []
+            raise
+        return child
+
+    def _open(self, names: list[str], create: bool) -> None:
+        for name in names:
+            try:
+                fd = _open_dir(self._fds[-1], name)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(name, 0o700, dir_fd=self._fds[-1])
+                fd = _open_dir(self._fds[-1], name)
+            except NotADirectoryError:
+                raise _NotAFolder(name) from None
+            self._fds.append(fd)
+            self.path.append(name)
+
+    def enter(self, name: str, create: bool = False) -> _Dirs:
+        """A chain one directory deeper (shares the parent's fds; close only
+        the deepest chain you keep)."""
+        return _Dirs._child(self, name, create)
+
+    @property
+    def fd(self) -> int:
+        return self._fds[-1]
+
+    def close(self) -> None:
+        for fd in self._fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds = []
+
+
+def _link_tmp_name(tid: str) -> str:
+    return f"{_LINK_PREFIX}{tid}"
+
+
+def _index_tmp_name() -> str:
+    # Unpredictable per write: the user cannot pre-place a link at the name,
+    # and O_EXCL would refuse to use it anyway.
+    return f"{_INDEX_TMP_PREFIX}{secrets.token_urlsafe(12)}"
+
+
 @dataclass
 class Transfer:
     id: str
@@ -115,7 +269,6 @@ class Transfer:
     cloud_path: Path
     size: int = 0
     mtime_unix: int = 0
-    part_path: Path | None = None
     received: int = 0         # up: bytes acknowledged; down: highest byte served
     inflight: int = 0         # up: bytes of the chunk currently arriving (not yet applied)
     sha: Any = None
@@ -128,6 +281,9 @@ class Transfer:
     finished: float = 0.0
     done: asyncio.Event = field(default_factory=asyncio.Event)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    dirs: _Dirs | None = None       # verified dir handles of the landing folder
+    file_fd: int = -1               # up: anonymous temp fd; down: verified source fd
+    link_name: str = ""             # up: materialized name before the final rename
 
     def touch(self) -> None:
         self.updated = time.monotonic()
@@ -138,6 +294,24 @@ class Transfer:
         self.state = "done" if ok else "failed"
         self.error = error
         self.finished = time.monotonic()
+        # Anonymous temp data dies with its fd; a materialized name is
+        # removed before the chain closes. Handles are never left behind.
+        link, dirs = self.link_name, self.dirs
+        self.link_name = ""
+        if link and dirs is not None:
+            try:
+                os.unlink(link, dir_fd=dirs.fd)
+            except OSError:
+                pass
+        if self.file_fd >= 0:
+            try:
+                os.close(self.file_fd)
+            except OSError:
+                pass
+            self.file_fd = -1
+        if dirs is not None:
+            dirs.close()
+            self.dirs = None
         self.done.set()
 
 
@@ -158,68 +332,76 @@ class TransferManager:
         self._sweep_stale_parts()
 
     def _sweep_stale_parts(self) -> None:
-        """Transfers live in memory, so after a restart every half-received
-        '.part-<id>' file is an orphan nobody will finish. Remove them, or
-        each interrupted transfer would leak its size in disk space. Sweep
-        every existing user's landing sub-folder."""
+        """Transfers live in memory, so after a restart the materialized
+        '.localoctop-link-<id>' files of interrupted uploads are orphans
+        nobody will finish (anonymous O_TMPFILE data needs no cleanup — it
+        died with its fd). Remove the orphans, or each interrupted transfer
+        would leak its size in disk space. Every step goes through a
+        dir_fd walk, so a user folder (or landing folder) that is a symlink
+        is skipped, never followed into someone else's directory."""
         try:
-            users = list(self.users_dir.iterdir())
+            top_fd = os.open(self.users_dir, _O_DIR_FLAGS)
         except OSError:
             return
-        for u in users:
-            try:
-                parts_dir = u / self.landing_subdir
-                if not parts_dir.is_dir():
-                    continue
-                for p in parts_dir.rglob("*.part-*"):
-                    if p.is_file():
-                        try:
-                            p.unlink()
-                            logger.info("removed orphaned partial file %s", p)
-                        except OSError:
-                            logger.warning("could not remove orphaned partial file %s", p)
-            except OSError:
-                continue
+        try:
+            for name in os.listdir(top_fd):
+                try:
+                    user_fd = _open_dir(top_fd, name)
+                except OSError:
+                    continue  # symlink, file, or unreadable: not ours to touch
+                try:
+                    try:
+                        landing_fd = _open_dir(user_fd, self.landing_subdir)
+                    except OSError:
+                        continue
+                    try:
+                        for entry in os.listdir(landing_fd):
+                            if entry.startswith(_LINK_PREFIX):
+                                try:
+                                    os.unlink(entry, dir_fd=landing_fd)
+                                    logger.info("removed orphaned partial file %s/%s/%s/%s",
+                                                self.users_dir, name, self.landing_subdir, entry)
+                                except OSError:
+                                    logger.warning(
+                                        "could not remove orphaned partial file %s in user folder %s",
+                                        entry, name)
+                    finally:
+                        os.close(landing_fd)
+                finally:
+                    os.close(user_fd)
+        finally:
+            os.close(top_fd)
 
     # ------------------------------------------------------------ helpers
-    def _user_root(self, user_id: str) -> Path:
-        """The real path of the user's Octop folder.
+    def _user_root_fd(self, user_id: str) -> int:
+        """A dir handle to the user's Octop folder, opened without following
+        links (a symlink where the folder should be is refused — following
+        it would smuggle one user's traffic into another's folder).
 
-        The folder must already exist as a real directory (it belongs to the
-        platform) and must not itself be a symlink — otherwise a planted
-        link would smuggle one user's traffic into another's folder. We
-        never create it: an account without a folder simply cannot transfer.
-        """
+        The folder must already exist (it belongs to the platform); we never
+        create it: an account without a folder simply cannot transfer."""
         name = _check_user_name(user_id)
-        root = self.users_dir / name
-        if root.is_symlink():
+        try:
+            return _open_dir(os.open(self.users_dir, _O_DIR_FLAGS), name)
+        except NotADirectoryError:
             raise BridgeProtocolError(
                 CODE_NOT_ALLOWED,
                 f"the folder for user {user_id!r} on the cloud machine is a link, "
                 "not a real folder; refusing to transfer (platform misconfiguration)")
-        if not root.is_dir():
+        except OSError:
             raise BridgeProtocolError(
                 CODE_NOT_FOUND,
                 f"this account has no folder on the cloud machine yet "
                 f"(no Octop user named {user_id!r}); the transfer was not started. "
                 "Create the Octop user first, then try again.")
-        return root.resolve()
 
-    def _inside(self, p: Path, root: Path) -> bool:
-        try:
-            p.relative_to(root)
-            return True
-        except ValueError:
-            return False
+    def _dest_for(self, user_id: str, rel: str, name: str) -> tuple[list[str], PurePosixPath]:
+        """Cloud landing location for a local file (stable per local path).
 
-    def _dest_for(self, user_id: str, rel: str, name: str) -> tuple[Path, PurePosixPath]:
-        """Cloud landing path for a local file (stable per local path).
-
-        Returns (absolute path on disk, path the agent sees). The parent
-        directory chain is created only after each step is proven to stay
-        inside the user's folder, so a symlink planted by the agent cannot
-        steer the write into someone else's folder."""
-        root = self._user_root(user_id)
+        Returns (components below the user root, path the agent sees). No
+        disk access happens here — components are opened through _Dirs when
+        the transfer actually starts."""
+        _check_user_name(user_id)
         rel = rel.replace("\\", "/")
         parts = [p for p in PurePosixPath(rel).parts if p not in ("", ".", "..", "/")]
         # An absolute local path (file outside every whitelist root should
@@ -228,56 +410,44 @@ class TransferManager:
             parts = [name or "file"]
         clean = [re.sub(r'[<>:"|?*\x00-\x1f]', "_", p) for p in parts]
         visible = PurePosixPath("/") / self.landing_subdir / PurePosixPath(*clean)
-        dest = root.joinpath(self.landing_subdir, *clean)
-        self._check_path_chain(dest, root)
-        return dest, visible
+        return [self.landing_subdir, *clean], visible
 
-    def _check_path_chain(self, dest: Path, root: Path) -> None:
-        """Write-side symlink defence: walk from the user's real folder down
-        to `dest`; every component that already exists (including a dangling
-        symlink, which Path.exists() would miss) must resolve to a place
-        still inside the user's folder. A planted link pointing at another
-        user's folder fails the check and nothing is written or created."""
-        rel = dest.relative_to(root)
-        probe = root
-        for part in rel.parts:
-            probe = probe / part
-            if probe.is_symlink() or probe.exists():
-                if not self._inside(probe.resolve(), root):
-                    raise BridgeProtocolError(
-                        CODE_NOT_ALLOWED,
-                        f"the landing path contains a link that points outside your own "
-                        f"folder ({part!r}); the transfer was not started. Remove the "
-                        "link and try again.")
-
-    def _ensure_parent(self, dest: Path, root: Path) -> Path:
-        """Create dest's parent directories, then prove the real location of
-        the parent is still inside the user's folder (nothing was written
-        through a planted link)."""
-        parent = dest.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        real_parent = parent.resolve()
-        if not self._inside(real_parent, root):
-            raise BridgeProtocolError(
-                CODE_NOT_ALLOWED,
-                "the destination folder resolves outside your own folder via a link; "
-                "the transfer was not started")
-        return real_parent
-
-    def _index_path(self, user_id: str) -> Path:
-        return self._user_root(user_id) / self.landing_subdir / ".localoctop-index.json"
-
-    def _index_load(self, user_id: str) -> dict[str, Any]:
+    def _index_load(self, dirs: _Dirs) -> dict[str, Any]:
+        """Read the per-user index through the verified landing dir handle.
+        An index replaced by a symlink (or anything but a readable regular
+        file) is treated as "no index" — we must never follow it."""
         try:
-            return json.loads(self._index_path(user_id).read_text("utf-8"))
+            fd = os.open(_INDEX_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=dirs.fd)
+        except OSError:
+            return {}
+        try:
+            with os.fdopen(fd, "rb") as f:
+                return json.loads(f.read().decode("utf-8"))
         except (OSError, ValueError):
             return {}
 
-    def _index_save(self, user_id: str, idx: dict[str, Any]) -> None:
-        p = self._index_path(user_id)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(idx, ensure_ascii=False), "utf-8")
-        os.replace(tmp, p)
+    def _index_save(self, dirs: _Dirs, idx: dict[str, Any]) -> None:
+        """Replace the index atomically relative to the verified dir handle.
+        The temp name is random and created O_EXCL: a link the user planted
+        at the index's name is swapped away by the rename, never written
+        through (rename never follows a symlink at the destination)."""
+        data = json.dumps(idx, ensure_ascii=False).encode("utf-8")
+        tmp = _index_tmp_name()
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=dirs.fd)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp, _INDEX_NAME, src_dir_fd=dirs.fd, dst_dir_fd=dirs.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dirs.fd)
+            except OSError:
+                pass
+            raise
 
     def _gc(self) -> None:
         now = time.monotonic()
@@ -291,11 +461,6 @@ class TransferManager:
                            "or the localoctop client was closed. Start it again when the machine is back.")
 
     def _abort(self, t: Transfer, msg: str) -> None:
-        if t.direction == "up" and t.part_path is not None:
-            try:
-                t.part_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         t.finish(False, msg)
 
     def _new(self, **kw: Any) -> Transfer:
@@ -314,14 +479,17 @@ class TransferManager:
                                                    timeout=self.settings.bridge_timeout)
         return await self.registry.call(user_id, method, params, timeout=self.settings.bridge_timeout)
 
-    def _resolve_agent_path(self, user_id: str, raw: str) -> Path:
+    def _open_agent_file(self, user_id: str, raw: str) -> tuple[int, _Dirs, os.stat_result]:
         """Map an agent-visible absolute path ("/..." inside the user's
-        folder) to a real file on disk, confined to the user's own folder.
+        folder) to an open file, confined to the user's own folder.
 
-        The path must stay inside the user's real folder after every link is
-        resolved, and it must be a regular file — anything else is refused.
-        Only the token owner's folder is ever readable; there are no other
-        read roots."""
+        Every directory component is opened relative to its parent handle
+        with O_NOFOLLOW, and the file itself with O_NOFOLLOW: a symlink at
+        any step — planted before or during this call — is refused, never
+        followed. Returns (file fd, open dir chain, fstat of the file). The
+        caller owns the fd and the chain; because both are held, later reads
+        keep seeing this exact file no matter how the folder is rearranged.
+        """
         if not raw or "\x00" in raw:
             raise BridgeProtocolError(CODE_INVALID_PARAMS, "cloud_path is required")
         pp = PurePosixPath(raw)
@@ -330,107 +498,188 @@ class TransferManager:
                 CODE_INVALID_PARAMS,
                 f"cloud_path must be an absolute path the agent sees, starting with '/' "
                 f"(your folder is the root), got {raw!r}")
-        root = self._user_root(user_id)
         parts = [p for p in pp.parts if p not in ("/", "")]
-        mapped = root.joinpath(*parts)
+        if not parts:
+            raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
+        for p in parts:
+            if p in (".", "..") or "/" in p or "\\" in p:
+                raise BridgeProtocolError(
+                    CODE_INVALID_PARAMS,
+                    f"cloud_path {raw!r} must not contain '.' / '..' / stray separators; "
+                    "give the plain absolute path as you see it inside your folder")
+        root_fd = self._user_root_fd(user_id)
+        chain = _Dirs(root_fd, [])
         try:
-            real = mapped.resolve(strict=True)
-        except OSError:
-            raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
-        if not self._inside(real, root):
-            raise BridgeProtocolError(
-                CODE_NOT_ALLOWED,
-                f"{raw!r} points outside your own folder on the cloud machine; "
-                "only files inside your own folder can be sent to the user's machine")
-        if not real.is_file():
-            raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
-        return real
+            for comp in parts[:-1]:
+                try:
+                    chain = chain.enter(comp)
+                except FileNotFoundError:
+                    raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
+                except _NotAFolder:
+                    # A symlink sits where a directory must be — refused,
+                    # never followed.
+                    raise BridgeProtocolError(
+                        CODE_NOT_ALLOWED,
+                        f"{raw!r} points outside your own folder on the cloud machine "
+                        "(a link sits in its path); only files inside your own folder "
+                        "can be sent to the user's machine")
+            try:
+                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=chain.fd)
+            except FileNotFoundError:
+                raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
+            except OSError:
+                # Includes ELOOP (the final component is a symlink).
+                raise BridgeProtocolError(
+                    CODE_NOT_ALLOWED,
+                    f"{raw!r} is a link, not a regular file; only files inside your own "
+                    "folder can be sent to the user's machine")
+            try:
+                st = os.fstat(fd)
+                if not statmod.S_ISREG(st.st_mode):
+                    raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd, chain, st
+        except BaseException:
+            chain.close()
+            raise
 
     # ------------------------------------------------------- start: upload
     async def start_upload(self, user_id: str, pair_id: str, local_path: str,
                            force: bool = False) -> Transfer:
-        # 1) Resolve the user's folder first: no folder, no transfer (and
+        # 1) Open the user's folder first: no folder, no transfer (and
         #    nothing is created on disk for unknown accounts).
-        root = self._user_root(user_id)
-        # 2) Ask the machine what the file looks like right now.
-        info = await self._call(user_id, pair_id, "transfer_upload",
-                                {"path": local_path, "stat_only": True, "max_bytes": self.max_bytes})
-        size, mtime = int(info.get("size", 0)), int(info.get("mtime_unix", 0))
-        rel = str(info.get("path") or local_path)
-        dest, visible = self._dest_for(user_id, rel, str(info.get("name") or ""))
-
-        # 3) Already have exactly this version in the cloud? Then do nothing.
-        key = f"{pair_id}|{rel}"
-        idx = self._index_load(user_id)
-        ent = idx.get(key)
-        if (not force and ent and ent.get("size") == size and ent.get("mtime") == mtime
-                and dest.is_file() and not dest.is_symlink() and dest.stat().st_size == size):
-            t = self._new(user_id=user_id, pair_id=pair_id, direction="up", local_path=rel,
-                          cloud_path=dest, size=size, mtime_unix=mtime, received=size)
-            t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
-                        "visible": str(visible)}
-            t.finish(True)
-            return t
-
-        # 4) An identical transfer already running? Join it instead of
-        #    starting a second copy (the model may call the tool twice).
-        for other in self._transfers.values():
-            if (other.state == "active" and other.direction == "up" and other.user_id == user_id
-                    and other.pair_id == pair_id and other.local_path == rel):
-                self._check_stall(other)
-                if other.state == "active":
-                    return other
-
-        # 5) Room on the cloud disk?
-        real_parent = self._ensure_parent(dest, root)
-        if dest.is_symlink():
-            raise BridgeProtocolError(
-                CODE_NOT_ALLOWED,
-                f"the landing path {dest.name!r} is a link; the transfer was not started "
-                "(it would write outside your own folder)")
-        free = shutil.disk_usage(real_parent).free
-        if size + DISK_RESERVE_BYTES > free:
-            raise BridgeProtocolError(
-                CODE_TOO_LARGE,
-                f"not enough space in the cloud to receive this file ({size:,} bytes needed, "
-                f"{free:,} free, {DISK_RESERVE_BYTES:,} kept in reserve)")
-
-        t = self._new(user_id=user_id, pair_id=pair_id, direction="up", local_path=rel,
-                      cloud_path=dest, size=size, mtime_unix=mtime)
-        t.result = {"visible": str(visible)}
-        t.part_path = dest.with_name(dest.name + f".part-{t.id}")
-        t.sha = hashlib.sha256()
-        t.part_path.write_bytes(b"")
+        root_fd = self._user_root_fd(user_id)
         try:
-            await self._call(user_id, pair_id, "transfer_upload",
-                             {"path": local_path, "max_bytes": self.max_bytes, **self._bridge_params(t)})
-        except BridgeProtocolError as exc:
-            self._abort(t, exc.message)
-            raise
-        return t
+            # 2) Ask the machine what the file looks like right now.
+            info = await self._call(user_id, pair_id, "transfer_upload",
+                                    {"path": local_path, "stat_only": True, "max_bytes": self.max_bytes})
+            size, mtime = int(info.get("size", 0)), int(info.get("mtime_unix", 0))
+            rel = str(info.get("path") or local_path)
+            comps, visible = self._dest_for(user_id, rel, str(info.get("name") or ""))
+
+            # 3) Already have exactly this version in the cloud? Then do
+            #    nothing — but only if the cloud file is still the very copy
+            #    we landed: its current size and mtime (nanoseconds) must
+            #    match what the index recorded at landing. Both are read
+            #    through the verified dir handle without following links, so
+            #    a swapped-in file or link simply fails the check and the
+            #    file is re-sent.
+            key = f"{pair_id}|{rel}"
+            try:
+                dirs = _Dirs(root_fd, comps[:-1])
+                root_fd = -1  # the chain owns it now
+            except FileNotFoundError:
+                dirs = None  # landing folder missing: a normal upload below
+            except _NotAFolder as exc:
+                raise exc.refuse() from None
+            if dirs is not None:
+                try:
+                    ent = self._index_load(dirs).get(key)
+                    st = _stat_name(dirs.fd, comps[-1]) if ent else None
+                    if (not force and ent and ent.get("size") == size and ent.get("mtime") == mtime
+                            and st is not None and statmod.S_ISREG(st.st_mode)
+                            and st.st_size == ent.get("landed_size")
+                            and st.st_mtime_ns == ent.get("landed_mtime_ns")):
+                        t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
+                                      local_path=rel, cloud_path=Path(visible),
+                                      size=size, mtime_unix=mtime, received=size)
+                        t.result = {"sha256": ent.get("sha256", ""), "fresh": True,
+                                    "visible": str(visible)}
+                        t.finish(True)
+                        return t
+                finally:
+                    dirs.close()
+
+            # 4) An identical transfer already running? Join it instead of
+            #    starting a second copy (the model may call the tool twice).
+            for other in self._transfers.values():
+                if (other.state == "active" and other.direction == "up" and other.user_id == user_id
+                        and other.pair_id == pair_id and other.local_path == rel):
+                    self._check_stall(other)
+                    if other.state == "active":
+                        return other
+
+            # 5) Open the landing directory chain (creating what is missing)
+            #    and the anonymous temp file. Everything from here on happens
+            #    relative to these handles.
+            if root_fd < 0:
+                root_fd = self._user_root_fd(user_id)
+            try:
+                dirs = _Dirs(root_fd, comps[:-1], create=True)
+                root_fd = -1
+            except FileNotFoundError as exc:
+                raise BridgeProtocolError(CODE_NOT_FOUND, str(exc))
+            except _NotAFolder as exc:
+                raise exc.refuse() from None
+            try:
+                # A symlink at the final name must never be written through;
+                # refuse up front (a regular file is fine — it gets replaced
+                # by the landing rename, which never follows links).
+                st = _stat_name(dirs.fd, comps[-1])
+                if st is not None and statmod.S_ISLNK(st.st_mode):
+                    raise BridgeProtocolError(
+                        CODE_NOT_ALLOWED,
+                        f"the landing path {comps[-1]!r} is a link; the transfer was not "
+                        "started (it would write outside your own folder)")
+                free = shutil.disk_usage(f"/proc/self/fd/{dirs.fd}").free
+                if size + DISK_RESERVE_BYTES > free:
+                    raise BridgeProtocolError(
+                        CODE_TOO_LARGE,
+                        f"not enough space in the cloud to receive this file ({size:,} bytes needed, "
+                        f"{free:,} free, {DISK_RESERVE_BYTES:,} kept in reserve)")
+
+                t = self._new(user_id=user_id, pair_id=pair_id, direction="up", local_path=rel,
+                              cloud_path=Path(str(visible)), size=size, mtime_unix=mtime)
+                t.result = {"visible": str(visible)}
+                t.dirs = dirs
+                t.sha = hashlib.sha256()
+                # O_TMPFILE: the file has no name, so nothing in the user's
+                # folder can redirect or replace what we write.
+                t.file_fd = os.open(".", os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC, 0o600,
+                                    dir_fd=dirs.fd)
+            except BaseException:
+                dirs.close()
+                raise
+            try:
+                await self._call(user_id, pair_id, "transfer_upload",
+                                 {"path": local_path, "max_bytes": self.max_bytes, **self._bridge_params(t)})
+            except BridgeProtocolError as exc:
+                self._abort(t, exc.message)
+                raise
+            return t
+        finally:
+            if root_fd >= 0:
+                os.close(root_fd)
 
     # ----------------------------------------------------- start: download
     async def start_download(self, user_id: str, pair_id: str, cloud_path: str,
                              local_path: str, overwrite: bool) -> Transfer:
-        src = self._resolve_agent_path(user_id, cloud_path)
-        size = src.stat().st_size
+        fd, dirs, st = self._open_agent_file(user_id, cloud_path)
+        size = st.st_size
         if size > self.max_bytes:
+            os.close(fd)
+            dirs.close()
             raise BridgeProtocolError(
                 CODE_TOO_LARGE, f"file is {size:,} bytes, larger than the {self.max_bytes:,}-byte transfer limit")
-        sha = await asyncio.to_thread(_sha256_file, src)
-        if not local_path:
-            local_path = src.name
-        t = self._new(user_id=user_id, pair_id=pair_id, direction="down", local_path=local_path,
-                      cloud_path=src, size=size)
-        t.expected_sha = sha
+        t = self._new(user_id=user_id, pair_id=pair_id, direction="down",
+                      local_path=local_path or cloud_path.rsplit("/", 1)[-1] or "file",
+                      cloud_path=Path(cloud_path), size=size)
+        t.dirs = dirs
+        t.file_fd = fd
         try:
+            # Hash the held fd, not the path: the digest is of the exact
+            # file /content will serve, whatever the user does to the name.
+            t.expected_sha = await asyncio.to_thread(_sha256_fd, fd)
             acc = await self._call(user_id, pair_id, "transfer_download",
-                                   {"path": local_path, "size": size, "sha256": sha,
+                                   {"path": t.local_path, "size": size, "sha256": t.expected_sha,
                                     "overwrite": bool(overwrite), **self._bridge_params(t)})
         except BridgeProtocolError as exc:
             t.finish(False, exc.message)
             raise
-        t.local_path = str(acc.get("path") or local_path)
+        t.local_path = str(acc.get("path") or t.local_path)
         return t
 
     # -------------------------------------------------------------- status
@@ -563,7 +812,9 @@ class TransferManager:
                     self._abort(t, "the local file grew during the transfer; please fetch it again")
                     return JSONResponse({"error": "exceeds declared size"}, status_code=413)
                 try:
-                    await asyncio.to_thread(_append, t.part_path, bytes(buf))
+                    # All chunks go to the one anonymous temp fd held since
+                    # the start; the folder's names cannot redirect this.
+                    await asyncio.to_thread(os.pwrite, t.file_fd, bytes(buf), t.received)
                 except OSError as exc:
                     self._abort(t, f"could not write to cloud storage: {exc}")
                     return JSONResponse({"error": "storage write failed"}, status_code=507)
@@ -588,17 +839,18 @@ class TransferManager:
                 return JSONResponse({"error": "range not satisfiable"}, status_code=416)
 
             async def body():
-                with open(t.cloud_path, "rb") as f:
-                    f.seek(start)
-                    pos = start
-                    while True:
-                        data = await asyncio.to_thread(f.read, 1024 * 1024)
-                        if not data:
-                            return
-                        pos += len(data)
-                        t.received = max(t.received, pos)
-                        t.touch()
-                        yield data
+                # Reads go through the fd captured at start_download: even if
+                # the source path was renamed or replaced by a link since,
+                # the bytes served are the file that was verified then.
+                pos = start
+                while True:
+                    data = await asyncio.to_thread(os.pread, t.file_fd, 1024 * 1024, pos)
+                    if not data:
+                        return
+                    pos += len(data)
+                    t.received = max(t.received, pos)
+                    t.touch()
+                    yield data
 
             return StreamingResponse(body(), status_code=206, media_type="application/octet-stream", headers={
                 "Content-Range": f"bytes {start}-{max(t.size - 1, 0)}/{t.size}",
@@ -625,32 +877,50 @@ class TransferManager:
                     t.received = t.size
                     t.finish(True)
                     return {"state": t.state}
+                # Integrity is checked against what actually landed: the
+                # anonymous fd is the only writer (O_TMPFILE has no name, so
+                # nothing else in the user's folder can reach it), and fstat
+                # confirms exactly `size` bytes made it to disk.
+                try:
+                    st = os.fstat(t.file_fd)
+                except OSError as exc:
+                    self._abort(t, f"could not verify the received file: {exc}")
+                    return {"state": t.state}
                 digest = t.sha.hexdigest()
-                if t.received != t.size or int(body.get("size", -1)) != t.size or body.get("sha256") != digest:
+                if (t.received != t.size or st.st_size != t.size
+                        or int(body.get("size", -1)) != t.size or body.get("sha256") != digest):
                     self._abort(t, "integrity check failed — the copy that reached the cloud does not match "
                                    "the local file; please fetch it again")
                     return {"state": t.state}
-                # Final write-side check: the landing path must still be a
-                # real path inside the user's folder (a link planted while
-                # the transfer ran must not be followed by the rename).
-                root = self._user_root(t.user_id)
-                parent_real = t.cloud_path.parent.resolve()
-                if not self._inside(parent_real, root) or t.cloud_path.is_symlink():
-                    self._abort(t, "the landing path no longer resolves inside your own folder; "
-                                   "the transfer was aborted")
-                    return {"state": t.state}
                 try:
-                    os.replace(t.part_path, t.cloud_path)
+                    # Set the local file's mtime on our own fd, before the
+                    # file gets any name the user could swap.
                     if t.mtime_unix:
-                        os.utime(t.cloud_path, (t.mtime_unix, t.mtime_unix))
+                        os.utime(t.file_fd, ns=(t.mtime_unix * 1_000_000_000,) * 2)
+                    # Give the anonymous file a name (a random one), then
+                    # move it to the final name — both relative to the
+                    # verified landing dir handle, neither following links.
+                    t.link_name = _link_tmp_name(t.id)
+                    os.link(f"/proc/self/fd/{t.file_fd}", t.link_name,
+                            dst_dir_fd=t.dirs.fd, follow_symlinks=True)
+                    final = t.cloud_path.name
+                    st_dst = _stat_name(t.dirs.fd, final)
+                    if st_dst is not None and not statmod.S_ISREG(st_dst.st_mode):
+                        raise OSError(f"the landing path {final!r} is not a regular file")
+                    os.rename(t.link_name, final, src_dir_fd=t.dirs.fd, dst_dir_fd=t.dirs.fd)
+                    t.link_name = ""
+                    st_final = os.stat(final, dir_fd=t.dirs.fd, follow_symlinks=False)
                 except OSError as exc:
                     self._abort(t, f"could not put the file in place in the cloud: {exc}")
                     return {"state": t.state}
                 async with self._index_lock:
-                    idx = self._index_load(t.user_id)
+                    idx = self._index_load(t.dirs)
                     idx[f"{t.pair_id}|{t.local_path}"] = {
-                        "size": t.size, "mtime": t.mtime_unix, "sha256": digest, "at": int(time.time())}
-                    self._index_save(t.user_id, idx)
+                        "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
+                        "landed_size": st_final.st_size,
+                        "landed_mtime_ns": st_final.st_mtime_ns,
+                        "at": int(time.time())}
+                    self._index_save(t.dirs, idx)
                 t.result = {**t.result, "sha256": digest}
                 t.finish(True)
             return {"state": t.state}
@@ -658,14 +928,15 @@ class TransferManager:
         return r
 
 
-def _append(path: Path, data: bytes) -> None:
-    with open(path, "ab") as f:
-        f.write(data)
-
-
-def _sha256_file(path: Path) -> str:
+def _sha256_fd(fd: int) -> str:
+    """SHA-256 of an open file, read through the fd itself: the digest is of
+    the exact object that was verified, whatever happens to its name."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(block)
+    offset = 0
+    while True:
+        block = os.pread(fd, 1024 * 1024, offset)
+        if not block:
+            break
+        h.update(block)
+        offset += len(block)
     return h.hexdigest()

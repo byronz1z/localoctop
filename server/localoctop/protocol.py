@@ -459,7 +459,7 @@ TOOL_SCHEMAS[M_DELIVER_TO_LOCAL] = {
     "inputSchema": {
         "type": "object",
         "properties": {
-            "cloud_path": {"type": "string", "description": "Absolute path of the file on the cloud machine."},
+            "cloud_path": {"type": "string", "description": "Your own folder on the cloud machine, as you see it: an absolute path starting with '/'."},
             "path": _path_prop("Destination file path on the user's machine (whitelist-relative or absolute "
                                "inside it). Omit to save under the same file name in the whitelist root."),
             "overwrite": {"type": "boolean", "default": False,
