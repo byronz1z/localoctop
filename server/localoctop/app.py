@@ -86,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             poll_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await poll_task
+        await transfers.aclose()
         endpoint = getattr(mcp_router, "localoctop_endpoint", None)
         if endpoint is not None:
             await endpoint.shutdown()

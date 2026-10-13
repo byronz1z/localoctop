@@ -282,10 +282,17 @@ class ToolService:
             kept += len(data)
         if not out_blocks:
             out_blocks.append({"type": "text", "text": ""})
-        note = (f"[result too large to show in full: {total:,} bytes, only the first part above is shown. "
-                "Narrow the request: point at a sub-directory, lower depth/limit, use a more specific "
-                "pattern or add excludePatterns — or use fetch_to_cloud to copy the file to the cloud "
-                "machine and process it there.]")
+        # The "next step" depends on what the tool was showing: a listing,
+        # a search or a tree is narrowed by scoping; an edit_file diff is a
+        # *result*, not content to page through; anything else gets the
+        # generic narrowing advice.
+        hint = ("The shown part is the whole result: the edit was attempted as described above "
+                "(applied, or failed to match). To see more of the same kind of output, narrow "
+                "the request (a smaller file or a section).")
+        if name in (M_LIST_DIRECTORY, M_LIST_DIRECTORY_WITH_SIZES, M_SEARCH_FILES, M_DIRECTORY_TREE):
+            hint = ("Narrow the request: point at a sub-directory, lower depth/limit, use a more "
+                    "specific pattern or add excludePatterns.")
+        note = f"[result too large to show in full: {total:,} bytes, only the first part above is shown. {hint}]"
         out_blocks.append({"type": "text", "text": note})
         return {"content": out_blocks, "isError": False}
 

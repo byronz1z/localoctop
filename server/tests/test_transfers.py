@@ -421,9 +421,9 @@ class TestWriteSideSymlinkDefence:
             assert r.status_code == 200
         assert t.state == "failed"
         assert {p.name: p.read_bytes() for p in bob.iterdir()} == bob_before
-        # No stray materialized names in alice's real landing folder either.
-        assert not [p for p in (home / "localoctop-away").iterdir()
-                    if p.name.startswith(".localoctop-link-")]
+        # No stray names in alice's real landing folder either — the
+        # landing process never leaves a visible intermediate name.
+        assert list((home / "localoctop-away").iterdir()) == []
 
 
 # ------------------------------------------------------------ index safety
@@ -514,9 +514,10 @@ class TestChunkedUpload:
         dest = users_dir / "alice" / "localoctop" / "big.bin"
         assert dest.read_bytes() == content
         assert int(dest.stat().st_mtime) == 1234
-        # No temp or materialized name is left behind.
+        # No leftover intermediate or partial names of any kind.
         assert not list(dest.parent.glob("*.part-*"))
-        assert not [p for p in dest.parent.iterdir() if p.name.startswith(".localoctop-link-")]
+        assert not [p for p in dest.parent.iterdir()
+                    if p.name.startswith(".localoctop-") and p.name != ".localoctop-index.json"]
         idx = _read_index(users_dir, "alice")
         ent = idx["pair-1|big.bin"]
         assert ent["size"] == len(content) and ent["sha256"] == hashlib.sha256(content).hexdigest()
@@ -537,7 +538,8 @@ class TestChunkedUpload:
         landing = users_dir / "alice" / "localoctop"
         assert not (landing / "f.bin").exists()
         assert not list(landing.glob("*.part-*"))
-        assert not [p for p in landing.iterdir() if p.name.startswith(".localoctop-link-")]
+        assert not [p for p in landing.iterdir()
+                    if p.name.startswith(".localoctop-") and p.name != ".localoctop-index.json"]
 
     async def test_forbidden_ticket_and_wrong_user(self, users_dir, mgr):
         _mk_user(users_dir, "alice")
@@ -743,7 +745,8 @@ class TestTransferLimits:
         landing = users_dir / "alice" / "localoctop"
         if landing.exists():
             assert not [p for p in landing.rglob("*") if p.name == "f.bin"]
-            assert not [p for p in landing.rglob("*") if p.name.startswith(".localoctop-link-")]
+            assert not [p for p in landing.rglob("*")
+                        if p.name.startswith(".localoctop-") and p.name != ".localoctop-index.json"]
         # The refused transfer's record was finished (handles released), and
         # the record we hand back is the advisory one.
         actives = [x for x in mgr._transfers.values() if x.state == "active"]
@@ -812,7 +815,9 @@ class TestCloudEditedKept:
 
     async def test_untouched_cloud_copy_replaced_without_keep(self, users_dir, mgr):
         """The cloud copy is exactly what we landed last time and the local
-        file changed: a plain replace, no .cloud-edited- file appears."""
+        file changed: the occupant is moved aside atomically, verified by
+        content against the index, and removed — no .cloud-edited- file
+        remains and nothing else is touched."""
         _mk_user(users_dir, "alice")
         reg = FakeRegistry({"doc.txt": (b"v1", 1000)})
         mgr.registry = reg
@@ -862,51 +867,6 @@ class TestLandedFilePermissions:
 
 # ------------------------------------------------------------ housekeeping
 class TestHousekeeping:
-    def test_orphan_link_files_swept_per_user(self, users_dir, monkeypatch):
-        for name in ("alice", "bob"):
-            landing = _mk_user(users_dir, name) / "localoctop"
-            landing.mkdir()
-            (landing / ".localoctop-link-dead1").write_bytes(b"half")
-            (landing / "keep.bin").write_bytes(b"full")
-            # Files that merely contain the pattern are NOT ours: keep them.
-            (landing / "notes.localoctop-link-backup").mkdir()
-        TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
-        for name in ("alice", "bob"):
-            landing = users_dir / name / "localoctop"
-            assert not list(landing.glob(".localoctop-link-*"))
-            assert (landing / "keep.bin").exists()
-            assert (landing / "notes.localoctop-link-backup").is_dir()
-
-    @needs_symlink
-    def test_sweep_skips_symlinked_landing_dir(self, users_dir, monkeypatch):
-        """alice's landing folder is a symlink into bob's folder when the
-        adapter starts. The sweep must skip alice entirely: bob's files
-        (including names starting with .localoctop-link-) stay put. The
-        target sits OUTSIDE bob's own landing folder, so only a sweep that
-        followed alice's symlink could reach it."""
-        _mk_user(users_dir, "alice")
-        bob = _mk_user(users_dir, "bob")
-        vault = bob / "vault"
-        vault.mkdir()
-        victim = vault / ".localoctop-link-precious"
-        victim.write_bytes(b"bob-data")
-        (users_dir / "alice" / "localoctop").symlink_to(vault, target_is_directory=True)
-        TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
-        assert victim.read_bytes() == b"bob-data"
-
-    @needs_symlink
-    def test_sweep_skips_symlinked_user_folder(self, users_dir, monkeypatch):
-        vault = users_dir / "vault"          # NOT inside any user folder
-        vault.mkdir()
-        victim = vault / ".localoctop-link-x"
-        victim.write_bytes(b"data")
-        # "alias" pretends to be a user folder but is a symlink out.
-        (users_dir / "alias").symlink_to(vault, target_is_directory=True)
-        TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
-        # The sweep never follows a symlinked user folder...
-        assert victim.read_bytes() == b"data"
-        assert (users_dir / "alias").is_symlink()
-
     async def test_transfer_isolation_between_users(self, users_dir, mgr):
         _mk_user(users_dir, "alice")
         _mk_user(users_dir, "bob")
@@ -918,3 +878,320 @@ class TestHousekeeping:
         assert ei.value.code == CODE_NOT_FOUND
         assert mgr.get_for_user("alice", t.id) is t
         t.finish(True) if t.state == "active" else None
+
+    async def test_legacy_link_name_survives_construction_and_upload(self, users_dir, mgr):
+        """The adapter no longer sweeps by name (round 5): a file whose name
+        starts with the old materialization prefix is somebody's data, never
+        to be touched. It must survive manager construction AND a full
+        upload with its content intact."""
+        home = _mk_user(users_dir, "alice")
+        landing = home / "localoctop"
+        landing.mkdir()
+        legacy = landing / ".localoctop-link-dead1"
+        legacy.write_bytes(b"not-ours-to-delete")
+        mgr2 = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        mgr2.registry = FakeRegistry({"f.bin": (b"payload", 1000)})
+        async with _client_for(mgr2) as client:
+            t, _ = await _push_upload(mgr2, client, "alice", "f.bin", b"payload")
+        assert t.state == "done"
+        assert legacy.read_bytes() == b"not-ours-to-delete"
+        assert (landing / "f.bin").read_bytes() == b"payload"
+
+
+# --------------------------------------------------- handles: no leaks (R5)
+
+class TestHandleLeaks:
+    def _fd_count(self) -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    async def test_upload_success_and_refusals_do_not_leak_fds(self, users_dir, mgr):
+        """50 successful uploads + 50 refused requests (missing user folder,
+        symlinked landing): the process fd count must not grow."""
+        home = _mk_user(users_dir, "alice")
+        bob = _mk_user(users_dir, "bob")
+        reg = FakeRegistry({f"f{i}.bin": (os.urandom(600), 1000) for i in range(51)})
+        mgr.registry = reg
+        async with _client_for(mgr) as client:
+            # Warm up once (first import / lazy setup costs fds legitimately).
+            t, _ = await _push_upload(mgr, client, "alice", "f0.bin", reg.files["f0.bin"][0])
+            assert t.state == "done"
+            try:
+                await mgr.start_upload("ghost", "pair-1", "f0.bin")
+            except BridgeProtocolError:
+                pass
+            before = self._fd_count()
+            for i in range(1, 51):
+                t, _ = await _push_upload(mgr, client, "alice", f"f{i}.bin", reg.files[f"f{i}.bin"][0])
+                assert t.state == "done"
+            for _ in range(25):
+                with pytest.raises(BridgeProtocolError):
+                    await mgr.start_upload("ghost", "pair-1", "f0.bin")
+            # A symlinked landing is refused too.
+            os.rename(home / "localoctop", home / "localoctop-real")
+            (home / "localoctop").symlink_to(bob, target_is_directory=True)
+            for _ in range(25):
+                with pytest.raises(BridgeProtocolError) as ei:
+                    await mgr.start_upload("alice", "pair-1", "f0.bin")
+                assert ei.value.code == CODE_NOT_ALLOWED
+            assert self._fd_count() <= before
+
+    async def test_download_success_and_refusals_do_not_leak_fds(self, users_dir, mgr):
+        home = _mk_user(users_dir, "alice")
+        (home / "out.txt").write_bytes(b"payload")
+        async with _client_for(mgr) as client:
+            # Warm up.
+            t = await mgr.start_download("alice", "pair-1", "/out.txt", "", False)
+            t.finish(True)
+            with pytest.raises(BridgeProtocolError):
+                await mgr.start_download("alice", "pair-1", "/nope.txt", "", False)
+            before = self._fd_count()
+            auth = {"Authorization": "Bearer btok-alice"}
+            for _ in range(50):
+                t = await mgr.start_download("alice", "pair-1", "/out.txt", "", False)
+                assert t.state == "active"
+                r = await client.get(f"/mcp/localoctop/transfer/{t.id}/content",
+                                     headers={**auth, "X-Transfer-Ticket": t.ticket})
+                assert r.status_code == 206 and r.content == b"payload"
+                await client.post(f"/mcp/localoctop/transfer/{t.id}/complete",
+                                  json={"ok": True, "path": "/local/out.txt"},
+                                  headers={**auth, "X-Transfer-Ticket": t.ticket})
+                assert t.state == "done"
+            for _ in range(25):
+                with pytest.raises(BridgeProtocolError):
+                    await mgr.start_download("alice", "pair-1", "/nope.txt", "", False)
+            for _ in range(25):
+                with pytest.raises(BridgeProtocolError):
+                    await mgr.start_download("ghost", "pair-1", "/out.txt", "", False)
+            assert self._fd_count() <= before
+
+
+# ------------------------------------------- background stall sweep (R5)
+
+class TestBackgroundSweep:
+    async def test_stalled_upload_aborted_and_handles_released(self, users_dir, mgr, monkeypatch):
+        import localoctop.transfers as tr
+        monkeypatch.setattr(tr, "STALL_SECONDS", 0.05)
+        _mk_user(users_dir, "alice")
+        content = b"0123456789" * 10
+        mgr.registry = FakeRegistry({"f.bin": (content, 1000)})
+        before = len(os.listdir("/proc/self/fd"))
+        t = await mgr.start_upload("alice", "pair-1", "f.bin")
+        assert t.state == "active"
+        assert t.file_fd >= 0 and t.dirs is not None
+        # Nobody ever asks for status; make it stale and sweep once directly.
+        t.updated = time.monotonic() - 10
+        mgr.sweep_transfers()
+        assert t.state == "failed" and "stopped making progress" in t.error
+        assert t.file_fd == -1 and t.dirs is None
+        assert len(os.listdir("/proc/self/fd")) <= before
+
+    async def test_stalled_download_aborted_and_handles_released(self, users_dir, mgr, monkeypatch):
+        import localoctop.transfers as tr
+        monkeypatch.setattr(tr, "STALL_SECONDS", 0.05)
+        home = _mk_user(users_dir, "alice")
+        (home / "out.txt").write_bytes(b"payload")
+        before = len(os.listdir("/proc/self/fd"))
+        t = await mgr.start_download("alice", "pair-1", "/out.txt", "", False)
+        assert t.state == "active"
+        t.updated = time.monotonic() - 10
+        mgr.sweep_transfers()
+        assert t.state == "failed"
+        assert t.file_fd == -1 and t.dirs is None
+        assert len(os.listdir("/proc/self/fd")) <= before
+
+    async def test_finished_records_expired_by_sweep(self, users_dir, mgr, monkeypatch):
+        import localoctop.transfers as tr
+        monkeypatch.setattr(tr, "RECORD_TTL_SECONDS", 0.01)
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.bin": (b"x", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"x")
+        assert t.id in mgr._transfers
+        t.finished = time.monotonic() - 10
+        mgr.sweep_transfers()
+        assert t.id not in mgr._transfers
+
+    async def test_scan_task_started_lazily_and_stopped(self, users_dir, mgr):
+        """The periodic task exists after the first transfer and is cancelled
+        cleanly by aclose(); a second manager on the same loop works too."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.bin": (b"x", 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.bin")
+        assert mgr._scan_task is not None and not mgr._scan_task.done()
+        t.finish(True)
+        await mgr.aclose()
+        assert mgr._scan_task is None
+
+
+# ----------------------------------- landing never overwrites (R5, item 3/4)
+
+class TestLandingNeverOverwrites:
+    async def test_unknown_occupant_moved_aside_content_intact(self, users_dir, mgr):
+        """A file at the landing name the index has no record of: moved to a
+        .cloud-edited- name unchanged, the new file takes the real name."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir()
+        (landing / "doc.txt").write_bytes(b"agent-made")
+        mgr.registry = FakeRegistry({"doc.txt": (b"fresh", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"fresh")
+        assert t.state == "done"
+        kept = [p for p in landing.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1 and kept[0].read_bytes() == b"agent-made"
+        assert (landing / "doc.txt").read_bytes() == b"fresh"
+
+    async def test_same_size_same_mtime_edit_still_kept(self, users_dir, mgr):
+        """The agent edits the landed copy keeping the SAME size and
+        restoring the mtime (ns-exact): size+mtime say 'unchanged', the
+        sha256 says otherwise. The edited copy must be kept, not deleted."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"doc.txt": (b"v1-aaaa", 1000)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1-aaaa")
+            assert t1.state == "done"
+            dest = users_dir / "alice" / "localoctop" / "doc.txt"
+            st = dest.stat()
+            # Same-size edit + exact mtime restore.
+            dest.write_bytes(b"v1-BBBB")
+            os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+            reg2 = FakeRegistry({"doc.txt": (b"v2-longer", 2000)})
+            mgr.registry = reg2
+            t2, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v2-longer")
+        assert t2.state == "done"
+        landing = dest.parent
+        kept = [p for p in landing.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1 and kept[0].read_bytes() == b"v1-BBBB"
+        assert dest.read_bytes() == b"v2-longer"
+
+    async def test_untouched_previous_copy_removed_after_move(self, users_dir, mgr):
+        """The occupant IS our last landing, untouched: it is moved aside
+        atomically (never overwritten), verified by content, and removed —
+        no .cloud-edited- file remains."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"doc.txt": (b"v1", 1000)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1")
+            assert t1.state == "done"
+            mgr.registry = FakeRegistry({"doc.txt": (b"v2", 2000)})
+            t2, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v2")
+        assert t2.state == "done"
+        landing = users_dir / "alice" / "localoctop"
+        assert not [p for p in landing.iterdir() if ".cloud-edited-" in p.name]
+        assert (landing / "doc.txt").read_bytes() == b"v2"
+
+    async def test_keep_name_collision_uses_next_suffix(self, users_dir, mgr):
+        """The first .cloud-edited- candidate is taken: the next suffix is
+        used and the pre-existing file's content is unchanged."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir()
+        (landing / "doc.txt").write_bytes(b"agent-made")
+        mgr.registry = FakeRegistry({"doc.txt": (b"fresh", 1000)})
+
+        real_keep = mgr._keep_cloud_edited
+
+        def colliding(dirs, name):
+            # Reproduce the real naming scheme, then occupy the first
+            # candidate so the loop must take "-1".
+            stem, dot, ext = name.rpartition(".")
+            if dot:
+                ext = "." + ext
+            else:
+                stem, ext = name, ""
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            holder = landing / f"{stem}.cloud-edited-{stamp}{ext}"
+            if not holder.exists():
+                holder.write_bytes(b"occupied-first")
+            return real_keep(dirs, name)
+
+        mgr._keep_cloud_edited = colliding
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"fresh")
+        assert t.state == "done"
+        kept = sorted(p for p in landing.iterdir() if ".cloud-edited-" in p.name)
+        assert len(kept) == 2
+        contents = sorted(p.read_bytes() for p in kept)
+        assert contents == [b"agent-made", b"occupied-first"]
+        assert (landing / "doc.txt").read_bytes() == b"fresh"
+
+    async def test_no_intermediate_names_left_after_landing(self, users_dir, mgr):
+        """After the whole landing dance (including a keep-aside), the
+        landing folder holds only final names — no .localoctop-link-*, no
+        temp names of any kind."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir()
+        (landing / "doc.txt").write_bytes(b"agent-made")
+        mgr.registry = FakeRegistry({"doc.txt": (b"fresh", 1000), "other.bin": (b"yy", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"fresh")
+            assert t.state == "done"
+            t2, _ = await _push_upload(mgr, client, "alice", "other.bin", b"yy")
+            assert t2.state == "done"
+        for p in landing.iterdir():
+            assert not p.name.startswith(".localoctop-link-")
+        names = {p.name for p in landing.iterdir()}
+        assert "doc.txt" in names and "other.bin" in names
+
+    def test_renameat2_primary_path_works(self, users_dir):
+        """The container's libc/kernel must take the real renameat2 path
+        (not the link+unlink fallback): rename an occupied name with
+        RENAME_NOREPLACE fails with EEXIST and leaves the occupant
+        untouched, and a free name is moved atomically."""
+        import localoctop.transfers as tr
+        d = _mk_user(users_dir, "alice")
+        (d / "src.txt").write_bytes(b"mine")
+        (d / "dst.txt").write_bytes(b"theirs")
+        fd = os.open(d, tr._O_DIR_FLAGS)
+        try:
+            with pytest.raises(FileExistsError):
+                tr._rename_noreplace(fd, "src.txt", "dst.txt")
+            assert (d / "dst.txt").read_bytes() == b"theirs"
+            assert (d / "src.txt").read_bytes() == b"mine"
+            tr._rename_noreplace(fd, "src.txt", "moved.txt")
+            assert (d / "moved.txt").read_bytes() == b"mine"
+            assert not (d / "src.txt").exists()
+        finally:
+            os.close(fd)
+        assert tr._libc is not None, "glibc renameat2 unavailable in the test container"
+
+
+# --------------------------------------- fresh check trusts content (R5, 4)
+
+class TestFreshCheckContentVerified:
+    async def test_same_size_restored_mtime_edit_is_resent(self, users_dir, mgr):
+        """The cloud copy is edited keeping size AND restoring the mtime to
+        the nanosecond: 'already up to date' must NOT fire — the file is
+        re-sent and the edited copy kept aside."""
+        _mk_user(users_dir, "alice")
+        content = b"0123456789"
+        reg = FakeRegistry({"cfg.yaml": (content, 4242)})
+        mgr.registry = reg
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "cfg.yaml", content)
+            assert t1.state == "done"
+            dest = users_dir / "alice" / "localoctop" / "cfg.yaml"
+            st = dest.stat()
+            dest.write_bytes(b"9876543210")  # same size, other bytes
+            os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+            t2, _ = await _push_upload(mgr, client, "alice", "cfg.yaml", content)
+        assert t2.state == "done" and not t2.result.get("fresh")
+        assert dest.read_bytes() == content
+        kept = [p for p in dest.parent.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1 and kept[0].read_bytes() == b"9876543210"
+
+    async def test_truly_unchanged_copy_still_skips_resend(self, users_dir, mgr):
+        """The happy path must survive the stricter check: a copy whose
+        content still matches the index is NOT re-sent."""
+        _mk_user(users_dir, "alice")
+        content = b"same-bytes"
+        reg = FakeRegistry({"report.xlsx": (content, 4242)})
+        mgr.registry = reg
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "report.xlsx", content)
+        assert t1.state == "done"
+        calls_after_first = len(reg.calls)
+        t2 = await mgr.start_upload("alice", "pair-1", "report.xlsx")
+        assert t2.state == "done" and t2.result.get("fresh") is True
+        assert len(reg.calls) == calls_after_first + 1  # only the stat probe

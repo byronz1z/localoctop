@@ -1,10 +1,12 @@
 """Out-of-band file transfer between the user's machine and the cloud
 (experiment branch).
 
-Why this exists: an MCP tool result is fed to the model verbatim, so a file
-must never travel inside one. Here the MCP tool only *starts* a transfer and
-reports where the file ended up; the bytes move over plain HTTP between the
-bridge and this adapter:
+Why this exists: an MCP tool result is fed to the model verbatim, so the
+bytes of a transferred file — binary or large ones in particular — must not
+travel inside one. Here the MCP tool only *starts* a transfer and reports
+where the file ended up; the bytes move over plain HTTP between the bridge
+and this adapter. (Text files are different: `read_file` returns them to the
+model line-bounded and capped, by design.)
 
     upload   (local -> cloud)   bridge PUTs fixed-size chunks, each one is
                                 acknowledged; a dropped connection resumes
@@ -41,16 +43,18 @@ our reads or writes anywhere else.
 
 Upload temp files are anonymous (O_TMPFILE): they have no name at all, so
 nothing the user does to their folder can touch them. On completion the fd
-is materialized to a random name via a /proc/self/fd linkat and then renamed
-to the final name relative to the verified directory handle. Orphans of the
-materialize step keep the pattern ".localoctop-link-<id>" and are swept at
-startup; the sweep also goes through dir_fd walking, so a user folder that
-was replaced by a symlink is skipped instead of followed.
+is given its final name directly (a /proc/self/fd linkat relative to the
+verified landing directory handle), so the process never leaves a visible
+intermediate name behind. A name that is already taken is moved aside first
+— atomically and never by overwriting (renameat2 with RENAME_NOREPLACE) —
+so cloud-side work under the landing name is never destroyed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import hashlib
 import json
 import logging
@@ -87,13 +91,15 @@ DISK_RESERVE_BYTES = 1024 * 1024 * 1024
 # A transfer with no byte movement for this long is declared dead (the
 # machine went offline / the bridge was closed).
 STALL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_STALL_SECONDS", 420))
+# How often the background task scans for stalled transfers and expired
+# records. The scan also runs on transfer_status polls; this task is what
+# releases the handles of a transfer nobody ever asks about again.
+SCAN_INTERVAL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_SCAN_INTERVAL", 30))
 # Finished transfer records are kept this long for transfer_status lookups.
 RECORD_TTL_SECONDS = 3600.0
 
 _INDEX_NAME = ".localoctop-index.json"
 _INDEX_TMP_PREFIX = ".localoctop-index.json.tmp-"
-# Materialized-but-not-yet-renamed upload files (see module docstring).
-_LINK_PREFIX = ".localoctop-link-"
 
 # A user name (== the token's user_id == the Octop folder name) must not
 # contain anything that could break the one-folder-per-user confinement.
@@ -248,14 +254,49 @@ class _Dirs:
         self._fds = []
 
 
-def _link_tmp_name(tid: str) -> str:
-    return f"{_LINK_PREFIX}{tid}"
-
-
 def _index_tmp_name() -> str:
     # Unpredictable per write: the user cannot pre-place a link at the name,
     # and O_EXCL would refuse to use it anyway.
     return f"{_INDEX_TMP_PREFIX}{secrets.token_urlsafe(12)}"
+
+
+# ---------------------------------------------------------------- renameat2
+# The Python standard library has no renameat2, so call libc directly.
+# RENAME_NOREPLACE makes the rename fail with EEXIST when the destination
+# name is taken — the only rename that can never overwrite someone's work.
+_RENAME_NOREPLACE = 1
+
+try:
+    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    _libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    _libc.renameat2.restype = ctypes.c_int
+except (OSError, AttributeError):  # not glibc: the fallback path is used
+    _libc = None
+
+
+def _rename_noreplace(dir_fd: int, old: str, new: str) -> None:
+    """Atomically rename `old` to `new` relative to `dir_fd`, failing with
+    FileExistsError instead of overwriting when `new` is already taken.
+
+    Falls back to link+unlink when the kernel or libc has no renameat2;
+    the fallback leaves a sub-microsecond window between link and unlink
+    during which the file sits under both names (a concurrent swap of the
+    source name would make us rename whatever the name holds at link time —
+    still never an overwrite of `new`)."""
+    old_b, new_b = os.fsencode(old), os.fsencode(new)
+    if _libc is not None:
+        rc = _libc.renameat2(dir_fd, old_b, dir_fd, new_b, _RENAME_NOREPLACE)
+        if rc == 0:
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOSYS, errno.EINVAL):
+            raise OSError(err, os.strerror(err), old)
+        # renameat2 unsupported at runtime: use the fallback below.
+    # Fallback: link(new) refuses EEXIST, so `new` is never overwritten;
+    # unlink(old) then removes the source name.
+    os.link(old, new_b, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+    os.unlink(old_b, dir_fd=dir_fd)
 
 
 @dataclass
@@ -283,7 +324,6 @@ class Transfer:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dirs: _Dirs | None = None       # verified dir handles of the landing folder
     file_fd: int = -1               # up: anonymous temp fd; down: verified source fd
-    link_name: str = ""             # up: materialized name before the final rename
 
     def touch(self) -> None:
         self.updated = time.monotonic()
@@ -294,23 +334,17 @@ class Transfer:
         self.state = "done" if ok else "failed"
         self.error = error
         self.finished = time.monotonic()
-        # Anonymous temp data dies with its fd; a materialized name is
-        # removed before the chain closes. Handles are never left behind.
-        link, dirs = self.link_name, self.dirs
-        self.link_name = ""
-        if link and dirs is not None:
-            try:
-                os.unlink(link, dir_fd=dirs.fd)
-            except OSError:
-                pass
+        # Anonymous temp data dies with its fd; the temp name was never
+        # visible at all, so there is nothing to sweep. Handles are never
+        # left behind — this runs on success, failure, abort and timeout.
         if self.file_fd >= 0:
             try:
                 os.close(self.file_fd)
             except OSError:
                 pass
             self.file_fd = -1
-        if dirs is not None:
-            dirs.close()
+        if self.dirs is not None:
+            self.dirs.close()
             self.dirs = None
         self.done.set()
 
@@ -329,48 +363,7 @@ class TransferManager:
         self.max_bytes = int(e.get("LOCALOCTOP_MAX_TRANSFER_BYTES", DEFAULT_MAX_TRANSFER_BYTES))
         self._transfers: dict[str, Transfer] = {}
         self._index_lock = asyncio.Lock()
-        self._sweep_stale_parts()
-
-    def _sweep_stale_parts(self) -> None:
-        """Transfers live in memory, so after a restart the materialized
-        '.localoctop-link-<id>' files of interrupted uploads are orphans
-        nobody will finish (anonymous O_TMPFILE data needs no cleanup — it
-        died with its fd). Remove the orphans, or each interrupted transfer
-        would leak its size in disk space. Every step goes through a
-        dir_fd walk, so a user folder (or landing folder) that is a symlink
-        is skipped, never followed into someone else's directory."""
-        try:
-            top_fd = os.open(self.users_dir, _O_DIR_FLAGS)
-        except OSError:
-            return
-        try:
-            for name in os.listdir(top_fd):
-                try:
-                    user_fd = _open_dir(top_fd, name)
-                except OSError:
-                    continue  # symlink, file, or unreadable: not ours to touch
-                try:
-                    try:
-                        landing_fd = _open_dir(user_fd, self.landing_subdir)
-                    except OSError:
-                        continue
-                    try:
-                        for entry in os.listdir(landing_fd):
-                            if entry.startswith(_LINK_PREFIX):
-                                try:
-                                    os.unlink(entry, dir_fd=landing_fd)
-                                    logger.info("removed orphaned partial file %s/%s/%s/%s",
-                                                self.users_dir, name, self.landing_subdir, entry)
-                                except OSError:
-                                    logger.warning(
-                                        "could not remove orphaned partial file %s in user folder %s",
-                                        entry, name)
-                    finally:
-                        os.close(landing_fd)
-                finally:
-                    os.close(user_fd)
-        finally:
-            os.close(top_fd)
+        self._scan_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ helpers
     def _user_root_fd(self, user_id: str) -> int:
@@ -382,7 +375,15 @@ class TransferManager:
         create it: an account without a folder simply cannot transfer."""
         name = _check_user_name(user_id)
         try:
-            return _open_dir(os.open(self.users_dir, _O_DIR_FLAGS), name)
+            top_fd = os.open(self.users_dir, _O_DIR_FLAGS)
+        except OSError:
+            raise BridgeProtocolError(
+                CODE_NOT_FOUND,
+                f"this account has no folder on the cloud machine yet "
+                f"(no Octop user named {user_id!r}); the transfer was not started. "
+                "Create the Octop user first, then try again.")
+        try:
+            return _open_dir(top_fd, name)
         except NotADirectoryError:
             raise BridgeProtocolError(
                 CODE_NOT_ALLOWED,
@@ -394,6 +395,8 @@ class TransferManager:
                 f"this account has no folder on the cloud machine yet "
                 f"(no Octop user named {user_id!r}); the transfer was not started. "
                 "Create the Octop user first, then try again.")
+        finally:
+            os.close(top_fd)
 
     def _dest_for(self, user_id: str, rel: str, name: str) -> tuple[list[str], PurePosixPath]:
         """Cloud landing location for a local file (stable per local path).
@@ -441,6 +444,19 @@ class TransferManager:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
+        except BaseException:
+            # Write/fsync failed: fdopen's close on the error path is not
+            # guaranteed, so close the fd explicitly before unlinking.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp, dir_fd=dirs.fd)
+            except OSError:
+                pass
+            raise
+        try:
             os.rename(tmp, _INDEX_NAME, src_dir_fd=dirs.fd, dst_dir_fd=dirs.fd)
         except BaseException:
             try:
@@ -450,15 +466,19 @@ class TransferManager:
             raise
 
     def _keep_cloud_edited(self, dirs: _Dirs, name: str) -> str:
-        """Rename `name` (a regular file at the landing position that is NOT
+        """Move `name` (a regular file at the landing position that is NOT
         the copy we landed last time — the agent edited it, or we have no
-        record of it) to "<stem>.cloud-edited-<YYYYMMDD-HHMMSS><ext>" so a
-        re-fetch never destroys cloud-side work.
+        record of it) aside to "<stem>.cloud-edited-<YYYYMMDD-HHMMSS><ext>"
+        so a re-fetch never destroys cloud-side work.
 
-        Everything happens relative to the verified dir handle: the rename
-        never follows links (rename of a symlink renames the link itself),
-        and a candidate name that already exists gets a numeric suffix —
-        nothing is ever overwritten. Returns the kept-as name."""
+        Everything happens relative to the verified dir handle and the move
+        uses renameat2(RENAME_NOREPLACE): it either happens in one atomic
+        step or fails with EEXIST — there is no check-then-act window for
+        the agent to slip into, and nothing at the keep-as name is ever
+        overwritten (a taken candidate gets a numeric suffix).
+        FileNotFoundError propagates: the occupant was moved away by someone
+        else first, and the caller retries the landing link. Returns the
+        kept-as name."""
         stem, dot, ext = name.rpartition(".")
         if not dot:  # no extension, or a dotfile like ".env"
             stem, ext = name, ""
@@ -468,10 +488,12 @@ class TransferManager:
         base = f"{stem}.cloud-edited-{stamp}"
         for i in range(0, 1000):
             cand = f"{base}{'' if i == 0 else f'-{i}'}{ext}"
-            if _stat_name(dirs.fd, cand) is None:
-                os.rename(name, cand, src_dir_fd=dirs.fd, dst_dir_fd=dirs.fd)
-                logger.info("cloud copy of %s was modified; kept as %s", name, cand)
-                return cand
+            try:
+                _rename_noreplace(dirs.fd, name, cand)
+            except FileExistsError:
+                continue
+            logger.info("cloud copy of %s was modified; kept as %s", name, cand)
+            return cand
         raise OSError(f"no free keep-as name for the modified cloud copy of {name!r}")
 
     def _gc(self) -> None:
@@ -485,6 +507,53 @@ class TransferManager:
             self._abort(t, "the transfer stopped making progress — the local machine went offline "
                            "or the localoctop client was closed. Start it again when the machine is back.")
 
+    def sweep_transfers(self) -> None:
+        """One pass over every transfer record: stall-abort actives that
+        stopped making progress (their handles are closed by finish()) and
+        drop finished records past the retention TTL.
+
+        This is called by the background scan task AND directly by tests —
+        a transfer nobody ever asks about again must not hold its file and
+        directory handles forever."""
+        for t in list(self._transfers.values()):
+            self._check_stall(t)
+        self._gc()
+
+    def _ensure_scan_task(self) -> None:
+        """Start the periodic sweep if it is not running yet. Lazy so the
+        manager also works where no lifespan event ever fires (tests, and
+        ASGI transports that skip startup)."""
+        task = self._scan_task
+        if task is not None and not task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop yet (sync context); retried on next _new
+        self._scan_task = asyncio.create_task(self._scan_loop())
+
+    async def _scan_loop(self) -> None:
+        while True:
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+            try:
+                self.sweep_transfers()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("transfer scan failed; retrying next interval")
+
+    async def aclose(self) -> None:
+        """Stop the background scan (called from the app lifespan on
+        shutdown). Transfer records themselves live until their TTL."""
+        task = self._scan_task
+        self._scan_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
     def _abort(self, t: Transfer, msg: str) -> None:
         t.finish(False, msg)
 
@@ -492,6 +561,7 @@ class TransferManager:
         self._gc()
         t = Transfer(id=secrets.token_urlsafe(9), ticket=secrets.token_urlsafe(24), **kw)
         self._transfers[t.id] = t
+        self._ensure_scan_task()
         return t
 
     def _advisory(self, user_id: str, pair_id: str, direction: str, local_path: str,
@@ -582,6 +652,27 @@ class TransferManager:
             chain.close()
             raise
 
+    async def _hash_matches(self, dirs: _Dirs, name: str, sha256: Any) -> bool:
+        """True when the regular file `name` below the verified dir handle
+        hashes (on its open fd, links never followed) to `sha256`. Any open
+        or read failure — including a symlink or a mid-check deletion —
+        simply means "not the same copy": the caller re-transfers."""
+        if not isinstance(sha256, str) or not sha256:
+            return False
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirs.fd)
+        except OSError:
+            return False
+        try:
+            st = os.fstat(fd)
+            if not statmod.S_ISREG(st.st_mode):
+                return False
+            return await asyncio.to_thread(_sha256_fd, fd) == sha256
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
     # ------------------------------------------------------- start: upload
     async def start_upload(self, user_id: str, pair_id: str, local_path: str,
                            force: bool = False) -> Transfer:
@@ -610,11 +701,15 @@ class TransferManager:
 
             # 3) Already have exactly this version in the cloud? Then do
             #    nothing — but only if the cloud file is still the very copy
-            #    we landed: its current size and mtime (nanoseconds) must
-            #    match what the index recorded at landing. Both are read
-            #    through the verified dir handle without following links, so
-            #    a swapped-in file or link simply fails the check and the
-            #    file is re-sent.
+            #    we landed: size and mtime must match the index AND the
+            #    file's current content must hash to the recorded sha256.
+            #    Content is checked because an edit that keeps the size and
+            #    restores the mtime (many copy/extract tools preserve times)
+            #    would otherwise look "unchanged". The file is opened
+            #    relative to the verified dir handle without following
+            #    links, and the hash is computed on the open fd in a worker
+            #    thread (never blocking the event loop, never re-resolving
+            #    the name).
             key = f"{pair_id}|{rel}"
             try:
                 dirs = _Dirs(root_fd, comps[:-1])
@@ -630,7 +725,8 @@ class TransferManager:
                     if (not force and ent and ent.get("size") == size and ent.get("mtime") == mtime
                             and st is not None and statmod.S_ISREG(st.st_mode)
                             and st.st_size == ent.get("landed_size")
-                            and st.st_mtime_ns == ent.get("landed_mtime_ns")):
+                            and st.st_mtime_ns == ent.get("landed_mtime_ns")
+                            and await self._hash_matches(dirs, comps[-1], ent.get("sha256"))):
                         t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
                                       local_path=rel, cloud_path=Path(visible),
                                       size=size, mtime_unix=mtime, received=size)
@@ -841,6 +937,86 @@ class TransferManager:
                 "Call transfer_status with this transfer_id to keep waiting. Do NOT start the same "
                 "transfer again — it is still running.")
 
+    # ----------------------------------------------------- landing (upload)
+    async def _land(self, t: Transfer, digest: str) -> tuple[os.stat_result, str]:
+        """Give the verified anonymous upload file its final name, never
+        overwriting anything: the linkat fails with EEXIST while the name is
+        taken, a name already taken is first moved aside atomically and
+        overwrite-free (renameat2 RENAME_NOREPLACE), and only a moved-aside
+        copy that provably IS the copy we landed last time (inode + sha256
+        of its content both match the index record) is removed.
+
+        No visible intermediate name ever exists: the file goes straight
+        from anonymous (O_TMPFILE) to the final name. Returns (fstat of the
+        landed fd, agent-visible kept-as path or "")."""
+        dirs = t.dirs
+        assert dirs is not None
+        final = t.cloud_path.name
+        idx_prev = self._index_load(dirs).get(f"{t.pair_id}|{t.local_path}")
+        kept_as = ""
+        for _ in range(20):
+            try:
+                os.link(f"/proc/self/fd/{t.file_fd}", final,
+                        dst_dir_fd=dirs.fd, follow_symlinks=True)
+                st = os.fstat(t.file_fd)
+                if kept_as:
+                    # The agent-visible path of the kept copy: the
+                    # transfer's visible path with the final component
+                    # swapped for the kept-as name.
+                    vis = str(t.result.get("visible") or "")
+                    base = vis.rsplit("/", 1)[0] if "/" in vis else ""
+                    t.result["kept_as"] = f"{base}/{kept_as}" if base else f"/{kept_as}"
+                return st, kept_as
+            except FileExistsError:
+                pass  # the name is taken: move the occupant aside below
+            st_dst = _stat_name(dirs.fd, final)
+            if st_dst is None:
+                continue  # the occupant vanished between the two syscalls
+            if not statmod.S_ISREG(st_dst.st_mode):
+                raise OSError(f"the landing path {final!r} is not a regular file")
+            kept_as = self._keep_cloud_edited(dirs, final)
+            if await self._drop_if_our_last_copy(dirs, kept_as, idx_prev):
+                kept_as = ""  # it was our own untouched copy: nothing to report
+        raise OSError(f"the landing path {final!r} stayed occupied through 20 attempts")
+
+    async def _drop_if_our_last_copy(self, dirs: _Dirs, kept_as: str,
+                                     idx_prev: Any) -> bool:
+        """Delete the moved-aside occupant ONLY if it is provably the copy
+        this adapter landed last time, untouched: its content hashes to the
+        index's sha256 AND the name still resolves to the very inode that
+        was hashed (re-checked after hashing). In every other case — the
+        content was edited, the index has no record, the inode changed, any
+        step fails — the file is kept and the transfer result names it.
+        Returns True when the file was removed."""
+        if not isinstance(idx_prev, dict) or not idx_prev.get("sha256"):
+            return False  # no record of it: it is somebody's work — keep it
+        try:
+            fd = os.open(kept_as, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=dirs.fd)
+        except OSError:
+            return False
+        try:
+            st = os.fstat(fd)
+            if not statmod.S_ISREG(st.st_mode):
+                return False
+            if await asyncio.to_thread(_sha256_fd, fd) != idx_prev["sha256"]:
+                return False  # content changed since we landed it: cloud work — keep it
+            # The stat between hashing and unlinking narrows the race, it
+            # does not close it: the agent could still swap this
+            # timestamped keep-as name in the microsecond between the two
+            # calls, in which case we would remove what it just placed
+            # there. That residual risk is accepted.
+            st2 = _stat_name(dirs.fd, kept_as)
+            if st2 is None or (st2.st_ino, st2.st_dev) != (st.st_ino, st.st_dev):
+                return False
+            os.unlink(kept_as, dir_fd=dirs.fd)
+            logger.info("removed the untouched previous copy of the landed file (kept-as %s)", kept_as)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
     # ----------------------------------------------- bridge-facing HTTP API
     def _auth(self, request: Request, transfer_id: str) -> Transfer | JSONResponse:
         raw = request.headers.get("authorization", "")
@@ -989,40 +1165,7 @@ class TransferManager:
                     # Match the platform's other files (0644), not the 0600
                     # an anonymous O_TMPFILE starts with.
                     os.fchmod(t.file_fd, 0o644)
-                    # Give the anonymous file a name (a random one), then
-                    # move it to the final name — both relative to the
-                    # verified landing dir handle, neither following links.
-                    t.link_name = _link_tmp_name(t.id)
-                    os.link(f"/proc/self/fd/{t.file_fd}", t.link_name,
-                            dst_dir_fd=t.dirs.fd, follow_symlinks=True)
-                    final = t.cloud_path.name
-                    st_dst = _stat_name(t.dirs.fd, final)
-                    if st_dst is not None and not statmod.S_ISREG(st_dst.st_mode):
-                        raise OSError(f"the landing path {final!r} is not a regular file")
-                    kept_as = ""
-                    if st_dst is not None:
-                        # A file already sits at the final name. If it is NOT
-                        # the very copy we landed last time (the agent may
-                        # have edited it), it is somebody's work: rename it
-                        # aside instead of overwriting it. The copy matching
-                        # our index record carries no one else's work and may
-                        # be replaced directly.
-                        idx_prev = self._index_load(t.dirs).get(f"{t.pair_id}|{t.local_path}")
-                        ours = (idx_prev is not None
-                                and st_dst.st_size == idx_prev.get("landed_size")
-                                and st_dst.st_mtime_ns == idx_prev.get("landed_mtime_ns"))
-                        if not ours:
-                            kept_as = self._keep_cloud_edited(t.dirs, final)
-                    os.rename(t.link_name, final, src_dir_fd=t.dirs.fd, dst_dir_fd=t.dirs.fd)
-                    t.link_name = ""
-                    st_final = os.stat(final, dir_fd=t.dirs.fd, follow_symlinks=False)
-                    if kept_as:
-                        # The agent-visible path of the kept copy: the
-                        # transfer's visible path with the final component
-                        # swapped for the kept-as name.
-                        vis = str(t.result.get("visible") or "")
-                        base = vis.rsplit("/", 1)[0] if "/" in vis else ""
-                        t.result["kept_as"] = f"{base}/{kept_as}" if base else f"/{kept_as}"
+                    st_final, kept_as = await self._land(t, digest)
                 except OSError as exc:
                     self._abort(t, f"could not put the file in place in the cloud: {exc}")
                     return {"state": t.state}
