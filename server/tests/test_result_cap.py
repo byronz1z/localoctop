@@ -56,3 +56,37 @@ class TestCapTruncation:
         assert out["isError"] is False
         text = out["content"][0]["text"]
         assert "binary" in text and "fetch_to_cloud" in text
+
+
+class TestCapNotesPerTool:
+    """Round 6, item 10: the truncation note is per tool category, must not
+    claim things that did not happen, and must not call the shown part the
+    complete result."""
+
+    def _note(self, monkeypatch, tool: str) -> str:
+        monkeypatch.setattr(tools_mod, "MODEL_RESULT_CAP_BYTES", 4096)
+        text = ("line of text\n" * 500)
+        out = _svc()._cap(tool, _big_text_result(text))
+        assert out["isError"] is False
+        return out["content"][-1]["text"]
+
+    def test_listing_note_suggests_narrowing_scope(self, monkeypatch):
+        note = self._note(monkeypatch, "list_directory")
+        assert "Narrow the request" in note
+        assert "sub-directory" in note or "excludePatterns" in note
+
+    def test_edit_note_asserts_neither_success_nor_failure(self, monkeypatch):
+        note = self._note(monkeypatch, "edit_file")
+        assert "only the first part" in note
+        # No claim about the edit's outcome, and the shown part is not
+        # called the whole result.
+        for word in ("applied", "failed to match", "the whole result",
+                     "succeeded", "was attempted"):
+            assert word not in note
+
+    def test_other_tools_get_generic_note_without_edit_wording(self, monkeypatch):
+        note = self._note(monkeypatch, "get_file_info")
+        assert "only the first part" in note
+        assert "narrow the request" in note
+        assert "edit" not in note.lower()
+        assert "the whole result" not in note

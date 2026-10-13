@@ -162,13 +162,27 @@ class TestUserNameSafety:
                                      "ma\x00li", "x\ny", "x\x7fy",
                                      # C1 control block must be refused too.
                                      "x\x85y", "x\x9fy",
-                                     # Hidden-directory lookalikes.
-                                     ".hidden", ".config",
                                      ])
     def test_unsafe_names_rejected(self, mgr, bad):
         with pytest.raises(BridgeProtocolError) as ei:
             mgr._user_root_fd(bad)
         assert ei.value.code == CODE_INVALID_PARAMS
+
+    def test_dot_leading_name_accepted(self, users_dir, mgr):
+        """Round 6: the upstream user-name rule (Octop patch 21) allows a
+        leading dot; only '.', '..', separators, blanks and control
+        characters are refused."""
+        _mk_user(users_dir, ".hidden")
+        fd = mgr._user_root_fd(".hidden")
+        os.close(fd)
+
+    async def test_dot_leading_user_can_transfer(self, users_dir, mgr):
+        _mk_user(users_dir, ".hidden")
+        mgr.registry = FakeRegistry({"f.txt": (b"hi", 1000)})
+        t = await mgr.start_upload(".hidden", "pair-1", "f.txt")
+        assert t.state == "active"
+        assert t.dirs is not None and t.file_fd >= 0
+        t.finish(True)  # release the held fds
 
     async def test_missing_user_folder_refused_and_not_created(self, users_dir, mgr):
         reg = FakeRegistry({"doc.txt": (b"hello", 1000)})
@@ -1155,6 +1169,7 @@ class TestLandingNeverOverwrites:
         finally:
             os.close(fd)
         assert tr._libc is not None, "glibc renameat2 unavailable in the test container"
+        assert tr._renameat2_fallbacks == 0, "the test container took the link+unlink fallback"
 
 
 # --------------------------------------- fresh check trusts content (R5, 4)
@@ -1195,3 +1210,334 @@ class TestFreshCheckContentVerified:
         t2 = await mgr.start_upload("alice", "pair-1", "report.xlsx")
         assert t2.state == "done" and t2.result.get("fresh") is True
         assert len(reg.calls) == calls_after_first + 1  # only the stat probe
+
+
+# --------------------------------------------------- LOX-002 round 6 tests
+
+import asyncio
+
+needs_fifo = pytest.mark.skipif(
+    not hasattr(os, "mkfifo"),
+    reason="os.mkfifo is unavailable on this platform")
+
+
+class TestFifoNeverBlocks:
+    """A named pipe the user's AI created must never hang the adapter: the
+    open happens on the event loop thread, so a blocking open() would stall
+    transfers for EVERY user (round 6, item 1)."""
+
+    @needs_fifo
+    async def test_fifo_as_download_source_fails_fast(self, users_dir, mgr):
+        home = _mk_user(users_dir, "alice")
+        os.mkfifo(home / "pipe")
+
+        async def go():
+            with pytest.raises(BridgeProtocolError) as ei:
+                await mgr.start_download("alice", "pair-1", "/pipe", "", False)
+            return ei.value
+        exc = await asyncio.wait_for(go(), timeout=2.0)
+        assert exc.code == CODE_NOT_FOUND
+        assert "not a regular file" in exc.message
+
+    @needs_fifo
+    async def test_fifo_as_index_does_not_block_upload(self, users_dir, mgr):
+        home = _mk_user(users_dir, "alice")
+        landing = home / "localoctop"
+        landing.mkdir()
+        os.mkfifo(landing / ".localoctop-index.json")
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+
+        async def go():
+            async with _client_for(mgr) as client:
+                return await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        t, _ = await asyncio.wait_for(go(), timeout=2.0)
+        assert t.state == "done", t.error
+        # The FIFO was never removed or written through: it was preserved
+        # under a .foreign- name, still a FIFO, and the index name now
+        # holds a regular file (our index).
+        import stat as statmod
+        foreign = [p for p in landing.iterdir() if ".foreign-" in p.name]
+        assert len(foreign) == 1
+        assert statmod.S_ISFIFO(foreign[0].stat().st_mode)
+        assert statmod.S_ISREG((landing / ".localoctop-index.json").stat().st_mode)
+        assert (landing / "f.bin").read_bytes() == b"data"
+
+    @needs_fifo
+    async def test_fifo_at_landing_name_fails_complete_fast(self, users_dir, mgr):
+        home = _mk_user(users_dir, "alice")
+        landing = home / "localoctop"
+        landing.mkdir()
+        os.mkfifo(landing / "f.bin")
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+
+        async def go():
+            async with _client_for(mgr) as client:
+                return await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        t, _ = await asyncio.wait_for(go(), timeout=2.0)
+        assert t.state == "failed"
+        import stat as statmod
+        assert statmod.S_ISFIFO((landing / "f.bin").stat().st_mode)
+
+
+class TestIndexBadData:
+    """The index file is user-writable ground: any garbage in it must read
+    as 'no index', never as an exception (round 6, item 2)."""
+
+    @pytest.mark.parametrize("payload", [
+        b"[]", b"null", b'"x"', b'{"a": 1}', b"\xff\xfe not utf-8",
+    ])
+    async def test_bad_index_content_upload_still_works(self, users_dir, mgr, payload):
+        landing = _landing(users_dir, "alice")
+        landing.mkdir(parents=True)
+        (landing / ".localoctop-index.json").write_bytes(payload)
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        assert t.state == "done", t.error
+        assert (landing / "f.bin").read_bytes() == b"data"
+
+    async def test_oversized_index_read_as_empty(self, users_dir, mgr):
+        landing = _landing(users_dir, "alice")
+        landing.mkdir(parents=True)
+        big = b'{"' + b"x" * (5 * 1024 * 1024) + b'": {}}'
+        (landing / ".localoctop-index.json").write_bytes(big)
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        assert t.state == "done", t.error
+        # The oversized file was recognised as not-our-index and preserved.
+        assert [p for p in landing.iterdir() if ".foreign-" in p.name]
+
+
+class TestReservedIndexName:
+    async def test_upload_named_like_index_saved_aside(self, users_dir, mgr):
+        """A local file literally named '.localoctop-index.json' must NOT
+        land on the index name (the adapter would overwrite it on the next
+        index save): it lands as '.uploaded', and the result says so —
+        a normal outcome (isError=false at the tool layer)."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({".localoctop-index.json": (b"user-content", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", ".localoctop-index.json", b"user-content")
+        assert t.state == "done", t.error
+        landing = _landing(users_dir, "alice")
+        assert (landing / ".localoctop-index.json.uploaded").read_bytes() == b"user-content"
+        idx = _read_index(users_dir, "alice")  # still a valid index
+        assert "pair-1|.localoctop-index.json" in idx
+        assert "saved as" in mgr.describe(t)
+        assert ".localoctop-index.json.uploaded" in mgr.describe(t)
+        # Tool layer: not an error (no advisory flag, state done).
+        assert not t.result.get("advisory")
+
+    async def test_foreign_json_at_index_name_preserved(self, users_dir, mgr):
+        """Somebody's own JSON file sits at the index name: after one upload
+        it must survive under a .foreign- name, content intact, and the
+        index name holds OUR index."""
+        landing = _landing(users_dir, "alice")
+        landing.mkdir(parents=True)
+        (landing / ".localoctop-index.json").write_text('{"my": "notes"}', "utf-8")
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        assert t.state == "done", t.error
+        foreign = [p for p in landing.iterdir() if ".foreign-" in p.name]
+        assert len(foreign) == 1
+        assert foreign[0].read_text("utf-8") == '{"my": "notes"}'
+        idx = _read_index(users_dir, "alice")
+        assert "pair-1|f.bin" in idx
+
+
+class TestHashRaceDefence:
+    async def test_file_changed_mid_hash_is_kept(self, users_dir, mgr, monkeypatch):
+        """The occupant is rewritten WHILE its sha256 is being computed:
+        the before/after fstat must catch it and the copy must survive
+        (round 6, item 4)."""
+        import localoctop.transfers as tr
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"doc.txt": (b"v1", 1000)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1")
+            assert t1.state == "done"
+            mgr.registry = FakeRegistry({"doc.txt": (b"v2", 2000)})
+            dest = users_dir / "alice" / "localoctop" / "doc.txt"
+            real = tr._sha256_fd_own
+            state = {"done": False}
+
+            def racing(fd):
+                if not state["done"]:
+                    state["done"] = True
+                    dest.write_bytes(b"edited-mid-hash")
+                return real(fd)
+
+            monkeypatch.setattr(tr, "_sha256_fd_own", racing)
+            t2, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v2")
+        assert t2.state == "done", t2.error
+        landing = dest.parent
+        kept = [p for p in landing.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1
+        assert kept[0].read_bytes() == b"edited-mid-hash"
+        assert dest.read_bytes() == b"v2"
+
+
+class TestThreadsAndHandles:
+    async def test_cancelled_hash_thread_cannot_touch_recycled_fd(self, users_dir, mgr, monkeypatch):
+        """A slow hashing thread outlives its cancelled coroutine and the
+        transfer's own handle cleanup; because the thread works on a
+        duplicated fd it owns, the next transfer (which recycles the fd
+        number) is never read or written by it (round 6, item 5)."""
+        import localoctop.transfers as tr
+        import threading
+        home = _mk_user(users_dir, "alice")
+        (home / "one.txt").write_bytes(b"first-file")
+        real = tr._sha256_fd_own
+        entered = threading.Event()
+        release = threading.Event()
+        state = {"patch": True}
+
+        def slow(fd):
+            if state["patch"]:
+                entered.set()
+                release.wait(5.0)
+            return real(fd)
+
+        monkeypatch.setattr(tr, "_sha256_fd_own", slow)
+        task = asyncio.create_task(mgr.start_download("alice", "pair-1", "/one.txt", "", False))
+        # Wait until the worker thread is inside the slow hash.
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 2.0), 3.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The transfer record finished and released its own handles.
+        for t in mgr._transfers.values():
+            assert t.state != "active"
+            assert t.file_fd == -1
+        # A new transfer recycles fd numbers; the slow thread must not
+        # interfere with it.
+        state["patch"] = False
+        (home / "two.txt").write_bytes(b"second-file")
+        t2 = await mgr.start_download("alice", "pair-1", "/two.txt", "", False)
+        assert t2.expected_sha == hashlib.sha256(b"second-file").hexdigest()
+        t2.finish(True)
+        assert (home / "two.txt").read_bytes() == b"second-file"
+        # Let the slow thread finish; it must not raise into the void.
+        release.set()
+        await asyncio.sleep(0.2)
+
+    async def test_aclose_fails_inflight_transfers_and_releases_handles(self, users_dir, mgr):
+        _mk_user(users_dir, "alice")
+        home = users_dir / "alice"
+        (home / "out.txt").write_bytes(b"payload")
+        mgr.registry = FakeRegistry({"up.bin": (b"up-data", 1000)})
+        before = len(os.listdir("/proc/self/fd"))
+        t_up = await mgr.start_upload("alice", "pair-1", "up.bin")
+        t_down = await mgr.start_download("alice", "pair-1", "/out.txt", "", False)
+        assert t_up.state == "active" and t_down.state == "active"
+        await mgr.aclose()
+        assert t_up.state == "failed" and "shutting down" in t_up.error
+        assert t_down.state == "failed" and "shutting down" in t_down.error
+        assert t_up.file_fd == -1 and t_down.file_fd == -1
+        assert len(os.listdir("/proc/self/fd")) <= before
+
+
+class TestCompleteRobustness:
+    async def test_index_save_failure_still_succeeds_and_idempotent(self, users_dir, mgr):
+        """Landing succeeded but the index cannot be saved (a non-empty
+        directory sits at the index name): the transfer is done, the file
+        is in place, the request does not error, handles are released, and
+        a retried complete returns the same state without touching the
+        landed file (round 6, item 7)."""
+        landing = _landing(users_dir, "alice")
+        landing.mkdir(parents=True)
+        blocker = landing / ".localoctop-index.json"
+        blocker.mkdir()
+        (blocker / "inner").write_bytes(b"x")  # non-empty: rmdir impossible
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        before = len(os.listdir("/proc/self/fd"))
+        async with _client_for(mgr) as client:
+            t, resp = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+            assert resp.status_code == 200
+            assert t.state == "done", t.error
+            dest = landing / "f.bin"
+            assert dest.read_bytes() == b"data"
+            st1 = dest.stat()
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+            r2 = await client.post(f"/mcp/localoctop/transfer/{t.id}/complete",
+                                   json={"ok": True, "size": 4,
+                                         "sha256": hashlib.sha256(b"data").hexdigest()},
+                                   headers=auth)
+            assert r2.status_code == 200 and r2.json()["state"] == "done"
+            st2 = dest.stat()
+            assert (st1.st_ino, st1.st_mtime_ns) == (st2.st_ino, st2.st_mtime_ns)
+        assert len(os.listdir("/proc/self/fd")) <= before
+
+
+class TestLandingRetries:
+    async def test_occupant_moved_away_during_landing_retries(self, users_dir, mgr):
+        """The occupant vanishes between the EEXIST and the keep-aside
+        (somebody else moved it first): _land retries and succeeds."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir()
+        (landing / "doc.txt").write_bytes(b"agent-made")
+        mgr.registry = FakeRegistry({"doc.txt": (b"fresh", 1000)})
+        real_keep = mgr._keep_cloud_edited
+        state = {"done": False}
+
+        def whisk_away(dirs, name):
+            if not state["done"]:
+                state["done"] = True
+                os.rename(landing / name, landing / "whisked-away.txt")
+            return real_keep(dirs, name)
+
+        mgr._keep_cloud_edited = whisk_away
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"fresh")
+        assert t.state == "done", t.error
+        assert (landing / "doc.txt").read_bytes() == b"fresh"
+        assert (landing / "whisked-away.txt").read_bytes() == b"agent-made"
+
+    async def test_two_conflicts_report_both_kept_names(self, users_dir, mgr):
+        """Two successive conflicts produce two kept-aside copies and the
+        result text names BOTH (round 6, item 8)."""
+        _mk_user(users_dir, "alice")
+        landing = _landing(users_dir, "alice")
+        landing.mkdir()
+        (landing / "doc.txt").write_bytes(b"occupant-one")
+        mgr.registry = FakeRegistry({"doc.txt": (b"fresh", 1000)})
+        real_keep = mgr._keep_cloud_edited
+        state = {"n": 0}
+
+        def replant(dirs, name):
+            kept = real_keep(dirs, name)
+            state["n"] += 1
+            if state["n"] == 1:
+                # A new occupant appears right after the first was moved.
+                (landing / name).write_bytes(b"occupant-two")
+            return kept
+
+        mgr._keep_cloud_edited = replant
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"fresh")
+        assert t.state == "done", t.error
+        assert len(t.result.get("kept_as_list") or []) == 2
+        text = mgr.describe(t)
+        for kept in t.result["kept_as_list"]:
+            assert kept in text
+        kept_files = sorted(p.read_bytes() for p in landing.iterdir()
+                            if ".cloud-edited-" in p.name)
+        assert kept_files == [b"occupant-one", b"occupant-two"]
+        assert (landing / "doc.txt").read_bytes() == b"fresh"
+
+
+class TestLandingSubdirValidation:
+    @pytest.mark.parametrize("bad", ["a/b", "..", "", ".", "a\\b", "x\x01y"])
+    def test_invalid_subdir_refused_at_startup(self, users_dir, monkeypatch, bad):
+        monkeypatch.setenv("LOCALOCTOP_LANDING_SUBDIR", bad)
+        with pytest.raises(ValueError) as ei:
+            TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        assert "LOCALOCTOP_LANDING_SUBDIR" in str(ei.value)
+
+    def test_valid_subdir_accepted(self, users_dir, monkeypatch):
+        monkeypatch.setenv("LOCALOCTOP_LANDING_SUBDIR", "incoming.files")
+        m = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        assert m.landing_subdir == "incoming.files"

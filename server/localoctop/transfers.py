@@ -55,6 +55,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -100,6 +101,14 @@ RECORD_TTL_SECONDS = 3600.0
 
 _INDEX_NAME = ".localoctop-index.json"
 _INDEX_TMP_PREFIX = ".localoctop-index.json.tmp-"
+# Format marker written into every index we save: a JSON object carrying
+# this key is OUR index. Anything else at the index name (somebody's notes
+# file, a directory, a FIFO, ...) is preserved, never overwritten.
+_INDEX_MARK = "_localoctop_index"
+# An index larger than this is treated as "no index": the per-user index
+# holds a handful of small entries, so megabytes of "index" can only be
+# something the agent dropped at the reserved name.
+_INDEX_MAX_BYTES = 4 * 1024 * 1024
 
 # A user name (== the token's user_id == the Octop folder name) must not
 # contain anything that could break the one-folder-per-user confinement.
@@ -119,10 +128,11 @@ def _open_dir(parent_fd: int, name: str) -> int:
 def _check_user_name(user_id: str) -> str:
     """Validate that user_id is safe to use as a folder name, verbatim.
 
-    Allowed: any non-blank name without path separators, control characters,
-    or a leading "." (which would collide with hidden directories such as
-    the per-user index) — Chinese names such as '马威' are fine and kept
-    as-is.
+    Allowed: any non-blank name without path separators or control
+    characters — Chinese names such as '马威' are fine and kept as-is, and
+    a leading dot is fine too (matches the upstream Octop rule; a user
+    folder named ".hidden" is still confined to its own tree). Control
+    characters include C0, DEL and the C1 block (U+0080-U+009F).
     """
     if not user_id or not user_id.strip():
         raise BridgeProtocolError(
@@ -134,11 +144,6 @@ def _check_user_name(user_id: str) -> str:
             CODE_INVALID_PARAMS,
             f"the token's user name {user_id!r} is not a valid folder name "
             "(it would escape the per-user folder)")
-    if user_id.startswith("."):
-        raise BridgeProtocolError(
-            CODE_INVALID_PARAMS,
-            f"the token's user name {user_id!r} starts with a dot; "
-            "a user name must not look like a hidden directory")
     if "/" in user_id or "\\" in user_id:
         raise BridgeProtocolError(
             CODE_INVALID_PARAMS,
@@ -260,6 +265,65 @@ def _index_tmp_name() -> str:
     return f"{_INDEX_TMP_PREFIX}{secrets.token_urlsafe(12)}"
 
 
+_O_FILE_FLAGS = (os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+                 | getattr(os, "O_NONBLOCK", 0))
+
+
+def _open_regular_file(dir_fd: int, name: str) -> int:
+    """Open `name` below a verified dir handle for reading, refusing
+    anything that is not a regular file.
+
+    O_NONBLOCK is what keeps a FIFO (named pipe) from hanging the whole
+    adapter: open(2) on a FIFO otherwise blocks until a writer shows up,
+    and this call runs on the event loop thread — one user's pipe would
+    stall transfers for EVERY user. O_NOFOLLOW refuses symlinks. Right
+    after the open, fstat must say S_ISREG or the fd is closed and the
+    caller gets OSError. O_NONBLOCK is then cleared so later reads behave
+    like plain blocking file reads (it never had an effect on regular
+    files; clearing keeps behaviour uniform)."""
+    fd = os.open(name, _O_FILE_FLAGS, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not statmod.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, f"not a regular file: {name!r}", name)
+        fcntl.fcntl(fd, fcntl.F_SETFL,
+                    fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _sha256_fd(fd: int) -> str:
+    """SHA-256 of an open file, read through the fd itself: the digest is of
+    the exact object that was verified, whatever happens to its name."""
+    h = hashlib.sha256()
+    offset = 0
+    while True:
+        block = os.pread(fd, 1024 * 1024, offset)
+        if not block:
+            break
+        h.update(block)
+        offset += len(block)
+    return h.hexdigest()
+
+
+def _sha256_fd_own(fd: int) -> str:
+    """_sha256_fd on a duplicated fd the worker thread owns end to end:
+    closes it no matter how the hashing ends. The coroutine that handed the
+    fd over keeps its own — a cancelled coroutine closing its half can
+    never pull the rug from under the thread (a bare fd number would be
+    recycled by the next transfer, and the thread could then read someone
+    else's file through it)."""
+    try:
+        return _sha256_fd(fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------- renameat2
 # The Python standard library has no renameat2, so call libc directly.
 # RENAME_NOREPLACE makes the rename fail with EEXIST when the destination
@@ -284,6 +348,7 @@ def _rename_noreplace(dir_fd: int, old: str, new: str) -> None:
     during which the file sits under both names (a concurrent swap of the
     source name would make us rename whatever the name holds at link time —
     still never an overwrite of `new`)."""
+    global _renameat2_fallbacks
     old_b, new_b = os.fsencode(old), os.fsencode(new)
     if _libc is not None:
         rc = _libc.renameat2(dir_fd, old_b, dir_fd, new_b, _RENAME_NOREPLACE)
@@ -295,8 +360,14 @@ def _rename_noreplace(dir_fd: int, old: str, new: str) -> None:
         # renameat2 unsupported at runtime: use the fallback below.
     # Fallback: link(new) refuses EEXIST, so `new` is never overwritten;
     # unlink(old) then removes the source name.
+    _renameat2_fallbacks += 1
     os.link(old, new_b, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
     os.unlink(old_b, dir_fd=dir_fd)
+
+
+# Counts link+unlink fallbacks: the test suite asserts this stays 0 in the
+# container (the primary renameat2 path is the one production relies on).
+_renameat2_fallbacks = 0
 
 
 @dataclass
@@ -358,8 +429,17 @@ class TransferManager:
         # Mount point of all per-user Octop folders: {users_dir}/<user_id>/.
         self.users_dir = Path(e.get("LOCALOCTOP_USERS_DIR", "/users"))
         # Sub-folder inside each user's folder where fetched files land (the
-        # agent sees it as "/{landing_subdir}").
-        self.landing_subdir = e.get("LOCALOCTOP_LANDING_SUBDIR", "localoctop").strip("/") or "localoctop"
+        # agent sees it as "/{landing_subdir}"). Must be ONE plain directory
+        # name: anything else (a path, ".", control characters) would break
+        # the handle-anchored confinement below, so refuse to start at all.
+        raw_subdir = e.get("LOCALOCTOP_LANDING_SUBDIR", "localoctop")
+        if (not raw_subdir or raw_subdir in (".", "..")
+                or "/" in raw_subdir or "\\" in raw_subdir
+                or _CTRL.search(raw_subdir)):
+            raise ValueError(
+                f"LOCALOCTOP_LANDING_SUBDIR must be a single directory name "
+                f"(no '/', '\\\\', '.'/'..' or control characters), got {raw_subdir!r}")
+        self.landing_subdir = raw_subdir
         self.max_bytes = int(e.get("LOCALOCTOP_MAX_TRANSFER_BYTES", DEFAULT_MAX_TRANSFER_BYTES))
         self._transfers: dict[str, Transfer] = {}
         self._index_lock = asyncio.Lock()
@@ -417,25 +497,105 @@ class TransferManager:
 
     def _index_load(self, dirs: _Dirs) -> dict[str, Any]:
         """Read the per-user index through the verified landing dir handle.
-        An index replaced by a symlink (or anything but a readable regular
-        file) is treated as "no index" — we must never follow it."""
+
+        Defensive against everything a user folder can hold at the reserved
+        name: a symlink or FIFO (opening follows neither and blocks on
+        neither — see _open_regular_file), a non-regular file, an oversized
+        file, invalid UTF-8/JSON, or valid JSON of the wrong shape. Every
+        one of those reads as "no index"; this method never raises. Entries
+        whose value is not an object are dropped individually."""
         try:
-            fd = os.open(_INDEX_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         dir_fd=dirs.fd)
+            fd = _open_regular_file(dirs.fd, _INDEX_NAME)
         except OSError:
             return {}
         try:
+            if os.fstat(fd).st_size > _INDEX_MAX_BYTES:
+                return {}
             with os.fdopen(fd, "rb") as f:
-                return json.loads(f.read().decode("utf-8"))
-        except (OSError, ValueError):
+                raw = f.read(_INDEX_MAX_BYTES + 1)
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        # Drop the format marker and any entry that is not an object.
+        return {k: v for k, v in data.items()
+                if k != _INDEX_MARK and isinstance(v, dict)}
+
+    @staticmethod
+    def _is_our_index(fd: int) -> bool:
+        """True when the open file holds OUR index: a JSON object either
+        carrying the format marker, or of the pre-marker shape (every value
+        an object — the entries table older versions wrote). Anything else
+        (notes file, config, ...) is foreign and must be preserved. Reads at
+        most _INDEX_MAX_BYTES; never raises."""
+        try:
+            raw = os.pread(fd, _INDEX_MAX_BYTES + 1, 0)
+            if len(raw) > _INDEX_MAX_BYTES:
+                return False
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        if data.get(_INDEX_MARK):
+            return True
+        # Legacy unmarked index: an object whose values are all objects.
+        return all(isinstance(v, dict) for v in data.values())
+
+    def _preserve_foreign_index(self, dirs: _Dirs) -> None:
+        """Whatever sits at the index name is NOT our index: move it aside,
+        overwrite-free, to "<index>.foreign-<timestamp>" (numeric suffix on
+        collision) so saving our index never destroys somebody's file. A
+        missing name or a failed move is logged and ignored — index
+        persistence must never break a landed transfer."""
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        for i in range(0, 1000):
+            cand = f"{_INDEX_NAME}.foreign-{stamp}{'' if i == 0 else f'-{i}'}"
+            try:
+                _rename_noreplace(dirs.fd, _INDEX_NAME, cand)
+                logger.warning("foreign file at the index name preserved as %s", cand)
+                return
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                logger.warning("could not preserve the foreign file at the index name: %s", exc)
+                return
+        logger.warning("no free .foreign- name for the file at the index name; leaving it")
 
     def _index_save(self, dirs: _Dirs, idx: dict[str, Any]) -> None:
         """Replace the index atomically relative to the verified dir handle.
         The temp name is random and created O_EXCL: a link the user planted
         at the index's name is swapped away by the rename, never written
-        through (rename never follows a symlink at the destination)."""
-        data = json.dumps(idx, ensure_ascii=False).encode("utf-8")
+        through (rename never follows a symlink at the destination).
+
+        Before the swap: whatever currently sits at the index name and is
+        NOT recognizably our own index (not a regular file, or not parseable
+        as our format — see _is_our_index) is moved aside to a .foreign-
+        name instead of being overwritten."""
+        st = _stat_name(dirs.fd, _INDEX_NAME)
+        if st is not None:
+            ours = False
+            if statmod.S_ISREG(st.st_mode):
+                try:
+                    fd = _open_regular_file(dirs.fd, _INDEX_NAME)
+                except OSError:
+                    fd = -1
+                if fd >= 0:
+                    try:
+                        ours = self._is_our_index(fd)
+                    finally:
+                        os.close(fd)
+            if not ours:
+                self._preserve_foreign_index(dirs)
+        data = json.dumps({**idx, _INDEX_MARK: 1}, ensure_ascii=False).encode("utf-8")
         tmp = _index_tmp_name()
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=dirs.fd)
@@ -543,8 +703,11 @@ class TransferManager:
                 logger.exception("transfer scan failed; retrying next interval")
 
     async def aclose(self) -> None:
-        """Stop the background scan (called from the app lifespan on
-        shutdown). Transfer records themselves live until their TTL."""
+        """Shut the manager down: stop the background scan, then fail every
+        transfer still in flight and release its handles (called from the
+        app lifespan on shutdown). fds handed to worker threads were
+        duplicated first (the thread closes its own copy), so closing the
+        coroutine's copies here cannot touch I/O still running."""
         task = self._scan_task
         self._scan_task = None
         if task is not None:
@@ -553,6 +716,9 @@ class TransferManager:
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        for t in list(self._transfers.values()):
+            if t.state == "active":
+                t.finish(False, "the localoctop adapter is shutting down; start the transfer again")
 
     def _abort(self, t: Transfer, msg: str) -> None:
         t.finish(False, msg)
@@ -630,20 +796,25 @@ class TransferManager:
                         "(a link sits in its path); only files inside your own folder "
                         "can be sent to the user's machine")
             try:
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                             dir_fd=chain.fd)
+                fd = _open_regular_file(chain.fd, parts[-1])
             except FileNotFoundError:
                 raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
-            except OSError:
-                # Includes ELOOP (the final component is a symlink).
+            except OSError as exc:
+                # ELOOP: the final component is a symlink. Anything else
+                # (a directory, a FIFO, a device node — see
+                # _open_regular_file) is not a regular file either: refused
+                # without ever blocking on it.
+                if exc.errno == errno.ELOOP:
+                    raise BridgeProtocolError(
+                        CODE_NOT_ALLOWED,
+                        f"{raw!r} is a link, not a regular file; only files inside your own "
+                        "folder can be sent to the user's machine")
                 raise BridgeProtocolError(
-                    CODE_NOT_ALLOWED,
-                    f"{raw!r} is a link, not a regular file; only files inside your own "
-                    "folder can be sent to the user's machine")
+                    CODE_NOT_FOUND,
+                    f"{raw!r} is not a regular file (a directory, pipe or device cannot be "
+                    "sent to the user's machine)")
             try:
                 st = os.fstat(fd)
-                if not statmod.S_ISREG(st.st_mode):
-                    raise BridgeProtocolError(CODE_NOT_FOUND, f"cloud file not found: {raw}")
             except BaseException:
                 os.close(fd)
                 raise
@@ -654,20 +825,35 @@ class TransferManager:
 
     async def _hash_matches(self, dirs: _Dirs, name: str, sha256: Any) -> bool:
         """True when the regular file `name` below the verified dir handle
-        hashes (on its open fd, links never followed) to `sha256`. Any open
-        or read failure — including a symlink or a mid-check deletion —
-        simply means "not the same copy": the caller re-transfers."""
+        provably still is the recorded copy: it hashes (on its open fd,
+        links never followed, FIFOs refused) to `sha256`, AND fstat before
+        and after the hashing shows the same size, st_mtime_ns and
+        st_ctime_ns — a file rewritten while we read it can coincidentally
+        hash right only if nothing changed, so any change means "cannot
+        prove untouched". That check does NOT close the race (a write can
+        land between the second fstat and the caller's next step; it only
+        catches the obvious cases); whenever in doubt the caller keeps the
+        file. Any open or read failure — including a symlink or a mid-check
+        deletion — simply means "not the same copy": the caller
+        re-transfers."""
         if not isinstance(sha256, str) or not sha256:
             return False
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dirs.fd)
+            fd = _open_regular_file(dirs.fd, name)
         except OSError:
             return False
         try:
-            st = os.fstat(fd)
-            if not statmod.S_ISREG(st.st_mode):
+            st1 = os.fstat(fd)
+            try:
+                dup = os.dup(fd)
+            except OSError:
                 return False
-            return await asyncio.to_thread(_sha256_fd, fd) == sha256
+            digest = await asyncio.to_thread(_sha256_fd_own, dup)
+            st2 = os.fstat(fd)
+            if (st1.st_size, st1.st_mtime_ns, st1.st_ctime_ns) != \
+                    (st2.st_size, st2.st_mtime_ns, st2.st_ctime_ns):
+                return False  # changed while we hashed: cannot prove untouched
+            return digest == sha256
         except OSError:
             return False
         finally:
@@ -798,16 +984,17 @@ class TransferManager:
                 await self._call(user_id, pair_id, "transfer_upload",
                                  {"path": local_path, "max_bytes": self.max_bytes, **self._bridge_params(t)})
             except BridgeProtocolError as exc:
+                t.finish(False, exc.message)  # release the temp fd and dir handles
                 if exc.code == CODE_TOO_LARGE:
-                    # Release this transfer's handles before handing back a
-                    # fresh advisory record (finish() unlinks any
-                    # materialized name, closes the temp fd and the dirs).
-                    t.finish(False, exc.message)
                     return self._advisory(
                         user_id, pair_id, "up", rel, str(visible), size,
                         f"file is over the {self.max_bytes:,}-byte transfer limit "
                         "(it grew between the size check and the upload start)")
-                self._abort(t, exc.message)
+                raise
+            except BaseException:
+                # OSError, cancellation, anything: the handles this transfer
+                # already holds are released before the exception travels on.
+                t.finish(False, "the upload could not be started")
                 raise
             return t
         finally:
@@ -834,12 +1021,15 @@ class TransferManager:
         try:
             # Hash the held fd, not the path: the digest is of the exact
             # file /content will serve, whatever the user does to the name.
-            t.expected_sha = await asyncio.to_thread(_sha256_fd, fd)
+            # The thread gets its own duplicated fd and closes it itself.
+            t.expected_sha = await asyncio.to_thread(_sha256_fd_own, os.dup(fd))
             acc = await self._call(user_id, pair_id, "transfer_download",
                                    {"path": t.local_path, "size": size, "sha256": t.expected_sha,
                                     "overwrite": bool(overwrite), **self._bridge_params(t)})
-        except BridgeProtocolError as exc:
-            t.finish(False, exc.message)
+        except BaseException as exc:
+            # Any failure after the handles were allocated — protocol error,
+            # OSError, cancellation — ends the transfer and releases them.
+            t.finish(False, getattr(exc, "message", None) or "the download could not be started")
             raise
         t.local_path = str(acc.get("path") or t.local_path)
         return t
@@ -897,12 +1087,18 @@ class TransferManager:
             kept = t.result.get("kept_as")
             kept_line = (f"The previous cloud copy had been modified and was kept as {kept}.\n"
                          if kept else "")
+            kept_list = t.result.get("kept_as_list") or []
+            if len(kept_list) > 1:
+                kept_line += "All kept copies: " + ", ".join(kept_list) + ".\n"
+            saved_as = t.result.get("saved_as")
+            saved_line = (f"Note: {saved_as}\n" if saved_as else "")
             return (f"DONE {what}{fresh}\n"
                     f"cloud_path: {self._agent_view(t)}\n"
                     f"local_path: {t.local_path}\n"
                     f"size: {t.size:,} bytes\n"
                     f"sha256: {t.result.get('sha256', '')}\n"
                     f"{kept_line}"
+                    f"{saved_line}"
                     "The file is now on the cloud machine at cloud_path. Work on it there with your own "
                     "file/shell tools. It is a copy: the user's original stays untouched on their machine.\n"
                     "If the file is larger than 10 MB, process it with command-line tools (execute): "
@@ -938,7 +1134,18 @@ class TransferManager:
                 "transfer again — it is still running.")
 
     # ----------------------------------------------------- landing (upload)
-    async def _land(self, t: Transfer, digest: str) -> tuple[os.stat_result, str]:
+    @staticmethod
+    def _free_name(dirs: _Dirs, name: str) -> str:
+        """`name` if free below the verified dir handle, else name-1, -2…"""
+        if _stat_name(dirs.fd, name) is None:
+            return name
+        for i in range(1, 1000):
+            cand = f"{name}-{i}"
+            if _stat_name(dirs.fd, cand) is None:
+                return cand
+        raise OSError(f"no free alternative name for {name!r}")
+
+    async def _land(self, t: Transfer, digest: str) -> tuple[os.stat_result, list[str]]:
         """Give the verified anonymous upload file its final name, never
         overwriting anything: the linkat fails with EEXIST while the name is
         taken, a name already taken is first moved aside atomically and
@@ -946,27 +1153,40 @@ class TransferManager:
         copy that provably IS the copy we landed last time (inode + sha256
         of its content both match the index record) is removed.
 
+        A final name that collides with the connector's own reserved names
+        (the index, or an index temp prefix) never receives user content:
+        the file lands as "<name>.uploaded" (numeric suffix when taken) and
+        the result tells the agent so — a normal outcome, not an error.
+
         No visible intermediate name ever exists: the file goes straight
         from anonymous (O_TMPFILE) to the final name. Returns (fstat of the
-        landed fd, agent-visible kept-as path or "")."""
+        landed fd, kept-as names of every copy moved aside — all of them,
+        not just the last)."""
         dirs = t.dirs
         assert dirs is not None
         final = t.cloud_path.name
+        if final == _INDEX_NAME or final.startswith(_INDEX_TMP_PREFIX):
+            final = self._free_name(dirs, f"{final}.uploaded")
+            t.result["saved_as"] = (
+                f"the name {t.cloud_path.name!r} is reserved for the connector itself; "
+                f"the file was saved as {final!r} instead")
         idx_prev = self._index_load(dirs).get(f"{t.pair_id}|{t.local_path}")
-        kept_as = ""
+        kept_list: list[str] = []
         for _ in range(20):
             try:
                 os.link(f"/proc/self/fd/{t.file_fd}", final,
                         dst_dir_fd=dirs.fd, follow_symlinks=True)
                 st = os.fstat(t.file_fd)
-                if kept_as:
-                    # The agent-visible path of the kept copy: the
+                if kept_list:
+                    # The agent-visible paths of the kept copies: the
                     # transfer's visible path with the final component
-                    # swapped for the kept-as name.
+                    # swapped for each kept-as name.
                     vis = str(t.result.get("visible") or "")
                     base = vis.rsplit("/", 1)[0] if "/" in vis else ""
-                    t.result["kept_as"] = f"{base}/{kept_as}" if base else f"/{kept_as}"
-                return st, kept_as
+                    t.result["kept_as_list"] = [
+                        f"{base}/{k}" if base else f"/{k}" for k in kept_list]
+                    t.result["kept_as"] = t.result["kept_as_list"][-1]
+                return st, kept_list
             except FileExistsError:
                 pass  # the name is taken: move the occupant aside below
             st_dst = _stat_name(dirs.fd, final)
@@ -974,33 +1194,56 @@ class TransferManager:
                 continue  # the occupant vanished between the two syscalls
             if not statmod.S_ISREG(st_dst.st_mode):
                 raise OSError(f"the landing path {final!r} is not a regular file")
-            kept_as = self._keep_cloud_edited(dirs, final)
+            try:
+                kept_as = self._keep_cloud_edited(dirs, final)
+            except FileNotFoundError:
+                # Someone else moved the occupant away first: not a failure —
+                # retry the landing link against the now-free (or newly
+                # occupied) name.
+                continue
             if await self._drop_if_our_last_copy(dirs, kept_as, idx_prev):
-                kept_as = ""  # it was our own untouched copy: nothing to report
-        raise OSError(f"the landing path {final!r} stayed occupied through 20 attempts")
+                continue  # it was our own untouched copy: nothing to report
+            kept_list.append(kept_as)
+        raise OSError(
+            f"the landing path {final!r} stayed occupied through 20 attempts"
+            + (f"; the conflicting copies were moved aside to: {', '.join(kept_list)}"
+               if kept_list else ""))
 
     async def _drop_if_our_last_copy(self, dirs: _Dirs, kept_as: str,
                                      idx_prev: Any) -> bool:
         """Delete the moved-aside occupant ONLY if it is provably the copy
         this adapter landed last time, untouched: its content hashes to the
-        index's sha256 AND the name still resolves to the very inode that
-        was hashed (re-checked after hashing). In every other case — the
-        content was edited, the index has no record, the inode changed, any
-        step fails — the file is kept and the transfer result names it.
-        Returns True when the file was removed."""
+        index's sha256, fstat before AND after hashing shows the same size,
+        st_mtime_ns and st_ctime_ns (a rewrite mid-hash means "cannot prove
+        untouched" — keep it), and the name still resolves to the very inode
+        that was hashed. In every other case — the content was edited, the
+        index has no record, the inode changed, any step fails — the file is
+        kept and the transfer result names it.
+
+        The before/after fstat does NOT close the race: a write landing
+        between the last check and the unlink would still be lost. It only
+        catches the obvious cases, and whenever in doubt the file is kept —
+        that residual risk is accepted. Returns True when the file was
+        removed."""
         if not isinstance(idx_prev, dict) or not idx_prev.get("sha256"):
             return False  # no record of it: it is somebody's work — keep it
         try:
-            fd = os.open(kept_as, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                         dir_fd=dirs.fd)
+            fd = _open_regular_file(dirs.fd, kept_as)
         except OSError:
             return False
         try:
             st = os.fstat(fd)
-            if not statmod.S_ISREG(st.st_mode):
+            try:
+                dup = os.dup(fd)
+            except OSError:
                 return False
-            if await asyncio.to_thread(_sha256_fd, fd) != idx_prev["sha256"]:
+            digest = await asyncio.to_thread(_sha256_fd_own, dup)
+            if digest != idx_prev["sha256"]:
                 return False  # content changed since we landed it: cloud work — keep it
+            st_after = os.fstat(fd)
+            if (st.st_size, st.st_mtime_ns, st.st_ctime_ns) != \
+                    (st_after.st_size, st_after.st_mtime_ns, st_after.st_ctime_ns):
+                return False  # rewritten while we hashed: cannot prove untouched
             # The stat between hashing and unlinking narrows the race, it
             # does not close it: the agent could still swap this
             # timestamped keep-as name in the microsecond between the two
@@ -1079,7 +1322,21 @@ class TransferManager:
                 try:
                     # All chunks go to the one anonymous temp fd held since
                     # the start; the folder's names cannot redirect this.
-                    await asyncio.to_thread(os.pwrite, t.file_fd, bytes(buf), t.received)
+                    # The worker thread writes through its OWN duplicated fd
+                    # and closes it itself: if this coroutine is cancelled
+                    # and the transfer's handles are released meanwhile, the
+                    # thread's write still lands on the file it was meant
+                    # for — never on whatever recycled the fd number.
+                    try:
+                        wfd = os.dup(t.file_fd)
+                    except OSError as exc:
+                        raise OSError(f"could not duplicate the temp fd: {exc}") from exc
+                    try:
+                        await asyncio.to_thread(_pwrite_own, wfd, bytes(buf), t.received)
+                    except asyncio.CancelledError:
+                        # The thread finishes on its own fd (it is allowed
+                        # to — the temp data dies with the transfer).
+                        raise
                 except OSError as exc:
                     self._abort(t, f"could not write to cloud storage: {exc}")
                     return JSONResponse({"error": "storage write failed"}, status_code=507)
@@ -1106,10 +1363,17 @@ class TransferManager:
             async def body():
                 # Reads go through the fd captured at start_download: even if
                 # the source path was renamed or replaced by a link since,
-                # the bytes served are the file that was verified then.
+                # the bytes served are the file that was verified then. Each
+                # worker-thread read uses its own duplicated fd (closed by
+                # the thread), so a finished/cancelled transfer closing its
+                # handles can never redirect an in-flight read.
                 pos = start
                 while True:
-                    data = await asyncio.to_thread(os.pread, t.file_fd, 1024 * 1024, pos)
+                    try:
+                        rfd = os.dup(t.file_fd)
+                    except OSError:
+                        return
+                    data = await asyncio.to_thread(_pread_own, rfd, 1024 * 1024, pos)
                     if not data:
                         return
                     pos += len(data)
@@ -1165,18 +1429,27 @@ class TransferManager:
                     # Match the platform's other files (0644), not the 0600
                     # an anonymous O_TMPFILE starts with.
                     os.fchmod(t.file_fd, 0o644)
-                    st_final, kept_as = await self._land(t, digest)
+                    st_final, _kept = await self._land(t, digest)
                 except OSError as exc:
                     self._abort(t, f"could not put the file in place in the cloud: {exc}")
                     return {"state": t.state}
-                async with self._index_lock:
-                    idx = self._index_load(t.dirs)
-                    idx[f"{t.pair_id}|{t.local_path}"] = {
-                        "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
-                        "landed_size": st_final.st_size,
-                        "landed_mtime_ns": st_final.st_mtime_ns,
-                        "at": int(time.time())}
-                    self._index_save(t.dirs, idx)
+                # The file landed: the transfer IS a success from here on.
+                # The index only powers the "already up to date" shortcut, so
+                # a failure to persist it (disk full, the index name turned
+                # into a directory, ...) must not fail the request or strand
+                # the transfer: log it and finish normally.
+                try:
+                    async with self._index_lock:
+                        idx = self._index_load(t.dirs)
+                        idx[f"{t.pair_id}|{t.local_path}"] = {
+                            "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
+                            "landed_size": st_final.st_size,
+                            "landed_mtime_ns": st_final.st_mtime_ns,
+                            "at": int(time.time())}
+                        self._index_save(t.dirs, idx)
+                except Exception:  # noqa: BLE001
+                    logger.warning("could not persist the transfer index for %s; "
+                                   "the landed file is unaffected", t.local_path, exc_info=True)
                 t.result = {**t.result, "sha256": digest}
                 t.finish(True)
             return {"state": t.state}
@@ -1184,15 +1457,28 @@ class TransferManager:
         return r
 
 
-def _sha256_fd(fd: int) -> str:
-    """SHA-256 of an open file, read through the fd itself: the digest is of
-    the exact object that was verified, whatever happens to its name."""
-    h = hashlib.sha256()
-    offset = 0
-    while True:
-        block = os.pread(fd, 1024 * 1024, offset)
-        if not block:
-            break
-        h.update(block)
-        offset += len(block)
-    return h.hexdigest()
+def _pread_own(fd: int, n: int, offset: int) -> bytes:
+    """os.pread on a duplicated fd the worker thread owns end to end (see
+    _sha256_fd_own for why). Returns b"" on error: a failed read ends the
+    stream instead of killing the worker with an unraisable exception."""
+    try:
+        return os.pread(fd, n, offset)
+    except OSError:
+        return b""
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _pwrite_own(fd: int, data: bytes, offset: int) -> int:
+    """os.pwrite on a duplicated fd the worker thread owns end to end (see
+    _sha256_fd_own for why)."""
+    try:
+        return os.pwrite(fd, data, offset)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
