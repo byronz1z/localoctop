@@ -548,6 +548,12 @@ func (b *Bridge) dispatch(ctx context.Context, method string, params map[string]
 		return b.tools.unzipFile(params)
 	case MethodListAllowedDirectories:
 		return b.tools.listAllowedDirectories(params)
+	case MethodTransferUpload:
+		return b.transferUpload(params)
+	case MethodTransferDownload:
+		return b.transferDownload(params)
+	case MethodReadText:
+		return b.tools.readText(params)
 	default:
 		return nil, errMethodNotFound(method)
 	}

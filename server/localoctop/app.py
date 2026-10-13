@@ -32,6 +32,7 @@ from .config import Settings, load_settings
 from .errors import BridgeProtocolError, CODE_AUTH_FAILED
 from .mcp_app import build_router as build_mcp_router
 from .sessions import SessionRegistry
+from .transfers import TransferManager
 
 logger = logging.getLogger("localoctop")
 
@@ -103,6 +104,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(mcp_router)
     app.include_router(build_ws_router(settings, registry, settings.ws_path))
+
+    # Out-of-band file transfer (experiment branch): the bridge moves file
+    # bytes over these HTTP routes; MCP tools only start/observe transfers.
+    transfers = TransferManager(settings, registry, settings.mcp_path.rstrip("/") + "/transfer")
+    app.state.transfers = transfers
+    app.include_router(transfers.build_router())
+    mcp_router.localoctop_endpoint.tools.transfers = transfers  # type: ignore[attr-defined]
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

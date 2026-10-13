@@ -52,6 +52,10 @@ M_REMOVE_DIRECTORY = "remove_directory"
 M_ZIP_FILES = "zip_files"
 M_UNZIP_FILE = "unzip_file"
 M_LIST_ALLOWED_DIRECTORIES = "list_allowed_directories"
+# Experiment branch: files move out-of-band, never inside a tool result.
+M_FETCH_TO_CLOUD = "fetch_to_cloud"
+M_DELIVER_TO_LOCAL = "deliver_to_local"
+M_TRANSFER_STATUS = "transfer_status"
 
 READ_ONLY_TOOLS = (
     M_LIST_ALLOWED_DIRECTORIES,
@@ -60,11 +64,14 @@ READ_ONLY_TOOLS = (
     M_DIRECTORY_TREE,
     M_SEARCH_FILES,
     M_READ_FILE,
-    M_READ_MEDIA_FILE,
-    M_READ_MULTIPLE_FILES,
     M_GET_FILE_INFO,
-    M_ZIP_FILES,
+    M_FETCH_TO_CLOUD,
+    M_TRANSFER_STATUS,
 )
+# Retired from the catalog: they returned whole files (base64 / raw text) in
+# the tool result, i.e. straight into the model context. The bridge methods
+# still exist for old adapters; nothing advertises them any more.
+RETIRED_TOOLS = (M_READ_MEDIA_FILE, M_READ_MULTIPLE_FILES, M_ZIP_FILES)
 WRITE_TOOLS = (
     M_CREATE_DIRECTORY,
     M_WRITE_FILE,
@@ -73,6 +80,7 @@ WRITE_TOOLS = (
     M_DELETE_FILE,
     M_REMOVE_DIRECTORY,
     M_UNZIP_FILE,
+    M_DELIVER_TO_LOCAL,
 )
 ALL_TOOLS = READ_ONLY_TOOLS + WRITE_TOOLS
 
@@ -390,6 +398,78 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "annotations": _ann("Remove directory", destructive=True, idempotent=False),
     },
 }
+
+TOOL_SCHEMAS[M_READ_FILE] = {
+    "name": M_READ_FILE,
+    "description": "Read part of a TEXT file on the user's machine, by lines. Returns at most ~48 KB per call "
+                   "and tells you the line range returned, the total line count and how to get the next part. "
+                   "Use it to peek at or read small/medium text. For binary files (PDF, Office, images, archives) "
+                   "or to process a whole large file, use fetch_to_cloud instead — never try to page a big file "
+                   "through this tool.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "path": _path_prop("File path relative to the whitelist root, or absolute inside it."),
+            "start_line": {"type": "integer", "minimum": 1, "default": 1,
+                           "description": "First line to return (1-based). Default 1."},
+            "max_lines": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200,
+                          "description": "How many lines to return at most. Default 200."},
+        },
+        "required": ["path"],
+    },
+    "annotations": _ann("Read text file (paged)", read_only=True),
+}
+TOOL_SCHEMAS[M_FETCH_TO_CLOUD] = {
+    "name": M_FETCH_TO_CLOUD,
+    "description": "Copy ONE file from the user's machine to the cloud machine you run on, so you can process it "
+                   "with your own file and shell tools. Any type and size (PDF, Excel, video, archives…). The file "
+                   "content does not pass through this conversation: you get back only the cloud path. The user's "
+                   "original is not touched. If the cloud already has the current version nothing is re-sent, so "
+                   "it is cheap to call again before each use. Large files take a while: if the answer says "
+                   "IN PROGRESS, call transfer_status with the given transfer_id until it says DONE.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "path": _path_prop("File on the user's machine, relative to the whitelist root or absolute inside it."),
+            "force": {"type": "boolean", "default": False,
+                      "description": "Re-send even if the cloud copy looks current (default false)."},
+        },
+        "required": ["path"],
+    },
+    "annotations": _ann("Fetch file to cloud", read_only=True),
+}
+TOOL_SCHEMAS[M_TRANSFER_STATUS] = {
+    "name": M_TRANSFER_STATUS,
+    "description": "Wait for / check a file transfer started by fetch_to_cloud or deliver_to_local. "
+                   "Returns DONE, FAILED (with the reason) or IN PROGRESS (with percent and time left).",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"transfer_id": {"type": "string", "description": "The transfer_id from the earlier answer."}},
+        "required": ["transfer_id"],
+    },
+    "annotations": _ann("Transfer status", read_only=True),
+}
+TOOL_SCHEMAS[M_DELIVER_TO_LOCAL] = {
+    "name": M_DELIVER_TO_LOCAL,
+    "description": "Copy ONE finished file from the cloud machine to the user's machine. By default it never "
+                   "overwrites: if a file with that name exists, the new one is saved as \"name (1).ext\" and you "
+                   "are told the final name. Set overwrite=true only when the user explicitly asked to replace "
+                   "the original (the old version goes to the recycle bin). Large files take a while: if the "
+                   "answer says IN PROGRESS, call transfer_status until DONE.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "cloud_path": {"type": "string", "description": "Absolute path of the file on the cloud machine."},
+            "path": _path_prop("Destination file path on the user's machine (whitelist-relative or absolute "
+                               "inside it). Omit to save under the same file name in the whitelist root."),
+            "overwrite": {"type": "boolean", "default": False,
+                          "description": "Replace an existing file (old version to recycle bin). Default false."},
+        },
+        "required": ["cloud_path"],
+    },
+    "annotations": _ann("Deliver file to user's machine", idempotent=False),
+}
+
 
 def tools_list(write_enabled: bool) -> list[dict[str, Any]]:
     """Return the tool descriptors advertised to Octop.
