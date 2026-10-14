@@ -11,15 +11,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code.
 COPY localoctop ./localoctop
 
-# Non-root runtime user; audit log directory must be writable.
+# Non-root runtime user; audit log and state directories must be writable.
 RUN useradd --create-home --uid 10001 adapter \
-    && mkdir -p /app/logs \
+    && mkdir -p /app/logs /app/state \
     && chown -R adapter:adapter /app
 USER adapter
 
 ENV LOCALOCTOP_HOST=0.0.0.0 \
     LOCALOCTOP_PORT=8080 \
     LOCALOCTOP_AUDIT_LOG=/app/logs/calls.jsonl \
+    LOCALOCTOP_STATE_DIR=/app/state \
     LOCALOCTOP_LOG_LEVEL=INFO
 
 EXPOSE 8080

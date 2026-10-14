@@ -88,6 +88,9 @@ class Settings:
     # --- logging ---
     audit_log_path: str = "logs/calls.jsonl"
     log_level: str = "INFO"
+    # Service-owned state directory (transfer ledger lives here, one file
+    # per user — never inside the users' own folders).
+    state_dir: str = "state"
     # v0.6.0 热加载: background env-poll interval (0 disables the poller).
     token_poll_interval: float = DEFAULT_TOKEN_POLL_INTERVAL
 
@@ -249,6 +252,7 @@ def load_settings(env: os._Environ | dict | None = None) -> Settings:
         idle_timeout=_float(e.get("LOCALOCTOP_IDLE_TIMEOUT"), DEFAULT_IDLE_TIMEOUT),
         audit_log_path=e.get("LOCALOCTOP_AUDIT_LOG", "logs/calls.jsonl"),
         log_level=e.get("LOCALOCTOP_LOG_LEVEL", "INFO"),
+        state_dir=e.get("LOCALOCTOP_STATE_DIR", "state"),
         token_poll_interval=_float(e.get("LOCALOCTOP_TOKEN_POLL_INTERVAL"), DEFAULT_TOKEN_POLL_INTERVAL),
         host=e.get("LOCALOCTOP_HOST", "0.0.0.0"),
         port=_int(e.get("LOCALOCTOP_PORT"), 8080),

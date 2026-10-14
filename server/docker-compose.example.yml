@@ -19,9 +19,13 @@ services:
       # Admin kill-switch (product layer): set "true" to disable all calls.
       LOCALOCTOP_DISABLED: "false"
       LOCALOCTOP_AUDIT_LOG: /app/logs/calls.jsonl
+      # Service-owned state (the transfer ledger, one file per user) — kept
+      # on its own persistent volume, never inside the users' folders.
+      LOCALOCTOP_STATE_DIR: /app/state
       LOCALOCTOP_LOG_LEVEL: INFO
     volumes:
       - localoctop-audit:/app/logs
+      - localoctop-state:/app/state
     networks:
       - octop-net
     # Bind to loopback only when a reverse proxy (Caddy/Nginx/Traefik) fronts
@@ -36,6 +40,7 @@ services:
 
 volumes:
   localoctop-audit:
+  localoctop-state:
 
 networks:
   octop-net:

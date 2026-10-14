@@ -1,8 +1,10 @@
-"""Tests for the out-of-band transfer manager (LOX-002, round 2):
+"""Tests for the out-of-band transfer manager (LOX-002, T1):
 handle-anchored confinement. The user's own folder is hostile ground —
 every name in it can be swapped or turned into a symlink at any moment — so
 these tests attack the adapter mid-transfer and assert that nothing outside
-the user's folder is ever read, written, renamed or deleted.
+the user's folder is ever read, written, renamed or deleted. The transfer
+ledger is the service's own book: it lives in LOCALOCTOP_STATE_DIR (a
+pytest tmp dir here), never in the user's folder.
 
 The bridge side is faked: a stub registry answers transfer_upload /
 transfer_download like the Go bridge would, and chunks are pushed through
@@ -17,6 +19,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 
 import httpx
 import pytest
@@ -86,6 +89,7 @@ def users_dir(tmp_path, monkeypatch):
     d.mkdir()
     monkeypatch.setenv("LOCALOCTOP_USERS_DIR", str(d))
     monkeypatch.setenv("LOCALOCTOP_LANDING_SUBDIR", "localoctop")
+    monkeypatch.setenv("LOCALOCTOP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.delenv("LOCALOCTOP_MAX_TRANSFER_BYTES", raising=False)
     return d
 
@@ -136,9 +140,13 @@ def _client_for(mgr: TransferManager) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-def _read_index(users_dir, user: str) -> dict:
-    p = users_dir / user / "localoctop" / ".localoctop-index.json"
+def _read_ledger(mgr: TransferManager, user: str) -> dict:
+    p = mgr.ledger_dir / (urllib.parse.quote(user, safe="") + ".json")
     return json.loads(p.read_text("utf-8"))
+
+
+def _ledger_path(mgr: TransferManager, user: str):
+    return mgr.ledger_dir / (urllib.parse.quote(user, safe="") + ".json")
 
 
 def _landing(users_dir, user: str):
@@ -448,60 +456,6 @@ class TestWriteSideSymlinkDefence:
         assert list((home / "localoctop-away").iterdir()) == []
 
 
-# ------------------------------------------------------------ index safety
-
-class TestIndexSymlinkSafety:
-    @needs_symlink
-    async def test_index_and_tmp_preplanted_symlinks_not_written(self, users_dir, mgr):
-        """Both the index and a would-be index temp name are symlinks into
-        bob's folder before the upload starts. Completing the upload must
-        not write a single byte through either link."""
-        _mk_user(users_dir, "alice")
-        bob = _mk_user(users_dir, "bob")
-        bob_target = bob / "precious.txt"
-        bob_target.write_bytes(b"bob-precious")
-        bob_tmp_target = bob / "other.txt"
-        bob_tmp_target.write_bytes(b"bob-other")
-        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in bob.iterdir()}
-
-        landing = _landing(users_dir, "alice")
-        landing.mkdir()
-        (landing / ".localoctop-index.json").symlink_to(bob_target)
-        # A fixed-looking temp name the old code would have used.
-        (landing / ".localoctop-index.json.tmp").symlink_to(bob_tmp_target)
-
-        mgr.registry = FakeRegistry({"f.bin": (b"hello", 1000)})
-        async with _client_for(mgr) as client:
-            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"hello")
-        assert t.state == "done"
-        after = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in bob.iterdir()}
-        assert after == before
-        # The landed file itself is fine.
-        assert (landing / "f.bin").read_bytes() == b"hello"
-
-    @needs_symlink
-    async def test_index_symlink_reads_as_empty(self, users_dir, mgr):
-        """An index that is a symlink to another user's file must read as
-        'no index' — never leak its content into fresh-check decisions."""
-        _mk_user(users_dir, "alice")
-        bob = _mk_user(users_dir, "bob")
-        landing = _landing(users_dir, "alice")
-        landing.mkdir()
-        bob_idx = bob / "idx.json"
-        bob_idx.write_text(json.dumps({"pair-1|f.bin": {"size": 5, "mtime": 1000, "sha256": "x"}}))
-        (landing / ".localoctop-index.json").symlink_to(bob_idx)
-
-        # Even with matching size/mtime in the planted index, the upload
-        # must really run (fresh=False) because the index is unreadable.
-        reg = FakeRegistry({"f.bin": (b"hello", 1000)})
-        mgr.registry = reg
-        (landing / "f.bin").write_bytes(b"hello")
-        os.utime(landing / "f.bin", (1000, 1000))
-        async with _client_for(mgr) as client:
-            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"hello")
-        assert t.state == "done" and not t.result.get("fresh")
-
-
 # ------------------------------------------------------------ chunking
 
 class TestChunkedUpload:
@@ -536,18 +490,22 @@ class TestChunkedUpload:
         dest = users_dir / "alice" / "localoctop" / "big.bin"
         assert dest.read_bytes() == content
         assert int(dest.stat().st_mtime) == 1234
-        # No leftover intermediate or partial names of any kind.
+        # No leftover intermediate or partial names of any kind, and NO
+        # service-owned file in the user's folder at all — the uploaded
+        # file is the only name there.
         assert not list(dest.parent.glob("*.part-*"))
-        assert not [p for p in dest.parent.iterdir()
-                    if p.name.startswith(".localoctop-") and p.name != ".localoctop-index.json"]
-        idx = _read_index(users_dir, "alice")
+        assert [p.name for p in dest.parent.iterdir()] == ["big.bin"]
+        idx = _read_ledger(mgr, "alice")
         ent = idx["pair-1|big.bin"]
         assert ent["size"] == len(content) and ent["sha256"] == hashlib.sha256(content).hexdigest()
-        # The index records the landed copy's size and mtime (ns).
+        # The ledger records the landed copy's size and mtime (ns).
         st = dest.stat()
         assert ent["landed_size"] == st.st_size
         assert ent["landed_mtime_ns"] == st.st_mtime_ns
         assert t.result["sha256"] == ent["sha256"]
+        # The ledger file itself is the service's own book: 0600.
+        import stat as statmod
+        assert statmod.S_IMODE(_ledger_path(mgr, "alice").stat().st_mode) == 0o600
 
     async def test_integrity_mismatch_fails_and_cleans_up(self, users_dir, mgr):
         _mk_user(users_dir, "alice")
@@ -560,8 +518,7 @@ class TestChunkedUpload:
         landing = users_dir / "alice" / "localoctop"
         assert not (landing / "f.bin").exists()
         assert not list(landing.glob("*.part-*"))
-        assert not [p for p in landing.iterdir()
-                    if p.name.startswith(".localoctop-") and p.name != ".localoctop-index.json"]
+        assert not [p for p in landing.iterdir() if p.name.startswith(".localoctop-")]
 
     async def test_forbidden_ticket_and_wrong_user(self, users_dir, mgr):
         _mk_user(users_dir, "alice")
@@ -767,8 +724,7 @@ class TestTransferLimits:
         landing = users_dir / "alice" / "localoctop"
         if landing.exists():
             assert not [p for p in landing.rglob("*") if p.name == "f.bin"]
-            assert not [p for p in landing.rglob("*")
-                        if p.name.startswith(".localoctop-") and p.name != ".localoctop-index.json"]
+            assert not [p for p in landing.rglob("*") if p.name.startswith(".localoctop-")]
         # The refused transfer's record was finished (handles released), and
         # the record we hand back is the advisory one.
         actives = [x for x in mgr._transfers.values() if x.state == "active"]
@@ -874,7 +830,7 @@ class TestCloudEditedKept:
 # ------------------------------------------------------------ permissions
 
 class TestLandedFilePermissions:
-    async def test_landed_file_is_0644_index_stays_0600(self, users_dir, mgr):
+    async def test_landed_file_is_0644_ledger_is_0600(self, users_dir, mgr):
         _mk_user(users_dir, "alice")
         mgr.registry = FakeRegistry({"f.txt": (b"hello", 1000)})
         async with _client_for(mgr) as client:
@@ -883,8 +839,7 @@ class TestLandedFilePermissions:
         import stat as statmod
         dest = users_dir / "alice" / "localoctop" / "f.txt"
         assert statmod.S_IMODE(dest.stat().st_mode) == 0o644
-        idx = users_dir / "alice" / "localoctop" / ".localoctop-index.json"
-        assert statmod.S_IMODE(idx.stat().st_mode) == 0o600
+        assert statmod.S_IMODE(_ledger_path(mgr, "alice").stat().st_mode) == 0o600
 
 
 # ------------------------------------------------------------ housekeeping
@@ -1248,29 +1203,6 @@ class TestFifoNeverBlocks:
         assert "not a regular file" in exc.message
 
     @needs_fifo
-    async def test_fifo_as_index_does_not_block_upload(self, users_dir, mgr):
-        home = _mk_user(users_dir, "alice")
-        landing = home / "localoctop"
-        landing.mkdir()
-        os.mkfifo(landing / ".localoctop-index.json")
-        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
-
-        async def go():
-            async with _client_for(mgr) as client:
-                return await _push_upload(mgr, client, "alice", "f.bin", b"data")
-        t, _ = await asyncio.wait_for(go(), timeout=2.0)
-        assert t.state == "done", t.error
-        # The FIFO was never removed or written through: it was preserved
-        # under a .foreign- name, still a FIFO, and the index name now
-        # holds a regular file (our index).
-        import stat as statmod
-        foreign = [p for p in landing.iterdir() if ".foreign-" in p.name]
-        assert len(foreign) == 1
-        assert statmod.S_ISFIFO(foreign[0].stat().st_mode)
-        assert statmod.S_ISREG((landing / ".localoctop-index.json").stat().st_mode)
-        assert (landing / "f.bin").read_bytes() == b"data"
-
-    @needs_fifo
     async def test_fifo_at_landing_name_saved_aside_complete_fast(self, users_dir, mgr):
         home = _mk_user(users_dir, "alice")
         landing = home / "localoctop"
@@ -1291,93 +1223,148 @@ class TestFifoNeverBlocks:
         assert "cloud_path: /localoctop/f.bin.uploaded" in desc
 
 
-class TestIndexBadData:
-    """The index file is user-writable ground: any garbage in it must read
-    as 'no index', never as an exception (round 6, item 2)."""
+class TestLedgerBadData:
+    """The ledger file is machine-maintained, but anything on disk can be
+    damaged: any garbage in it must read as 'no records', never as an
+    exception (T1: the read path never raises into request handling)."""
 
     @pytest.mark.parametrize("payload", [
-        b"[]", b"null", b'"x"', b'{"a": 1}', b"\xff\xfe not utf-8",
+        b"", b"[]", b"null", b'{"x": 1}', b"\xff\xfe not utf-8",
     ])
-    async def test_bad_index_content_upload_still_works(self, users_dir, mgr, payload):
-        landing = _landing(users_dir, "alice")
-        landing.mkdir(parents=True)
-        (landing / ".localoctop-index.json").write_bytes(payload)
+    async def test_bad_ledger_content_upload_still_works(self, users_dir, mgr, payload, caplog):
+        _mk_user(users_dir, "alice")
+        mgr.ledger_dir.mkdir(parents=True, exist_ok=True)
+        _ledger_path(mgr, "alice").write_bytes(payload)
         mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
-        async with _client_for(mgr) as client:
-            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        with caplog.at_level("WARNING", logger="localoctop.transfers"):
+            async with _client_for(mgr) as client:
+                t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
         assert t.state == "done", t.error
+        landing = _landing(users_dir, "alice")
+        assert (landing / "f.bin").read_bytes() == b"data"
+        # '{"x": 1}' parses as an object with one bad entry — skipped
+        # silently. Everything else here is whole-file damage: a warning.
+        if payload and payload != b'{"x": 1}':
+            assert any("ledger" in r.message for r in caplog.records)
+
+    async def test_oversized_ledger_read_as_empty(self, users_dir, mgr, caplog):
+        _mk_user(users_dir, "alice")
+        mgr.ledger_dir.mkdir(parents=True, exist_ok=True)
+        big = b'{"' + b"x" * (17 * 1024 * 1024) + b'": {}}'
+        _ledger_path(mgr, "alice").write_bytes(big)
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        with caplog.at_level("WARNING", logger="localoctop.transfers"):
+            async with _client_for(mgr) as client:
+                t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        assert t.state == "done", t.error
+        assert any("oversized" in r.message for r in caplog.records)
+
+    async def test_deeply_nested_ledger_read_as_empty(self, users_dir, mgr, caplog):
+        _mk_user(users_dir, "alice")
+        mgr.ledger_dir.mkdir(parents=True, exist_ok=True)
+        _ledger_path(mgr, "alice").write_bytes(b"[" * 100_000)
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        with caplog.at_level("WARNING", logger="localoctop.transfers"):
+            async with _client_for(mgr) as client:
+                t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        assert t.state == "done", t.error
+        assert any("ledger" in r.message for r in caplog.records)
+
+    async def test_bad_entry_fields_upload_still_works(self, users_dir, mgr, caplog):
+        """Entries with wrong-typed fields (landed_name an int, size a
+        string, sha256 a number) must never raise: the upload runs normally
+        and bad entries are ignored."""
+        _mk_user(users_dir, "alice")
+        mgr.ledger_dir.mkdir(parents=True, exist_ok=True)
+        _ledger_path(mgr, "alice").write_text(json.dumps({
+            "_localoctop_ledger": 1,
+            "pair-1|f.bin": {"size": "4", "mtime": 1000, "sha256": 42,
+                             "landed_name": 7, "landed_size": 4, "landed_mtime_ns": 0},
+        }), "utf-8")
+        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
+        with caplog.at_level("WARNING", logger="localoctop.transfers"):
+            async with _client_for(mgr) as client:
+                t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+        assert t.state == "done", t.error
+        landing = _landing(users_dir, "alice")
         assert (landing / "f.bin").read_bytes() == b"data"
 
-    async def test_oversized_index_read_as_empty(self, users_dir, mgr):
-        landing = _landing(users_dir, "alice")
-        landing.mkdir(parents=True)
-        big = b'{"' + b"x" * (5 * 1024 * 1024) + b'": {}}'
-        (landing / ".localoctop-index.json").write_bytes(big)
-        mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
-        async with _client_for(mgr) as client:
-            t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
+
+class TestLedgerFilePerUser:
+    """One ledger file per user, named by a reversible, safe-characters-only
+    encoding of the user name — Chinese names, spaces, '%' and leading dots
+    all get their own file and never collide."""
+
+    @pytest.mark.parametrize("name", ["马威", "ann a", "per%cent", ".hidden"])
+    async def test_special_names_get_own_safe_ledger(self, users_dir, tmp_path, monkeypatch, name):
+        monkeypatch.setenv("LOCALOCTOP_STATE_DIR", str(tmp_path / "state"))
+        store = make_token_store()
+        store.seed_pair(name, f"tok-{len(name)}", f"btok-{len(name)}")
+        m = TransferManager(_Settings(store), FakeRegistry({name + "-f.txt": (b"x", 1000)}),
+                            "/mcp/localoctop/transfer")
+        _mk_user(users_dir, name)
+        async with _client_for(m) as client:
+            t = await m.start_upload(name, "pair-1", name + "-f.txt")
+            auth = {"Authorization": f"Bearer btok-{len(name)}", "X-Transfer-Ticket": t.ticket}
+            r = await client.put(f"/mcp/localoctop/transfer/{t.id}/chunk?offset=0",
+                                 content=b"x", headers=auth)
+            assert r.status_code == 200, r.text
+            r = await client.post(f"/mcp/localoctop/transfer/{t.id}/complete",
+                                  json={"ok": True, "size": 1,
+                                        "sha256": hashlib.sha256(b"x").hexdigest()},
+                                  headers=auth)
+            assert r.status_code == 200
         assert t.state == "done", t.error
-        # The oversized file was recognised as not-our-index and preserved.
-        assert [p for p in landing.iterdir() if ".foreign-" in p.name]
+        p = _ledger_path(m, name)
+        assert p.exists()
+        # The file name carries only safe characters: spaces and '%' from
+        # the user name itself never appear raw ('%' only inside %XX
+        # escapes), and the encoding reverses to the exact user name.
+        stem = p.name
+        assert " " not in stem
+        import re as _re
+        assert _re.fullmatch(r"([A-Za-z0-9._~\-]|%[0-9A-Fa-f]{2})+\.json", stem)
+        assert urllib.parse.unquote(stem[:-len(".json")]) == name
+        if name == "马威":
+            assert name not in stem  # non-ASCII is always percent-encoded
+        # The user's folder holds only the uploaded file.
+        landing = _landing(users_dir, name)
+        assert [q.name for q in landing.iterdir()] == [name + "-f.txt"]
 
 
-class TestReservedIndexName:
-    async def test_upload_named_like_index_saved_aside(self, users_dir, mgr):
-        """A local file literally named '.localoctop-index.json' must NOT
-        land on the index name (the adapter would overwrite it on the next
-        index save): it lands as '.uploaded', and the result says so —
-        a normal outcome (isError=false at the tool layer)."""
+class TestUploadNamedLikeOldIndex:
+    async def test_upload_named_localoctop_index_lands_normally(self, users_dir, mgr):
+        """'.localoctop-index.json' is no longer a reserved name: a file
+        with that name lands under that very name with the uploaded
+        content, and the result has no save-aside note."""
         _mk_user(users_dir, "alice")
         mgr.registry = FakeRegistry({".localoctop-index.json": (b"user-content", 1000)})
         async with _client_for(mgr) as client:
             t, _ = await _push_upload(mgr, client, "alice", ".localoctop-index.json", b"user-content")
         assert t.state == "done", t.error
         landing = _landing(users_dir, "alice")
-        assert (landing / ".localoctop-index.json.uploaded").read_bytes() == b"user-content"
-        idx = _read_index(users_dir, "alice")  # still a valid index
-        assert "pair-1|.localoctop-index.json" in idx
-        assert "saved as" in mgr.describe(t)
-        assert ".localoctop-index.json.uploaded" in mgr.describe(t)
-        # The rendered cloud_path must be the path where the file actually
-        # landed, not the reserved original name.
-        assert "cloud_path: /localoctop/.localoctop-index.json.uploaded" in mgr.describe(t)
-        # Tool layer: not an error (no advisory flag, state done).
-        assert not t.result.get("advisory")
+        assert (landing / ".localoctop-index.json").read_bytes() == b"user-content"
+        assert "saved_as" not in t.result
+        assert "saved as" not in mgr.describe(t)
+        assert "cloud_path: /localoctop/.localoctop-index.json" in mgr.describe(t)
 
-    async def test_rupload_named_like_index_fresh_reports_real_path(self, users_dir, mgr):
-        """Round 7 续: after a save-aside upload of the index-named file, a
-        same-content re-upload takes the 'already up to date' shortcut — and
-        its cloud_path must be the saved-aside path, never the reserved
-        original name."""
+    async def test_preexisting_old_index_file_untouched(self, users_dir, mgr):
+        """A leftover '.localoctop-index.json' from before the move is just
+        a user file now: uploading another file must not read, rename or
+        modify it (content and mtime unchanged)."""
         _mk_user(users_dir, "alice")
-        mgr.registry = FakeRegistry({".localoctop-index.json": (b"user-content", 1000)})
-        async with _client_for(mgr) as client:
-            t1, _ = await _push_upload(mgr, client, "alice", ".localoctop-index.json", b"user-content")
-        assert t1.state == "done", t1.error
-        t2 = await asyncio.wait_for(
-            mgr.start_upload("alice", "pair-1", ".localoctop-index.json"), timeout=2.0)
-        assert t2.state == "done" and t2.result.get("fresh") is True
-        desc = mgr.describe(t2)
-        assert "cloud_path: /localoctop/.localoctop-index.json.uploaded" in desc
-        assert "cloud_path: /localoctop/.localoctop-index.json\n" not in desc
-        assert ".localoctop-index.json.uploaded" in desc
-
-    async def test_foreign_json_at_index_name_preserved(self, users_dir, mgr):
-        """Somebody's own JSON file sits at the index name: after one upload
-        it must survive under a .foreign- name, content intact, and the
-        index name holds OUR index."""
         landing = _landing(users_dir, "alice")
         landing.mkdir(parents=True)
-        (landing / ".localoctop-index.json").write_text('{"my": "notes"}', "utf-8")
+        old = landing / ".localoctop-index.json"
+        old.write_bytes(b'{"legacy": "index"}')
+        os.utime(old, (1000000, 1000000))
+        before = (old.read_bytes(), old.stat().st_mtime_ns)
         mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
         async with _client_for(mgr) as client:
             t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"data")
         assert t.state == "done", t.error
-        foreign = [p for p in landing.iterdir() if ".foreign-" in p.name]
-        assert len(foreign) == 1
-        assert foreign[0].read_text("utf-8") == '{"my": "notes"}'
-        idx = _read_index(users_dir, "alice")
-        assert "pair-1|f.bin" in idx
+        assert (old.read_bytes(), old.stat().st_mtime_ns) == before
+        assert not list(landing.glob(".localoctop-index.json.foreign-*"))
 
 
 class TestNonRegularOccupantSavedAside:
@@ -1573,24 +1560,25 @@ class TestThreadsAndHandles:
 
 
 class TestCompleteRobustness:
-    async def test_index_save_failure_still_succeeds_and_idempotent(self, users_dir, mgr):
-        """Landing succeeded but the index cannot be saved (a non-empty
-        directory sits at the index name): the transfer is done, the file
-        is in place, the request does not error, handles are released, and
-        a retried complete returns the same state without touching the
-        landed file (round 6, item 7)."""
-        landing = _landing(users_dir, "alice")
-        landing.mkdir(parents=True)
-        blocker = landing / ".localoctop-index.json"
-        blocker.mkdir()
-        (blocker / "inner").write_bytes(b"x")  # non-empty: rmdir impossible
+    async def test_ledger_save_failure_still_succeeds_and_idempotent(self, users_dir, mgr, tmp_path):
+        """Landing succeeded but the ledger cannot be written (the ledger
+        directory was replaced by a plain file): the transfer is done, the
+        file is in place, the request does not error, handles are released,
+        and a retried complete returns the same state without touching the
+        landed file."""
+        _mk_user(users_dir, "alice")
+        # Sabotage the ledger home AFTER construction: nothing can be
+        # written into a path that is a plain file.
+        os.rmdir(mgr.ledger_dir)
+        blocker = mgr.ledger_dir
+        blocker.write_bytes(b"not-a-directory")
         mgr.registry = FakeRegistry({"f.bin": (b"data", 1000)})
         before = len(os.listdir("/proc/self/fd"))
         async with _client_for(mgr) as client:
             t, resp = await _push_upload(mgr, client, "alice", "f.bin", b"data")
             assert resp.status_code == 200
             assert t.state == "done", t.error
-            dest = landing / "f.bin"
+            dest = _landing(users_dir, "alice") / "f.bin"
             assert dest.read_bytes() == b"data"
             st1 = dest.stat()
             auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
@@ -1674,3 +1662,122 @@ class TestLandingSubdirValidation:
         monkeypatch.setenv("LOCALOCTOP_LANDING_SUBDIR", "incoming.files")
         m = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
         assert m.landing_subdir == "incoming.files"
+
+
+# --------------------------------------------------- LOX-002 T1: the ledger
+
+class TestLedgerMovedToStateDir:
+    async def test_ledger_gone_means_reupload_and_previous_copy_kept(self, users_dir, mgr):
+        """Deleting the ledger file while the cloud copy sits untouched:
+        the record is gone, so the file is re-sent, and the previous cloud
+        copy (now unprovable as ours) is renamed aside — never deleted."""
+        _mk_user(users_dir, "alice")
+        content = b"same-bytes"
+        mgr.registry = FakeRegistry({"report.xlsx": (content, 4242)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "report.xlsx", content)
+            assert t1.state == "done"
+            dest = users_dir / "alice" / "localoctop" / "report.xlsx"
+            assert dest.read_bytes() == content
+            # The ledger vanishes (lost, corrupted, tokens rotated — all the
+            # same to the adapter).
+            os.unlink(_ledger_path(mgr, "alice"))
+            t2, _ = await _push_upload(mgr, client, "alice", "report.xlsx", content)
+        assert t2.state == "done" and not t2.result.get("fresh")
+        assert dest.read_bytes() == content
+        kept = [p for p in dest.parent.iterdir() if ".cloud-edited-" in p.name]
+        assert len(kept) == 1 and kept[0].read_bytes() == content
+
+    async def test_cloud_copy_removed_or_moved_reuploads_to_original_name(self, users_dir, mgr):
+        """The ledger still records the file but the user deleted it in the
+        cloud (or moved it away): treated as 'not fetched' — re-sent and
+        landed under the original name."""
+        _mk_user(users_dir, "alice")
+        content = b"data"
+        mgr.registry = FakeRegistry({"f.txt": (content, 1000)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "f.txt", content)
+            assert t1.state == "done"
+            landing = _landing(users_dir, "alice")
+            os.unlink(landing / "f.txt")
+            t2, _ = await _push_upload(mgr, client, "alice", "f.txt", content)
+            assert t2.state == "done" and not t2.result.get("fresh")
+            assert (landing / "f.txt").read_bytes() == content
+            assert t2.result["visible"] == "/localoctop/f.txt"
+            # Moved away instead of deleted: same outcome.
+            os.rename(landing / "f.txt", landing / "f-moved-away.txt")
+            t3, _ = await _push_upload(mgr, client, "alice", "f.txt", content)
+        assert t3.state == "done" and not t3.result.get("fresh")
+        assert (landing / "f.txt").read_bytes() == content
+        assert t3.result["visible"] == "/localoctop/f.txt"
+        assert (landing / "f-moved-away.txt").read_bytes() == content
+
+    async def test_concurrent_uploads_both_recorded(self, users_dir, mgr):
+        """Two transfers of the same user finishing at the same time: the
+        per-user ledger lock must serialise read-modify-write so both
+        records survive."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"a.bin": (b"aaa", 1000), "b.bin": (b"bbb", 1000)})
+        async with _client_for(mgr) as client:
+            ta = await mgr.start_upload("alice", "pair-1", "a.bin")
+            tb = await mgr.start_upload("alice", "pair-1", "b.bin")
+            auth = {"Authorization": "Bearer btok-alice"}
+            for t, payload in ((ta, b"aaa"), (tb, b"bbb")):
+                h = {**auth, "X-Transfer-Ticket": t.ticket}
+                r = await client.put(f"/mcp/localoctop/transfer/{t.id}/chunk?offset=0",
+                                     content=payload, headers=h)
+                assert r.status_code == 200, r.text
+            async def finish(t, payload):
+                h = {**auth, "X-Transfer-Ticket": t.ticket}
+                r = await client.post(f"/mcp/localoctop/transfer/{t.id}/complete",
+                                      json={"ok": True, "size": len(payload),
+                                            "sha256": hashlib.sha256(payload).hexdigest()},
+                                      headers=h)
+                assert r.status_code == 200
+            await asyncio.gather(finish(ta, b"aaa"), finish(tb, b"bbb"))
+        assert ta.state == "done" and tb.state == "done"
+        ledger = _read_ledger(mgr, "alice")
+        assert "pair-1|a.bin" in ledger and "pair-1|b.bin" in ledger
+
+    async def test_two_pairs_same_user_same_local_path_two_records(self, users_dir, mgr):
+        """One human, two machines (two token pairs) fetching a file at the
+        same local path: the ledger key carries the pair, so both records
+        coexist."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"doc.txt": (b"v1", 1000)})
+        async with _client_for(mgr) as client:
+            t1, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1")
+            assert t1.state == "done"
+            t2 = await mgr.start_upload("alice", "pair-2", "doc.txt")
+            assert t2.state == "active"  # no fresh shortcut across pairs
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t2.ticket}
+            r = await client.put(f"/mcp/localoctop/transfer/{t2.id}/chunk?offset=0",
+                                 content=b"v1", headers=auth)
+            assert r.status_code == 200, r.text
+            r = await client.post(f"/mcp/localoctop/transfer/{t2.id}/complete",
+                                  json={"ok": True, "size": 2,
+                                        "sha256": hashlib.sha256(b"v1").hexdigest()},
+                                  headers=auth)
+            assert r.status_code == 200
+        assert t2.state == "done", t2.error
+        ledger = _read_ledger(mgr, "alice")
+        assert "pair-1|doc.txt" in ledger and "pair-2|doc.txt" in ledger
+
+
+class TestStateDirStartup:
+    def test_unwritable_state_dir_refused_at_startup(self, tmp_path, monkeypatch):
+        """LOCALOCTOP_STATE_DIR pointing at a place that cannot be created
+        or written is a hard startup error — never a silent degradation."""
+        blocker = tmp_path / "a-plain-file"
+        blocker.write_bytes(b"x")
+        monkeypatch.setenv("LOCALOCTOP_STATE_DIR", str(blocker / "state"))
+        with pytest.raises(ValueError) as ei:
+            TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        assert "LOCALOCTOP_STATE_DIR" in str(ei.value)
+
+    def test_state_dir_created_with_0700(self, tmp_path, monkeypatch):
+        import stat as statmod
+        monkeypatch.setenv("LOCALOCTOP_STATE_DIR", str(tmp_path / "brand-new-state"))
+        m = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
+        assert statmod.S_IMODE(m.state_dir.stat().st_mode) == 0o700
+        assert statmod.S_IMODE(m.ledger_dir.stat().st_mode) == 0o700

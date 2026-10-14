@@ -65,6 +65,7 @@ import secrets
 import shutil
 import stat as statmod
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -99,16 +100,12 @@ SCAN_INTERVAL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_SCAN_INTERVAL"
 # Finished transfer records are kept this long for transfer_status lookups.
 RECORD_TTL_SECONDS = 3600.0
 
-_INDEX_NAME = ".localoctop-index.json"
-_INDEX_TMP_PREFIX = ".localoctop-index.json.tmp-"
-# Format marker written into every index we save: a JSON object carrying
-# this key is OUR index. Anything else at the index name (somebody's notes
-# file, a directory, a FIFO, ...) is preserved, never overwritten.
-_INDEX_MARK = "_localoctop_index"
-# An index larger than this is treated as "no index": the per-user index
-# holds a handful of small entries, so megabytes of "index" can only be
-# something the agent dropped at the reserved name.
-_INDEX_MAX_BYTES = 4 * 1024 * 1024
+# A ledger larger than this is treated as "no ledger": the per-user ledger
+# holds a handful of small entries, so megabytes of JSON cannot be one.
+_LEDGER_MAX_BYTES = 16 * 1024 * 1024
+# Format marker at the top level of every ledger file we write, so a later
+# format version can recognise what it is reading.
+_LEDGER_MARK = "_localoctop_ledger"
 
 # A user name (== the token's user_id == the Octop folder name) must not
 # contain anything that could break the one-folder-per-user confinement.
@@ -259,14 +256,16 @@ class _Dirs:
         self._fds = []
 
 
-def _index_tmp_name() -> str:
-    # Unpredictable per write: the user cannot pre-place a link at the name,
-    # and O_EXCL would refuse to use it anyway.
-    return f"{_INDEX_TMP_PREFIX}{secrets.token_urlsafe(12)}"
-
-
 _O_FILE_FLAGS = (os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
                  | getattr(os, "O_NONBLOCK", 0))
+
+
+def _ledger_file_name(user_id: str) -> str:
+    """The ledger's file name for one user: the user name percent-encoded
+    (reversible, and the alphabet it produces — letters, digits and
+    '%XX' escapes — is safe on every filesystem). A user name may be
+    Chinese, contain spaces or '%' itself; it is NEVER used verbatim."""
+    return urllib.parse.quote(user_id, safe="") + ".json"
 
 
 def _open_regular_file(dir_fd: int, name: str) -> int:
@@ -441,9 +440,49 @@ class TransferManager:
                 f"(no '/', '\\\\', '.'/'..' or control characters), got {raw_subdir!r}")
         self.landing_subdir = raw_subdir
         self.max_bytes = int(e.get("LOCALOCTOP_MAX_TRANSFER_BYTES", DEFAULT_MAX_TRANSFER_BYTES))
+        # Service-owned state directory: the transfer ledger lives here
+        # (one file per user), never inside the users' own folders. It is
+        # created at startup with 0700; a directory we cannot create or
+        # write to is a hard startup error — running without a writable
+        # ledger home would silently degrade every transfer.
+        raw_state = (getattr(settings, "state_dir", None)
+                     or e.get("LOCALOCTOP_STATE_DIR") or "state")
+        self.state_dir = Path(raw_state)
+        self.ledger_dir = self.state_dir / "ledger"
+        try:
+            os.makedirs(self.state_dir, mode=0o700, exist_ok=True)
+            os.chmod(self.state_dir, 0o700)
+            os.makedirs(self.ledger_dir, mode=0o700, exist_ok=True)
+            os.chmod(self.ledger_dir, 0o700)
+        except OSError as exc:
+            raise ValueError(
+                f"LOCALOCTOP_STATE_DIR {raw_state!r} cannot be created or used "
+                f"as the service state directory: {exc}") from exc
+        if not self.ledger_dir.is_dir():
+            raise ValueError(
+                f"LOCALOCTOP_STATE_DIR {raw_state!r}: {str(self.ledger_dir)!r} "
+                "exists but is not a directory")
+        try:
+            probe = self.ledger_dir / f".probe-{secrets.token_urlsafe(8)}"
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+            os.unlink(probe)
+        except OSError as exc:
+            raise ValueError(
+                f"LOCALOCTOP_STATE_DIR {raw_state!r}: the ledger directory "
+                f"{str(self.ledger_dir)!r} is not writable: {exc}") from exc
         self._transfers: dict[str, Transfer] = {}
-        self._index_lock = asyncio.Lock()
+        self._ledger_locks: dict[str, asyncio.Lock] = {}
         self._scan_task: asyncio.Task | None = None
+
+    def _ledger_lock(self, user_id: str) -> asyncio.Lock:
+        """One lock per user: the read-modify-write of that user's ledger
+        must be serial (two transfers completing at once must not lose each
+        other's records)."""
+        lock = self._ledger_locks.get(user_id)
+        if lock is None:
+            lock = self._ledger_locks[user_id] = asyncio.Lock()
+        return lock
 
     # ------------------------------------------------------------ helpers
     def _user_root_fd(self, user_id: str) -> int:
@@ -495,132 +534,72 @@ class TransferManager:
         visible = PurePosixPath("/") / self.landing_subdir / PurePosixPath(*clean)
         return [self.landing_subdir, *clean], visible
 
-    def _index_load(self, dirs: _Dirs) -> dict[str, Any]:
-        """Read the per-user index through the verified landing dir handle.
+    def _ledger_load(self, user_id: str) -> dict[str, Any]:
+        """Read one user's ledger from the service state directory.
 
-        Defensive against everything a user folder can hold at the reserved
-        name: a symlink or FIFO (opening follows neither and blocks on
-        neither — see _open_regular_file), a non-regular file, an oversized
-        file, invalid UTF-8/JSON, or valid JSON of the wrong shape. Every
-        one of those reads as "no index"; this method never raises. Entries
-        whose value is not an object are dropped individually."""
+        Never raises into request handling: a missing, empty, oversized,
+        non-UTF-8, non-JSON, wrongly-shaped or insanely nested file reads
+        as "no records" (one warning is logged); a single entry that is
+        not an object is skipped, so every caller downstream only ever
+        sees well-typed values."""
+        path = self.ledger_dir / _ledger_file_name(user_id)
         try:
-            fd = _open_regular_file(dirs.fd, _INDEX_NAME)
-        except OSError:
-            return {}
-        try:
-            if os.fstat(fd).st_size > _INDEX_MAX_BYTES:
+            st = os.stat(path)
+            if not statmod.S_ISREG(st.st_mode) or st.st_size > _LEDGER_MAX_BYTES:
+                if st.st_size > _LEDGER_MAX_BYTES:
+                    logger.warning("ledger for user %r is oversized (%d bytes); treated as empty",
+                                   user_id, st.st_size)
                 return {}
-            with os.fdopen(fd, "rb") as f:
-                raw = f.read(_INDEX_MAX_BYTES + 1)
-        except OSError:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            logger.warning("could not read the ledger for user %r: %s", user_id, exc)
+            return {}
+        if not raw:
             return {}
         try:
             data = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError, RecursionError, MemoryError) as exc:
+            logger.warning("ledger for user %r is not readable JSON (%s); treated as empty",
+                           user_id, exc)
             return {}
         if not isinstance(data, dict):
+            logger.warning("ledger for user %r is not a JSON object; treated as empty", user_id)
             return {}
-        # Drop the format marker and any entry that is not an object.
         return {k: v for k, v in data.items()
-                if k != _INDEX_MARK and isinstance(v, dict)}
+                if k != _LEDGER_MARK and isinstance(v, dict)}
 
-    @staticmethod
-    def _is_our_index(fd: int) -> bool:
-        """True when the open file holds OUR index: a JSON object either
-        carrying the format marker, or of the pre-marker shape (every value
-        an object — the entries table older versions wrote). Anything else
-        (notes file, config, ...) is foreign and must be preserved. Reads at
-        most _INDEX_MAX_BYTES; never raises."""
-        try:
-            raw = os.pread(fd, _INDEX_MAX_BYTES + 1, 0)
-            if len(raw) > _INDEX_MAX_BYTES:
-                return False
-            data = json.loads(raw.decode("utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
-            return False
-        if not isinstance(data, dict):
-            return False
-        if data.get(_INDEX_MARK):
-            return True
-        # Legacy unmarked index: an object whose values are all objects.
-        return all(isinstance(v, dict) for v in data.values())
-
-    def _preserve_foreign_index(self, dirs: _Dirs) -> None:
-        """Whatever sits at the index name is NOT our index: move it aside,
-        overwrite-free, to "<index>.foreign-<timestamp>" (numeric suffix on
-        collision) so saving our index never destroys somebody's file. A
-        missing name or a failed move is logged and ignored — index
-        persistence must never break a landed transfer."""
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        for i in range(0, 1000):
-            cand = f"{_INDEX_NAME}.foreign-{stamp}{'' if i == 0 else f'-{i}'}"
-            try:
-                _rename_noreplace(dirs.fd, _INDEX_NAME, cand)
-                logger.warning("foreign file at the index name preserved as %s", cand)
-                return
-            except FileExistsError:
-                continue
-            except OSError as exc:
-                logger.warning("could not preserve the foreign file at the index name: %s", exc)
-                return
-        logger.warning("no free .foreign- name for the file at the index name; leaving it")
-
-    def _index_save(self, dirs: _Dirs, idx: dict[str, Any]) -> None:
-        """Replace the index atomically relative to the verified dir handle.
-        The temp name is random and created O_EXCL: a link the user planted
-        at the index's name is swapped away by the rename, never written
-        through (rename never follows a symlink at the destination).
-
-        Before the swap: whatever currently sits at the index name and is
-        NOT recognizably our own index (not a regular file, or not parseable
-        as our format — see _is_our_index) is moved aside to a .foreign-
-        name instead of being overwritten."""
-        st = _stat_name(dirs.fd, _INDEX_NAME)
-        if st is not None:
-            ours = False
-            if statmod.S_ISREG(st.st_mode):
-                try:
-                    fd = _open_regular_file(dirs.fd, _INDEX_NAME)
-                except OSError:
-                    fd = -1
-                if fd >= 0:
-                    try:
-                        ours = self._is_our_index(fd)
-                    finally:
-                        os.close(fd)
-            if not ours:
-                self._preserve_foreign_index(dirs)
-        data = json.dumps({**idx, _INDEX_MARK: 1}, ensure_ascii=False).encode("utf-8")
-        tmp = _index_tmp_name()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                     0o600, dir_fd=dirs.fd)
+    def _ledger_save(self, user_id: str, entries: dict[str, Any]) -> None:
+        """Replace one user's ledger atomically: the temp file is written
+        in the SAME directory, fsynced, then os.replace'd onto the real
+        name. The file is 0600 — it is the service's own book, nobody
+        else's business."""
+        path = self.ledger_dir / _ledger_file_name(user_id)
+        data = json.dumps({**entries, _LEDGER_MARK: 1}, ensure_ascii=False).encode("utf-8")
+        tmp = self.ledger_dir / f".tmp-{secrets.token_urlsafe(12)}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
         except BaseException:
-            # Write/fsync failed: fdopen's close on the error path is not
-            # guaranteed, so close the fd explicitly before unlinking.
             try:
                 os.close(fd)
             except OSError:
                 pass
             try:
-                os.unlink(tmp, dir_fd=dirs.fd)
+                os.unlink(tmp)
             except OSError:
                 pass
             raise
         try:
-            os.rename(tmp, _INDEX_NAME, src_dir_fd=dirs.fd, dst_dir_fd=dirs.fd)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
         except BaseException:
             try:
-                os.unlink(tmp, dir_fd=dirs.fd)
+                os.unlink(tmp)
             except OSError:
                 pass
             raise
@@ -887,16 +866,17 @@ class TransferManager:
 
             # 3) Already have exactly this version in the cloud? Then do
             #    nothing — but only if the cloud file is still the very copy
-            #    we landed: size and mtime must match the index AND the
-            #    file's current content must hash to the recorded sha256.
-            #    Content is checked because an edit that keeps the size and
-            #    restores the mtime (many copy/extract tools preserve times)
-            #    would otherwise look "unchanged". The file is opened
-            #    relative to the verified dir handle without following
-            #    links, and the hash is computed on the open fd in a worker
-            #    thread (never blocking the event loop, never re-resolving
-            #    the name).
+            #    we landed: size and mtime must match the ledger record AND
+            #    the file's current content must hash to the recorded
+            #    sha256. Content is checked because an edit that keeps the
+            #    size and restores the mtime (many copy/extract tools
+            #    preserve times) would otherwise look "unchanged". The file
+            #    is opened relative to the verified dir handle without
+            #    following links, and the hash is computed on the open fd in
+            #    a worker thread (never blocking the event loop, never
+            #    re-resolving the name).
             key = f"{pair_id}|{rel}"
+            ent = self._ledger_load(user_id).get(key)
             try:
                 dirs = _Dirs(root_fd, comps[:-1])
                 root_fd = -1  # the chain owns it now
@@ -904,19 +884,19 @@ class TransferManager:
                 dirs = None  # landing folder missing: a normal upload below
             except _NotAFolder as exc:
                 raise exc.refuse() from None
-            if dirs is not None:
+            if dirs is not None and ent is not None:
                 try:
-                    ent = self._index_load(dirs).get(key)
-                    if not force and ent and ent.get("size") == size \
+                    if not force and ent.get("size") == size \
                             and ent.get("mtime") == mtime and ent.get("landed_name"):
                         # The last upload of this file was saved aside: the
                         # untouched copy check must look at the name the file
                         # ACTUALLY landed under (never at the original name,
                         # which may hold a fifo/directory/link or somebody
                         # else's content). The recorded name is a bare
-                        # filename validated by _index_save on the way in.
+                        # filename the ledger itself stored on landing.
                         landed = ent["landed_name"]
-                        if "/" not in landed and "\0" not in landed:
+                        if (isinstance(landed, str)
+                                and "/" not in landed and "\0" not in landed):
                             st = _stat_name(dirs.fd, landed)
                             if (st is not None and statmod.S_ISREG(st.st_mode)
                                     and st.st_size == ent.get("landed_size")
@@ -928,11 +908,7 @@ class TransferManager:
                                     # be the file's REAL location, and the
                                     # result must say why the name differs.
                                     occ = _stat_name(dirs.fd, comps[-1])
-                                    if comps[-1] == _INDEX_NAME \
-                                            or comps[-1].startswith(_INDEX_TMP_PREFIX):
-                                        reason = (f"the name {comps[-1]!r} is reserved for "
-                                                  f"the connector itself")
-                                    elif occ is not None:
+                                    if occ is not None:
                                         reason = (f"the name {comps[-1]!r} is occupied by "
                                                   f"{self._describe_kind(occ.st_mode)}")
                                     else:
@@ -970,6 +946,8 @@ class TransferManager:
                             return t
                 finally:
                     dirs.close()
+            elif dirs is not None:
+                dirs.close()
 
             # 4) An identical transfer already running? Join it instead of
             #    starting a second copy (the model may call the tool twice).
@@ -1222,17 +1200,14 @@ class TransferManager:
         taken, a name already taken is first moved aside atomically and
         overwrite-free (renameat2 RENAME_NOREPLACE), and only a moved-aside
         copy that provably IS the copy we landed last time (inode + sha256
-        of its content both match the index record) is removed.
+        of its content both match the ledger record) is removed.
 
-        A final name that collides with the connector's own reserved names
-        (the index, or an index temp prefix) never receives user content:
-        the file lands as "<name>.uploaded" (numeric suffix when taken) and
-        the result tells the agent so — a normal outcome, not an error.
-        The same applies when the name is occupied by anything that is not
-        a regular file (a fifo, directory, symlink, socket or device): that
-        thing is never moved, deleted or opened; the upload lands under a
-        free "<name>.uploaded" name instead (the transfer's cloud_path then
-        points at the file's real location), and the result says so.
+        A final name occupied by anything that is not a regular file (a
+        fifo, directory, symlink, socket or device) never receives user
+        content: that thing is never moved, deleted or opened; the upload
+        lands as "<name>.uploaded" (numeric suffix when taken) and the
+        result tells the agent so — a normal outcome, not an error (the
+        transfer's cloud_path then points at the file's real location).
 
         No visible intermediate name ever exists: the file goes straight
         from anonymous (O_TMPFILE) to the final name. Returns (fstat of the
@@ -1241,29 +1216,24 @@ class TransferManager:
         dirs = t.dirs
         assert dirs is not None
         final = t.cloud_path.name
-        if final == _INDEX_NAME or final.startswith(_INDEX_TMP_PREFIX):
+        st_occ = _stat_name(dirs.fd, final)
+        if st_occ is not None and not statmod.S_ISREG(st_occ.st_mode):
+            # Never touched: not moved, not deleted, not opened. The
+            # upload lands under a free name; the result names both the
+            # occupant's kind and the new name, and the transfer's
+            # cloud_path now points at the file's real location.
             final = self._save_aside(
                 t, final,
-                f"the name {t.cloud_path.name!r} is reserved for the connector itself")
-        else:
-            st_occ = _stat_name(dirs.fd, final)
-            if st_occ is not None and not statmod.S_ISREG(st_occ.st_mode):
-                # Never touched: not moved, not deleted, not opened. The
-                # upload lands under a free name; the result names both the
-                # occupant's kind and the new name, and the transfer's
-                # cloud_path now points at the file's real location.
-                final = self._save_aside(
-                    t, final,
-                    f"the name {final!r} is occupied by "
-                    f"{self._describe_kind(st_occ.st_mode)}")
-        idx_prev = self._index_load(dirs).get(f"{t.pair_id}|{t.local_path}")
+                f"the name {final!r} is occupied by "
+                f"{self._describe_kind(st_occ.st_mode)}")
+        idx_prev = self._ledger_load(t.user_id).get(f"{t.pair_id}|{t.local_path}")
         kept_list: list[str] = []
         for _ in range(20):
             try:
                 os.link(f"/proc/self/fd/{t.file_fd}", final,
                         dst_dir_fd=dirs.fd, follow_symlinks=True)
                 st = os.fstat(t.file_fd)
-                # The bare name the file actually landed under: the index
+                # The bare name the file actually landed under: the ledger
                 # stores it so the "still our untouched copy" shortcut
                 # checks the file's real location, not the original name.
                 t.result["landed_name"] = final
@@ -1310,11 +1280,11 @@ class TransferManager:
                                      idx_prev: Any) -> bool:
         """Delete the moved-aside occupant ONLY if it is provably the copy
         this adapter landed last time, untouched: its content hashes to the
-        index's sha256, fstat before AND after hashing shows the same size,
+        ledger's sha256, fstat before AND after hashing shows the same size,
         st_mtime_ns and st_ctime_ns (a rewrite mid-hash means "cannot prove
         untouched" — keep it), and the name still resolves to the very inode
         that was hashed. In every other case — the content was edited, the
-        index has no record, the inode changed, any step fails — the file is
+        ledger has no record, the inode changed, any step fails — the file is
         kept and the transfer result names it.
 
         The before/after fstat does NOT close the race: a write landing
@@ -1531,14 +1501,14 @@ class TransferManager:
                     self._abort(t, f"could not put the file in place in the cloud: {exc}")
                     return {"state": t.state}
                 # The file landed: the transfer IS a success from here on.
-                # The index only powers the "already up to date" shortcut, so
-                # a failure to persist it (disk full, the index name turned
-                # into a directory, ...) must not fail the request or strand
-                # the transfer: log it and finish normally.
+                # The ledger only powers the "already up to date" shortcut,
+                # so a failure to persist it (state disk full, the ledger
+                # directory swapped out, ...) must not fail the request or
+                # strand the transfer: log it and finish normally.
                 try:
-                    async with self._index_lock:
-                        idx = self._index_load(t.dirs)
-                        idx[f"{t.pair_id}|{t.local_path}"] = {
+                    async with self._ledger_lock(t.user_id):
+                        ledger = self._ledger_load(t.user_id)
+                        ledger[f"{t.pair_id}|{t.local_path}"] = {
                             "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
                             "landed_size": st_final.st_size,
                             "landed_mtime_ns": st_final.st_mtime_ns,
@@ -1549,10 +1519,10 @@ class TransferManager:
                             # never the original one.
                             "landed_name": t.result.get("landed_name") or t.cloud_path.name,
                             "at": int(time.time())}
-                        self._index_save(t.dirs, idx)
+                        self._ledger_save(t.user_id, ledger)
                 except Exception:  # noqa: BLE001
-                    logger.warning("could not persist the transfer index for %s; "
-                                   "the landed file is unaffected", t.local_path, exc_info=True)
+                    logger.warning("could not persist the transfer ledger for user %r; "
+                                   "the landed file is unaffected", t.user_id, exc_info=True)
                 t.result = {**t.result, "sha256": digest}
                 t.finish(True)
             return {"state": t.state}
