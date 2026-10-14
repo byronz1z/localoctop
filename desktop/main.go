@@ -35,7 +35,81 @@ func startMinimized() bool {
 	return false
 }
 
+// secondDesktopAction is what a second launch should do, decided purely
+// from "what is running" + "what am I". Kept as an enum so the decision is
+// unit-testable without touching Win32.
+type secondDesktopAction int
+
+const (
+	actBringToFront secondDesktopAction = iota // raise the running Wails window
+	actMessageBox                              // tell the user, then exit
+	actStderrExit                              // print to stderr, then exit
+)
+
+func (a secondDesktopAction) String() string {
+	switch a {
+	case actBringToFront:
+		return "bring-to-front"
+	case actMessageBox:
+		return "message-box"
+	default:
+		return "stderr-exit"
+	}
+}
+
+// decideSecondDesktopAction picks the action for a launch that found the
+// shared lock already held. running is what ProbeSingleInstance reported for
+// the holder; secondIsGUI is true when the second launch is the Wails
+// desktop app (has a window it could raise), false for a background bridge.
+func decideSecondDesktopAction(running localoctop.ProbeResult, secondIsGUI bool) secondDesktopAction {
+	switch running {
+	case localoctop.ProbeDesktop:
+		// Another desktop instance is up. A second desktop launch lets Wails
+		// raise the window; a background launch just exits with the stderr
+		// line (it has no window to raise and no user watching for one).
+		if secondIsGUI {
+			return actBringToFront
+		}
+		return actStderrExit
+	default:
+		// A background program holds the lock. A second desktop launch shows
+		// a message box (a bare exit would read as a crash); a second
+		// background launch prints the stderr line.
+		if secondIsGUI {
+			return actMessageBox
+		}
+		return actStderrExit
+	}
+}
+
 func main() {
+	// Single instance across ALL localoctop entry points (bridge headless,
+	// bridge desktop, this Wails desktop): one shared per-user lock. If the
+	// lock is already held we do NOT start. When the holder is another
+	// desktop instance we let Wails' own SingleInstanceLock bring its window
+	// forward (we still hold our shared lock, so a third copy is refused too).
+	// When the holder is a background program there is no window to raise, so
+	// we tell the user in a message box and exit.
+	if release, ok := localoctop.AcquireSingleInstance(); ok {
+		defer release()
+	} else {
+		// Lock held. Decide what to do, then do it; every branch ends in
+		// this process exiting without creating a second instance.
+		switch decideSecondDesktopAction(localoctop.ProbeSingleInstance(), true) {
+		case actBringToFront:
+			// Another desktop instance is running. Wails' single-instance
+			// handler (registered below via SingleInstanceLock) receives our
+			// launch and raises the window; we just exit quietly.
+		case actMessageBox:
+			// A background / tray bridge holds the lock and has no window.
+			localoctop.ShowAlreadyRunningMessageBox()
+		case actStderrExit:
+			// Should not happen for the GUI, but keep the path total.
+			println("localoctop is already running on this computer; not starting a second copy")
+		}
+		return
+	}
+
 	// Create an instance of the app structure
 	app := NewApp()
 
@@ -80,6 +154,14 @@ func main() {
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
+		},
+		// Same UniqueId as the shared mutex name in single_instance.go, so
+		// every entry point agrees on the identity of "the one desktop
+		// instance". The first launch (which holds the shared lock) keeps this;
+		// a second launch that got here via the ProbeDesktop branch lets
+		// Wails raise the running window and then exits.
+		SingleInstanceLock: &options.SingleInstanceLock{
+			UniqueId: localoctop.SingleInstanceLockName(),
 		},
 	})
 

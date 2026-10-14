@@ -32,3 +32,16 @@ func acquireSingleInstanceImpl() (func(), bool) {
 	}
 	return func() { f.Close() }, true
 }
+
+// probeSingleInstanceImpl on non-Windows systems can only tell whether the
+// lock is held, not what kind of program holds it (there is no window to
+// look for). The desktop app is Windows-only in practice; a second launch
+// just refuses to start.
+func probeSingleInstanceImpl() ProbeResult {
+	release, ok := AcquireSingleInstance()
+	if ok {
+		release()
+		return ProbeNone
+	}
+	return ProbeBackground
+}

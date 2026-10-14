@@ -57,13 +57,28 @@ func main() {
 // program (bridge headless, bridge desktop, or Wails desktop) runs on this
 // computer at a time. On contention it prints the required message and exits
 // with a non-zero code.
-func acquireSingleInstance() func() {
+//
+// When the holder is the Wails desktop app there is no console for the user
+// to see the stderr line, and the desktop window is right there — so in
+// desktop mode we ask the running desktop to come to front instead of just
+// exiting with text. Headless mode always prints and exits.
+func acquireSingleInstance(headless bool) func() {
 	release, ok := localoctop.AcquireSingleInstance()
-	if !ok {
-		fmt.Fprintln(os.Stderr, "localoctop is already running on this computer; not starting a second copy")
-		os.Exit(1)
+	if ok {
+		return release
 	}
-	return release
+	switch localoctop.ProbeSingleInstance() {
+	case localoctop.ProbeDesktop:
+		if !headless {
+			// The user double-clicked a second copy while the desktop app
+			// is running: surface the running window instead of a bare exit.
+			localoctop.BringWailsSingleInstanceWindowToFront()
+		}
+	case localoctop.ProbeBackground:
+		// A background / headless bridge holds the lock: plain stderr exit.
+	}
+	fmt.Fprintln(os.Stderr, "localoctop is already running on this computer; not starting a second copy")
+	os.Exit(1)
 }
 
 // ---- desktop mode: console + tray + bridge, one process ----
@@ -79,7 +94,7 @@ type appState struct {
 }
 
 func runDesktop(verbose bool) {
-	releaseLock := acquireSingleInstance()
+	releaseLock := acquireSingleInstance(false)
 	defer releaseLock()
 
 	cfg, existed, err := appcfg.Load()
@@ -236,7 +251,7 @@ func bridgeConfig(cfg appcfg.File, verbose bool) (localoctop.Config, error) {
 // ---- headless mode: the original cmd/bridge behavior, flag/env driven ----
 
 func runHeadless(server, token, dirs string, allowWrite bool, audit string, verbose bool) {
-	releaseLock := acquireSingleInstance()
+	releaseLock := acquireSingleInstance(true)
 	defer releaseLock()
 
 	// Fall back to the settings file for anything the flags leave empty, so a
