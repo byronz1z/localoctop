@@ -778,13 +778,18 @@ func TestSearchFiles_ContentSearchNamesSkippedLargeFiles(t *testing.T) {
 	if berr != nil {
 		t.Fatalf("search failed: %v", berr)
 	}
-	if len(res.Matches) != 0 {
-		t.Fatalf("no file's content matches: %+v", res.Matches)
+	// match_content is "name OR content" (G2 batch-2): both files match by
+	// name, so both are hits; the big one is ALSO named as not-searched-inside.
+	if len(res.Matches) != 2 {
+		t.Fatalf("both name hits must be found: %+v", res.Matches)
 	}
 	if res.SkippedLarge != 1 {
 		t.Fatalf("the skipped large file must be counted: %+v", res)
 	}
 	if len(res.SkippedLargeNames) != 1 || res.SkippedLargeNames[0] != "needle-big.log" {
 		t.Fatalf("the skipped large file must be named: %+v", res.SkippedLargeNames)
+	}
+	if res.SkippedLargeLimit != 1024 {
+		t.Fatalf("the result must state the skip line (1 KB), got %d", res.SkippedLargeLimit)
 	}
 }

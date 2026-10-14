@@ -20,6 +20,7 @@ both server and client (user ruling: switch kept, default ON).
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 from .errors import (
@@ -28,6 +29,14 @@ from .errors import (
     CODE_METHOD_NOT_FOUND,
     CODE_PARSE_ERROR,
 )
+from .transfers import DEFAULT_MAX_TRANSFER_BYTES
+
+# The one-shot transfer limit the tool descriptions quote. It is the SAME
+# value TransferManager enforces at runtime (transfers.py reads the identical
+# env var with the identical default) — read it here too so the advertised
+# number can never drift from the enforced one.
+MAX_TRANSFER_BYTES = int(os.environ.get("LOCALOCTOP_MAX_TRANSFER_BYTES", DEFAULT_MAX_TRANSFER_BYTES))
+MAX_TRANSFER_LIMIT_TEXT = f"{MAX_TRANSFER_BYTES / (1024 ** 3):g} GiB ({MAX_TRANSFER_BYTES:,} bytes)"
 
 # Protocol identity reported during the MCP handshake.
 PROTOCOL_VERSION = "2024-11-05"
@@ -157,8 +166,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     M_SEARCH_FILES: {
         "name": M_SEARCH_FILES,
         "description": "Search a whitelisted directory tree by filename glob/substring, or by regular "
-                       "expression (mode=\"regex\", optionally match_content for line-level content hits "
-                       "with line numbers and previews). Skips .git/node_modules subtrees by default.",
+                       "expression (mode=\"regex\"). With match_content=true a file matches when EITHER its "
+                       "name OR its text content matches (default mode treats the pattern as plain text, "
+                       "regex mode as a regular expression); content hits come with the first matching line "
+                       "number and a preview. Files larger than the read limit are NOT searched inside — "
+                       "they are listed in the result with that limit, so a \"0 matches\" answer that skipped "
+                       "files is never mistaken for a complete search. Skips .git/node_modules subtrees by "
+                       "default.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -175,7 +189,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     "minimum": 1, "maximum": 1000, "default": 200,
                 },
                 "max_results": {"type": "integer", "description": "Deprecated alias of limit.", "minimum": 1},
-                "match_content": {"type": "boolean", "description": "If true, also match file text content (default false)."},
+                "match_content": {"type": "boolean", "description": "If true, also search inside file text content (default "
+                                  "false): a file matches when its name OR its content matches. Default mode looks for the "
+                                  "pattern as plain text, regex mode as a regular expression. Files over the client "
+                                  "program's read limit are not opened; the result names them and states the exact limit "
+                                  "it skipped at, so you never have to guess it."},
                 "include_dirs": {"type": "boolean", "description": "Include directories in results (default true)."},
                 "recursive": {"type": "boolean", "description": "Walk sub-directories (default true)."},
             },
@@ -429,12 +447,14 @@ TOOL_SCHEMAS[M_READ_FILE] = {
 TOOL_SCHEMAS[M_FETCH_TO_CLOUD] = {
     "name": M_FETCH_TO_CLOUD,
     "description": "Copy files from the user's machine to the cloud machine you run on, so you can process them "
-                   "with your own file and shell tools. Any type and size (PDF, Excel, video, archives…). The file "
+                   "with your own file and shell tools. Any type (PDF, Excel, video, archives…) up to "
+                   f"{MAX_TRANSFER_LIMIT_TEXT} per transfer — a bigger file is refused with its size and the "
+                   "limit, nothing is sent then. The file "
                    "content does not pass through this conversation: you get back only the cloud path. The user's "
                    "original is not touched. "
                    "path may be ONE file, or a FOLDER: every file inside it (including sub-folders) is copied to the "
-                   "cloud with the same directory layout. A folder fetch is limited to 2000 files and to the "
-                   "per-transfer size limit in total; if the folder is bigger you are told so and how to split it "
+                   "cloud with the same directory layout. A folder fetch is limited to 2000 files and to "
+                   f"{MAX_TRANSFER_LIMIT_TEXT} in total; if the folder is bigger you are told so and how to split it "
                    "(fetch a sub-folder, or the individual files you need). "
                    "If the cloud already has the current version nothing is re-sent, so it is cheap to call again "
                    "before each use — including on a folder that was already fetched (unchanged files are skipped). "

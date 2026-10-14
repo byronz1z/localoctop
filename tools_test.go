@@ -451,6 +451,122 @@ func TestSearchFiles_SkipsVCSAndNonRecursive(t *testing.T) {
 	}
 }
 
+// G2 batch-2: default-mode match_content must be "name OR content", not
+// "name AND content" — a needle that lives only inside a file whose NAME does
+// not match must still be found (the tester lost a 9 MB file to this).
+func TestSearchFiles_ContentHitWithoutNameHit(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	must(t, os.WriteFile(filepath.Join(root, "probe.txt"),
+		[]byte("first line\nabcdefghij here\nthird line\n"), 0o644))
+
+	res, berr := tl.searchFiles(map[string]any{
+		"path": ".", "pattern": "abcdefghij", "match_content": true, "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("search failed: %v", berr)
+	}
+	if len(res.Matches) != 1 || res.Matches[0].Path != "probe.txt" {
+		t.Fatalf("content-only hit must be found: %+v", res.Matches)
+	}
+	if res.Matches[0].Line != 2 || !strings.Contains(res.Matches[0].Preview, "abcdefghij here") {
+		t.Fatalf("content hit must carry the first matching line: %+v", res.Matches[0])
+	}
+}
+
+// A NAME hit with no content match still counts under match_content.
+func TestSearchFiles_NameHitWithoutContentHit(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	must(t, os.WriteFile(filepath.Join(root, "needle-named.txt"), []byte("nothing here\n"), 0o644))
+
+	res, berr := tl.searchFiles(map[string]any{
+		"path": ".", "pattern": "needle", "match_content": true, "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("search failed: %v", berr)
+	}
+	found := false
+	for _, m := range res.Matches {
+		if m.Path == "needle-named.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("name-only hit must still be found: %+v", res.Matches)
+	}
+}
+
+// match_content=false keeps the old name-only behaviour exactly.
+func TestSearchFiles_NoContentSearchStillNameOnly(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	must(t, os.WriteFile(filepath.Join(root, "probe.txt"),
+		[]byte("first line\nabcdefghij here\n"), 0o644))
+
+	res, berr := tl.searchFiles(map[string]any{
+		"path": ".", "pattern": "abcdefghij", "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("search failed: %v", berr)
+	}
+	if len(res.Matches) != 0 {
+		t.Fatalf("without match_content the name-only behaviour must not change: %+v", res.Matches)
+	}
+}
+
+// An over-limit file is reported WITH the size line it was skipped at.
+func TestSearchFiles_SkippedLargeNamesTheLimit(t *testing.T) {
+	tl, root := newTestTools(t, false, 64) // 64-byte read cap
+	big := strings.Repeat("pad ", 100) + "abcdefghij\n"
+	must(t, os.WriteFile(filepath.Join(root, "big.log"), []byte(big), 0o644))
+
+	res, berr := tl.searchFiles(map[string]any{
+		"path": ".", "pattern": "abcdefghij", "match_content": true, "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("search failed: %v", berr)
+	}
+	if res.SkippedLarge != 1 {
+		t.Fatalf("the over-limit file must be counted: %+v", res)
+	}
+	if res.SkippedLargeLimit != 64 {
+		t.Fatalf("the result must state the skip line, got %d", res.SkippedLargeLimit)
+	}
+}
+
+// Default (substring) mode and regex mode must agree on the hit set for the
+// same plain-text pattern — the two modes differed silently before (G2).
+func TestSearchFiles_GlobAndRegexModesAgreeOnContent(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	must(t, os.WriteFile(filepath.Join(root, "probe.txt"),
+		[]byte("first line\nabcdefghij here\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "other.txt"), []byte("nothing\n"), 0o644))
+
+	glob, berr := tl.searchFiles(map[string]any{
+		"path": ".", "pattern": "abcdefghij", "match_content": true, "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("default-mode search failed: %v", berr)
+	}
+	re, berr := tl.searchFilesV05(map[string]any{
+		"path": ".", "pattern": "abcdefghij", "mode": "regex", "match_content": true, "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("regex-mode search failed: %v", berr)
+	}
+	paths := func(ms []SearchHit) map[string]bool {
+		out := map[string]bool{}
+		for _, m := range ms {
+			out[m.Path] = true
+		}
+		return out
+	}
+	g, r := paths(glob.Matches), paths(re.Matches)
+	if len(g) != len(r) {
+		t.Fatalf("modes disagree: glob=%v regex=%v", g, r)
+	}
+	for p := range g {
+		if !r[p] {
+			t.Fatalf("modes disagree on %q: glob=%v regex=%v", p, g, r)
+		}
+	}
+	if len(g) != 1 || !g["probe.txt"] {
+		t.Fatalf("expected exactly probe.txt from both modes, got %v", g)
+	}
+}
+
 func namesOf(entries []DirEntry) []string {
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {

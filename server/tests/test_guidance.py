@@ -60,6 +60,17 @@ class TestServerInstructions:
     def test_length_within_budget(self):
         assert len(SERVER_INSTRUCTIONS) <= 2500
 
+    def test_fetch_description_states_the_real_transfer_limit(self):
+        """Batch-2: 'the per-transfer size limit' told the model nothing. The
+        description must quote the same number TransferManager enforces."""
+        from localoctop.protocol import MAX_TRANSFER_BYTES, TOOL_SCHEMAS
+        from localoctop.transfers import DEFAULT_MAX_TRANSFER_BYTES
+        fetch = TOOL_SCHEMAS["fetch_to_cloud"]["description"]
+        assert f"{MAX_TRANSFER_BYTES:,} bytes" in fetch
+        # Same source as the runtime default (no second hard-coded number).
+        assert MAX_TRANSFER_BYTES == int(__import__("os").environ.get(
+            "LOCALOCTOP_MAX_TRANSFER_BYTES", DEFAULT_MAX_TRANSFER_BYTES))
+
     def test_no_contradiction_with_tool_descriptions(self):
         descs = "\n".join(t["description"] for t in TOOL_SCHEMAS.values())
         # Nothing anywhere may offer permanent deletion.
@@ -107,7 +118,8 @@ class TestNextStepForError:
         ("relative path must not be absolute", "list_allowed_directories"),
         ("relative path must not contain a drive letter", "list_allowed_directories"),
         ("path contains NUL byte", "plain path"),
-        ("destination already exists (move_file never overwrites)", "overwrite=true"),
+        ("destination already exists (move_file never overwrites)", "delete_file"),
+        ("member target already exists: <allowed folder>/a.txt (pass overwrite=true)", "overwrite=true"),
         ("directory is not empty; pass recursive=true to remove its contents", "recursive=true"),
         ("not a valid zip archive: zip: not a valid zip file", "get_file_info"),
         ("archive member escapes destination: ../evil", "tell the user"),
@@ -129,6 +141,26 @@ class TestNextStepForError:
         assert out.startswith(message)
         assert "Next step" in out or "tell the user" in out
         assert needle in out
+
+    def test_move_file_conflict_never_offers_overwrite(self):
+        """G1 batch-2: move_file has NO overwrite parameter — the old hint sent
+        the model looking for one and the retry was refused again. The hint
+        must only name steps that actually work."""
+        msg = "destination already exists (move_file never overwrites)"
+        out = _next_step_for_error(msg)
+        assert out.startswith(msg)
+        appended = out[len(msg):]
+        # The appended guidance must not offer a parameter the tool lacks.
+        assert "overwrite=true" not in appended
+        assert "different destination name" in appended
+        assert "delete_file" in appended and "recycle bin" in appended
+
+    def test_unzip_conflict_keeps_overwrite_hint(self):
+        """unzip_file DOES take overwrite=true; its 'already exists' wording
+        must keep pointing at it (the shared branch must not regress it)."""
+        out = _next_step_for_error("member target already exists: x/a.txt (pass overwrite=true)")
+        assert "overwrite=true" in out
+        assert "delete_file" not in out
 
     def test_message_with_guidance_is_left_alone(self):
         msg = ("the recycle bin is not available on this computer ... untouched. "
@@ -327,6 +359,17 @@ class TestListingHonesty:
         text = self._text(self._svc()._render("search_files", res))
         assert "NOT searched" not in text and "NOT ruled out" not in text
         assert "(nothing found)" in text
+
+    def test_search_skip_note_names_the_size_line(self):
+        """Batch-2: the skip note must state the actual size line the client
+        skipped at (its MaxReadBytes), so the model never guesses it (G2 saw
+        a model assume 10 MiB when the real line is 20 MiB)."""
+        res = {"pattern": "needle", "path": ".", "matches": [], "skipped_large": 1,
+               "skipped_large_names": ["big.log"], "skipped_large_limit": 20 * 1024 * 1024}
+        text = self._text(self._svc()._render("search_files", res))
+        assert "20 MiB" in text
+        assert f"{20 * 1024 * 1024:,} bytes" in text
+        assert "big.log" in text
 
 
 # ------------------------------------------------------------- T5-5b render

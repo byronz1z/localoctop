@@ -1001,6 +1001,9 @@ func (t *tools) searchFilesV05(params map[string]any) (*SearchResult, *BridgeErr
 	if werr != nil {
 		return nil, errInternal("walk failed", werr)
 	}
+	if res.SkippedLarge > 0 {
+		res.SkippedLargeLimit = t.cfg.MaxReadBytes
+	}
 	return res, nil
 }
 

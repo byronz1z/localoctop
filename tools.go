@@ -390,50 +390,75 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 		if rerr != nil {
 			rel = d.Name()
 		}
-		matched := false
+		nameHit := false
 		// Match against the base name and the relative path.
 		if ok, _ := filepath.Match(osPattern, d.Name()); ok {
-			matched = true
+			nameHit = true
 		} else if ok, _ := filepath.Match(osPattern, rel); ok {
-			matched = true
+			nameHit = true
 		} else if strings.Contains(strings.ToLower(d.Name()), strings.ToLower(pattern)) && !isGlob(pattern) {
 			// Convenience: plain substring match when pattern is not a glob.
-			matched = true
+			nameHit = true
 		}
-		if !matched {
-			return nil
-		}
-		if d.IsDir() && !getBool(params, "include_dirs", true) {
-			return nil
-		}
-		if matchContent && !d.IsDir() {
-			found, skippedLarge := fileContains(p, pattern, t.cfg.MaxReadBytes)
-			if skippedLarge {
-				// Content search does not look inside very large files; the
-				// adapter must say so instead of letting "0 matches" imply the
-				// file was searched.
-				res.SkippedLarge++
-				if len(res.SkippedLargeNames) < 10 {
-					res.SkippedLargeNames = append(res.SkippedLargeNames, relDisplay(t.cfg.AllowedDirs, p))
+		if d.IsDir() {
+			// Directories match on name only (they have no searchable text).
+			if !nameHit || !getBool(params, "include_dirs", true) {
+				return nil
+			}
+			info, ierr := d.Info()
+			var size int64
+			var mt time.Time
+			if ierr == nil {
+				size = info.Size()
+				mt = info.ModTime()
+			}
+			res.Matches = append(res.Matches, SearchHit{
+				Path:  relDisplay(t.cfg.AllowedDirs, p),
+				Size:  size,
+				MTime: mt.UTC().Format(time.RFC3339),
+			})
+		} else {
+			contentHit := false
+			hitLine := 0
+			hitPreview := ""
+			if matchContent {
+				// match_content means "name OR content" (same as regex mode), not
+				// "name AND content": a needle that lives only inside a file must
+				// still be found. The pattern is treated as a plain substring
+				// here, never as a glob.
+				ln, preview, found, skippedLarge := substringFirstLine(p, pattern, t.cfg.MaxReadBytes)
+				if skippedLarge {
+					// Content search does not look inside very large files; the
+					// adapter must say so instead of letting "0 matches" imply the
+					// file was searched.
+					res.SkippedLarge++
+					if len(res.SkippedLargeNames) < 10 {
+						res.SkippedLargeNames = append(res.SkippedLargeNames, relDisplay(t.cfg.AllowedDirs, p))
+					}
+				} else {
+					contentHit = found
+					hitLine = ln
+					hitPreview = preview
 				}
+			}
+			if !nameHit && !contentHit {
 				return nil
 			}
-			if !found {
-				return nil
+			info, ierr := d.Info()
+			var size int64
+			var mt time.Time
+			if ierr == nil {
+				size = info.Size()
+				mt = info.ModTime()
 			}
+			res.Matches = append(res.Matches, SearchHit{
+				Path:    relDisplay(t.cfg.AllowedDirs, p),
+				Size:    size,
+				MTime:   mt.UTC().Format(time.RFC3339),
+				Line:    hitLine,
+				Preview: hitPreview,
+			})
 		}
-		info, ierr := d.Info()
-		var size int64
-		var mt time.Time
-		if ierr == nil {
-			size = info.Size()
-			mt = info.ModTime()
-		}
-		res.Matches = append(res.Matches, SearchHit{
-			Path:  relDisplay(t.cfg.AllowedDirs, p),
-			Size:  size,
-			MTime: mt.UTC().Format(time.RFC3339),
-		})
 		if len(res.Matches) >= maxResults {
 			truncated = true
 			return fs.SkipAll
@@ -444,6 +469,9 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 		return nil, errInternal("walk failed", werr)
 	}
 	res.Truncated = truncated
+	if res.SkippedLarge > 0 {
+		res.SkippedLargeLimit = t.cfg.MaxReadBytes
+	}
 	return res, nil
 }
 
@@ -452,22 +480,34 @@ func isGlob(p string) bool {
 	return strings.ContainsAny(p, "*?[]")
 }
 
-// fileContains reports whether a file's text contains needle (case-insensitive).
-// skipped is true when the file was NOT searched because it is over maxBytes —
-// the caller must then not claim "nothing found".
-func fileContains(path, needle string, maxBytes int64) (found, skipped bool) {
+// substringFirstLine reports the first line of a text file containing needle
+// as a plain, case-insensitive substring (never a glob), with a capped
+// preview — the glob-mode counterpart of regexFirstLine. skipped is true when
+// the file was NOT searched because it is over maxBytes — the caller must
+// then not claim "nothing found".
+func substringFirstLine(path, needle string, maxBytes int64) (int, string, bool, bool) {
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
-		return false, false
+		return 0, "", false, false
 	}
 	if st.Size() > maxBytes {
-		return false, true
+		return 0, "", false, true
 	}
 	data, err := os.ReadFile(path) // #nosec G304 - inside validated walk root
 	if err != nil || !utf8.Valid(data) {
-		return false, false
+		return 0, "", false, false
 	}
-	return strings.Contains(strings.ToLower(string(data)), strings.ToLower(needle)), false
+	lowerNeedle := strings.ToLower(needle)
+	for i, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(strings.ToLower(line), lowerNeedle) {
+			prev := line
+			if len(prev) > 200 {
+				prev = prev[:200]
+			}
+			return i + 1, prev, true, false
+		}
+	}
+	return 0, "", false, false
 }
 
 // ---- get_file_info ----

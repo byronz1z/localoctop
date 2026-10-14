@@ -130,6 +130,12 @@ def _next_step_for_error(message: str) -> str:
     if "nul byte" in low:
         return m + " Next step: re-issue the call with a plain path (no NUL bytes)."
     if "already exists" in low:
+        if "never overwrites" in low:
+            # move_file has no overwrite parameter at all — never send the
+            # model looking for one.
+            return (m + " Next step: choose a different destination name, or — if the user "
+                    "explicitly asked to replace the existing file — call delete_file on the "
+                    "destination first (it goes to the recycle bin), then move again.")
         return (m + " Next step: choose a different name, or pass overwrite=true only if the "
                 "user explicitly asked to replace the existing file.")
     if "not empty" in low and "recursive" in low:
@@ -530,8 +536,16 @@ class ToolService:
         skipped = int(result.get("skipped_large") or 0)
         if skipped:
             names = [str(n) for n in (result.get("skipped_large_names") or [])][:10]
-            note = (f"{skipped} file(s) were NOT searched inside because they are larger than the "
-                    f"read limit")
+            skip_limit = int(result.get("skipped_large_limit") or 0)
+            if skip_limit > 0:
+                # Name the real line the client skipped at (its MaxReadBytes),
+                # so the model never has to guess the size limit.
+                limit_txt = f"{skip_limit / (1024 * 1024):g} MiB ({skip_limit:,} bytes)"
+            else:
+                # Older clients do not report the limit; stay truthful.
+                limit_txt = "the client's read limit"
+            note = (f"{skipped} file(s) were NOT searched inside because they are larger than "
+                    f"{limit_txt}")
             if names:
                 note += ": " + ", ".join(names) + (" …" if skipped > len(names) else "")
             note += (". To search inside them, fetch_to_cloud the file(s) and search with "

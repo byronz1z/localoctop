@@ -124,6 +124,9 @@ type SearchResult struct {
 	// to 10) instead of letting "0 matches" imply they were searched.
 	SkippedLarge      int      `json:"skipped_large,omitempty"`
 	SkippedLargeNames []string `json:"skipped_large_names,omitempty"`
+	// SkippedLargeLimit is the size line the skips happened at (bytes), so the
+	// adapter can state the real limit instead of leaving the model guessing.
+	SkippedLargeLimit int64 `json:"skipped_large_limit,omitempty"`
 }
 
 // FileInfo is the get_file_info payload.
