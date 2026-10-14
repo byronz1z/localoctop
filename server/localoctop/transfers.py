@@ -702,6 +702,14 @@ class TransferManager:
     def _abort(self, t: Transfer, msg: str) -> None:
         t.finish(False, msg)
 
+    def _fail_unexpected(self, t: Transfer, where: str, ref: str) -> None:
+        """End a transfer as failed after an unexpected internal problem on
+        the bridge-facing HTTP line: the record must not stay 'active' (the
+        model would poll it forever), and the reason is plain language plus
+        the reference id — never the raw exception."""
+        t.finish(False, f"the localoctop service hit an internal problem while {where} "
+                        f"(reference for the administrator: {ref}); start the transfer again")
+
     def _new(self, **kw: Any) -> Transfer:
         self._gc()
         t = Transfer(id=secrets.token_urlsafe(9), ticket=secrets.token_urlsafe(24), **kw)
@@ -989,12 +997,32 @@ class TransferManager:
                 t.result = {"visible": str(visible)}
                 t.dirs = dirs
                 t.sha = hashlib.sha256()
-                # O_TMPFILE: the file has no name, so nothing in the user's
-                # folder can redirect or replace what we write.
-                t.file_fd = os.open(".", os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC, 0o600,
-                                    dir_fd=dirs.fd)
+                try:
+                    # O_TMPFILE: the file has no name, so nothing in the user's
+                    # folder can redirect or replace what we write.
+                    t.file_fd = os.open(".", os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC, 0o600,
+                                        dir_fd=dirs.fd)
+                except OSError as exc:
+                    # The transfer and its dir handles are already registered:
+                    # from here on a failure goes through the SAME teardown —
+                    # finish() closes the handles exactly once and drops the
+                    # transfer's references, so the background sweep never
+                    # closes a recycled fd number. The transfer is returned
+                    # (failed) instead of raising: the model gets FAILED with
+                    # a plain reason (disk full, unsupported filesystem, ...)
+                    # on THIS call, not "in progress" until the stall timeout.
+                    t.finish(False, f"a temporary file could not be created in the cloud "
+                                    f"({exc.strerror or exc}); the transfer was not started")
+                    return t
+                except BaseException:
+                    # Unexpected (not an OS-level refusal): end the transfer
+                    # the same way, then let it travel to the last-resort net.
+                    t.finish(False, "the upload could not be started")
+                    dirs = None  # finish() closed and dropped them; nothing left to close below
+                    raise
             except BaseException:
-                dirs.close()
+                if dirs is not None:
+                    dirs.close()
                 raise
             try:
                 # max_bytes rides along as the bridge-side last line of
@@ -1328,6 +1356,139 @@ class TransferManager:
             os.close(fd)
 
     # ----------------------------------------------- bridge-facing HTTP API
+    async def _put_chunk(self, t: Transfer, request: Request, offset: int):
+        """Receive and apply one upload chunk. Every failure this method
+        anticipates is answered with a specific status and (where the
+        transfer cannot continue) an abort; anything it does NOT anticipate
+        propagates to the route's last-resort handler."""
+        if t.direction != "up" or t.state != "active":
+            return JSONResponse({"error": f"transfer is {t.state}", "received": t.received}, status_code=410)
+        declared = int(request.headers.get("content-length") or 0)
+        if declared > MAX_CHUNK_BYTES:
+            return JSONResponse({"error": "chunk too large"}, status_code=413)
+        # Buffer the whole chunk first: a chunk is applied all-or-nothing,
+        # so a connection cut mid-chunk leaves the file at a clean offset.
+        buf = bytearray()
+        async for piece in request.stream():
+            buf.extend(piece)
+            # Bytes are arriving: that is activity and progress even
+            # though the chunk is only applied once it is complete (on a
+            # slow link one chunk takes tens of seconds).
+            t.inflight = len(buf)
+            t.touch()
+            if len(buf) > MAX_CHUNK_BYTES:
+                return JSONResponse({"error": "chunk too large"}, status_code=413)
+        if declared and len(buf) != declared:
+            return JSONResponse({"error": "short chunk", "received": t.received}, status_code=400)
+        async with t.lock:
+            if t.state != "active":
+                return JSONResponse({"error": f"transfer is {t.state}"}, status_code=410)
+            if offset != t.received:
+                return JSONResponse({"error": "offset mismatch", "received": t.received}, status_code=409)
+            if t.received + len(buf) > t.size:
+                self._abort(t, "the local file grew during the transfer; please fetch it again")
+                return JSONResponse({"error": "exceeds declared size"}, status_code=413)
+            try:
+                # All chunks go to the one anonymous temp fd held since
+                # the start; the folder's names cannot redirect this.
+                # The worker thread writes through its OWN duplicated fd
+                # and closes it itself: if this coroutine is cancelled
+                # and the transfer's handles are released meanwhile, the
+                # thread's write still lands on the file it was meant
+                # for — never on whatever recycled the fd number.
+                try:
+                    wfd = os.dup(t.file_fd)
+                except OSError as exc:
+                    raise OSError(f"could not duplicate the temp fd: {exc}") from exc
+                try:
+                    await asyncio.to_thread(_pwrite_own, wfd, bytes(buf), t.received)
+                except asyncio.CancelledError:
+                    # The thread finishes on its own fd (it is allowed
+                    # to — the temp data dies with the transfer).
+                    raise
+            except OSError as exc:
+                self._abort(t, f"could not write to cloud storage: {exc}")
+                return JSONResponse({"error": "storage write failed"}, status_code=507)
+            t.sha.update(buf)
+            t.received += len(buf)
+            t.inflight = 0
+            t.touch()
+        return {"received": t.received}
+
+    async def _complete(self, t: Transfer, request: Request):
+        """Apply the bridge's completion report (integrity check, landing,
+        ledger). Handled failures abort the transfer with a specific reason;
+        anything unanticipated propagates to the route's last-resort handler,
+        which ends the transfer as failed instead of leaving it 'active'."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        async with t.lock:
+            if t.state != "active":
+                return {"state": t.state}
+            if not body.get("ok"):
+                self._abort(t, str(body.get("error") or "the local machine reported a failure")[:500])
+                return {"state": t.state}
+            if t.direction == "down":
+                t.result = {"path": str(body.get("path") or ""), "replaced": bool(body.get("replaced"))}
+                t.received = t.size
+                t.finish(True)
+                return {"state": t.state}
+            # Integrity is checked against what actually landed: the
+            # anonymous fd is the only writer (O_TMPFILE has no name, so
+            # nothing else in the user's folder can reach it), and fstat
+            # confirms exactly `size` bytes made it to disk.
+            try:
+                st = os.fstat(t.file_fd)
+            except OSError as exc:
+                self._abort(t, f"could not verify the received file: {exc}")
+                return {"state": t.state}
+            digest = t.sha.hexdigest()
+            if (t.received != t.size or st.st_size != t.size
+                    or int(body.get("size", -1)) != t.size or body.get("sha256") != digest):
+                self._abort(t, "integrity check failed — the copy that reached the cloud does not match "
+                               "the local file; please fetch it again")
+                return {"state": t.state}
+            try:
+                # Set the local file's mtime on our own fd, before the
+                # file gets any name the user could swap.
+                if t.mtime_unix:
+                    os.utime(t.file_fd, ns=(t.mtime_unix * 1_000_000_000,) * 2)
+                # Match the platform's other files (0644), not the 0600
+                # an anonymous O_TMPFILE starts with.
+                os.fchmod(t.file_fd, 0o644)
+                st_final, _kept = await self._land(t, digest)
+            except OSError as exc:
+                self._abort(t, f"could not put the file in place in the cloud: {exc}")
+                return {"state": t.state}
+            # The file landed: the transfer IS a success from here on.
+            # The ledger only powers the "already up to date" shortcut,
+            # so a failure to persist it (state disk full, the ledger
+            # directory swapped out, ...) must not fail the request or
+            # strand the transfer: log it and finish normally.
+            try:
+                async with self._ledger_lock(t.user_id):
+                    ledger = self._ledger_load(t.user_id)
+                    ledger[f"{t.pair_id}|{t.local_path}"] = {
+                        "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
+                        "landed_size": st_final.st_size,
+                        "landed_mtime_ns": st_final.st_mtime_ns,
+                        # The bare filename the file actually landed
+                        # under: when the upload was saved aside this is
+                        # the .uploaded name, and the "still our
+                        # untouched copy" shortcut must check THAT name,
+                        # never the original one.
+                        "landed_name": t.result.get("landed_name") or t.cloud_path.name,
+                        "at": int(time.time())}
+                    self._ledger_save(t.user_id, ledger)
+            except Exception:  # noqa: BLE001
+                logger.warning("could not persist the transfer ledger for user %r; "
+                               "the landed file is unaffected", t.user_id, exc_info=True)
+            t.result = {**t.result, "sha256": digest}
+            t.finish(True)
+        return {"state": t.state}
+
     def _auth(self, request: Request, transfer_id: str) -> Transfer | JSONResponse:
         raw = request.headers.get("authorization", "")
         token = raw[7:].strip() if raw.lower().startswith("bearer ") else None
@@ -1359,59 +1520,70 @@ class TransferManager:
             t = self._auth(request, tid)
             if isinstance(t, JSONResponse):
                 return t
-            if t.direction != "up" or t.state != "active":
-                return JSONResponse({"error": f"transfer is {t.state}", "received": t.received}, status_code=410)
-            declared = int(request.headers.get("content-length") or 0)
-            if declared > MAX_CHUNK_BYTES:
-                return JSONResponse({"error": "chunk too large"}, status_code=413)
-            # Buffer the whole chunk first: a chunk is applied all-or-nothing,
-            # so a connection cut mid-chunk leaves the file at a clean offset.
-            buf = bytearray()
-            async for piece in request.stream():
-                buf.extend(piece)
-                # Bytes are arriving: that is activity and progress even
-                # though the chunk is only applied once it is complete (on a
-                # slow link one chunk takes tens of seconds).
-                t.inflight = len(buf)
-                t.touch()
-                if len(buf) > MAX_CHUNK_BYTES:
-                    return JSONResponse({"error": "chunk too large"}, status_code=413)
-            if declared and len(buf) != declared:
-                return JSONResponse({"error": "short chunk", "received": t.received}, status_code=400)
-            async with t.lock:
-                if t.state != "active":
-                    return JSONResponse({"error": f"transfer is {t.state}"}, status_code=410)
-                if offset != t.received:
-                    return JSONResponse({"error": "offset mismatch", "received": t.received}, status_code=409)
-                if t.received + len(buf) > t.size:
-                    self._abort(t, "the local file grew during the transfer; please fetch it again")
-                    return JSONResponse({"error": "exceeds declared size"}, status_code=413)
+            try:
+                return await self._put_chunk(t, request, offset)
+            except Exception:
+                # Unexpected (not one of the handled protocol/storage cases
+                # inside _put_chunk): the bridge gets a 5xx AND the transfer
+                # is ended as failed — it must never sit "active" while the
+                # model keeps polling. The raw exception goes to the log
+                # only; the model sees plain language plus a reference id.
+                ref = secrets.token_hex(4)
+                logger.error("internal error receiving a chunk for transfer %s (user %r, ref %s)",
+                             t.id, t.user_id, ref, exc_info=True)
+                self._fail_unexpected(t, "receiving the file", ref)
+                return JSONResponse({"error": f"internal error (ref {ref})"}, status_code=500)
+
+        @r.get(base + "/{tid}/content")
+        async def content(tid: str, request: Request):
+            t = self._auth(request, tid)
+            if isinstance(t, JSONResponse):
+                return t
+            if t.direction != "down" or t.state != "active":
+                return JSONResponse({"error": f"transfer is {t.state}"}, status_code=410)
+            start = 0
+            m = re.match(r"bytes=(\d+)-", request.headers.get("range", ""))
+            if m:
+                start = int(m.group(1))
+            if start > t.size:
+                return JSONResponse({"error": "range not satisfiable"}, status_code=416)
+
+            async def body():
+                # Reads go through the fd captured at start_download: even if
+                # the source path was renamed or replaced by a link since,
+                # the bytes served are the file that was verified then. Each
+                # worker-thread read uses its own duplicated fd (closed by
+                # the thread), so a finished/cancelled transfer closing its
+                # handles can never redirect an in-flight read.
+                pos = start
                 try:
-                    # All chunks go to the one anonymous temp fd held since
-                    # the start; the folder's names cannot redirect this.
-                    # The worker thread writes through its OWN duplicated fd
-                    # and closes it itself: if this coroutine is cancelled
-                    # and the transfer's handles are released meanwhile, the
-                    # thread's write still lands on the file it was meant
-                    # for — never on whatever recycled the fd number.
-                    try:
-                        wfd = os.dup(t.file_fd)
-                    except OSError as exc:
-                        raise OSError(f"could not duplicate the temp fd: {exc}") from exc
-                    try:
-                        await asyncio.to_thread(_pwrite_own, wfd, bytes(buf), t.received)
-                    except asyncio.CancelledError:
-                        # The thread finishes on its own fd (it is allowed
-                        # to — the temp data dies with the transfer).
-                        raise
-                except OSError as exc:
-                    self._abort(t, f"could not write to cloud storage: {exc}")
-                    return JSONResponse({"error": "storage write failed"}, status_code=507)
-                t.sha.update(buf)
-                t.received += len(buf)
-                t.inflight = 0
-                t.touch()
-            return {"received": t.received}
+                    while True:
+                        try:
+                            rfd = os.dup(t.file_fd)
+                        except OSError:
+                            return
+                        data = await asyncio.to_thread(_pread_own, rfd, 1024 * 1024, pos)
+                        if not data:
+                            return
+                        pos += len(data)
+                        t.received = max(t.received, pos)
+                        t.touch()
+                        yield data
+                except Exception:
+                    # An unexpected failure mid-stream: the response headers
+                    # are already sent, so the HTTP answer can only be cut —
+                    # but the transfer must still be ended as failed (never
+                    # left "active") and the failure logged with a reference.
+                    ref = secrets.token_hex(4)
+                    logger.error("internal error serving content of transfer %s (user %r, ref %s)",
+                                 t.id, t.user_id, ref, exc_info=True)
+                    self._fail_unexpected(t, "sending the file", ref)
+                    return
+
+            return StreamingResponse(body(), status_code=206, media_type="application/octet-stream", headers={
+                "Content-Range": f"bytes {start}-{max(t.size - 1, 0)}/{t.size}",
+                "Content-Length": str(t.size - start),
+            })
 
         @r.get(base + "/{tid}/content")
         async def content(tid: str, request: Request):
@@ -1459,73 +1631,17 @@ class TransferManager:
             if isinstance(t, JSONResponse):
                 return t
             try:
-                body = await request.json()
-            except Exception:  # noqa: BLE001
-                return JSONResponse({"error": "invalid JSON"}, status_code=400)
-            async with t.lock:
-                if t.state != "active":
-                    return {"state": t.state}
-                if not body.get("ok"):
-                    self._abort(t, str(body.get("error") or "the local machine reported a failure")[:500])
-                    return {"state": t.state}
-                if t.direction == "down":
-                    t.result = {"path": str(body.get("path") or ""), "replaced": bool(body.get("replaced"))}
-                    t.received = t.size
-                    t.finish(True)
-                    return {"state": t.state}
-                # Integrity is checked against what actually landed: the
-                # anonymous fd is the only writer (O_TMPFILE has no name, so
-                # nothing else in the user's folder can reach it), and fstat
-                # confirms exactly `size` bytes made it to disk.
-                try:
-                    st = os.fstat(t.file_fd)
-                except OSError as exc:
-                    self._abort(t, f"could not verify the received file: {exc}")
-                    return {"state": t.state}
-                digest = t.sha.hexdigest()
-                if (t.received != t.size or st.st_size != t.size
-                        or int(body.get("size", -1)) != t.size or body.get("sha256") != digest):
-                    self._abort(t, "integrity check failed — the copy that reached the cloud does not match "
-                                   "the local file; please fetch it again")
-                    return {"state": t.state}
-                try:
-                    # Set the local file's mtime on our own fd, before the
-                    # file gets any name the user could swap.
-                    if t.mtime_unix:
-                        os.utime(t.file_fd, ns=(t.mtime_unix * 1_000_000_000,) * 2)
-                    # Match the platform's other files (0644), not the 0600
-                    # an anonymous O_TMPFILE starts with.
-                    os.fchmod(t.file_fd, 0o644)
-                    st_final, _kept = await self._land(t, digest)
-                except OSError as exc:
-                    self._abort(t, f"could not put the file in place in the cloud: {exc}")
-                    return {"state": t.state}
-                # The file landed: the transfer IS a success from here on.
-                # The ledger only powers the "already up to date" shortcut,
-                # so a failure to persist it (state disk full, the ledger
-                # directory swapped out, ...) must not fail the request or
-                # strand the transfer: log it and finish normally.
-                try:
-                    async with self._ledger_lock(t.user_id):
-                        ledger = self._ledger_load(t.user_id)
-                        ledger[f"{t.pair_id}|{t.local_path}"] = {
-                            "size": t.size, "mtime": t.mtime_unix, "sha256": digest,
-                            "landed_size": st_final.st_size,
-                            "landed_mtime_ns": st_final.st_mtime_ns,
-                            # The bare filename the file actually landed
-                            # under: when the upload was saved aside this is
-                            # the .uploaded name, and the "still our
-                            # untouched copy" shortcut must check THAT name,
-                            # never the original one.
-                            "landed_name": t.result.get("landed_name") or t.cloud_path.name,
-                            "at": int(time.time())}
-                        self._ledger_save(t.user_id, ledger)
-                except Exception:  # noqa: BLE001
-                    logger.warning("could not persist the transfer ledger for user %r; "
-                                   "the landed file is unaffected", t.user_id, exc_info=True)
-                t.result = {**t.result, "sha256": digest}
-                t.finish(True)
-            return {"state": t.state}
+                return await self._complete(t, request)
+            except Exception:
+                # Unexpected (not one of the handled cases inside _complete):
+                # same rule as the chunk route — 5xx to the bridge AND the
+                # transfer ended as failed with a plain-language reason, so
+                # the model is never stuck polling an "active" record.
+                ref = secrets.token_hex(4)
+                logger.error("internal error completing transfer %s (user %r, ref %s)",
+                             t.id, t.user_id, ref, exc_info=True)
+                self._fail_unexpected(t, "finishing the transfer", ref)
+                return JSONResponse({"error": f"internal error (ref {ref})"}, status_code=500)
 
         return r
 
@@ -1547,9 +1663,22 @@ def _pread_own(fd: int, n: int, offset: int) -> bytes:
 
 def _pwrite_own(fd: int, data: bytes, offset: int) -> int:
     """os.pwrite on a duplicated fd the worker thread owns end to end (see
-    _sha256_fd_own for why)."""
+    _sha256_fd_own for why). Writes the WHOLE buffer: pwrite(2) may legally
+    accept only part of it, and taking a partial write as a full one would
+    leave a hole in the file while the checksum and the byte count say
+    "complete" — the worst outcome (a corrupt file reported as success).
+    Loops until every byte is on disk; a write that makes no progress (0
+    bytes) or raises is an OSError, so the chunk — and the transfer — fail
+    instead of silently truncating."""
     try:
-        return os.pwrite(fd, data, offset)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            n = os.pwrite(fd, view[written:], offset + written)
+            if n <= 0:
+                raise OSError(f"short write to cloud storage: {written} of {len(view)} bytes written")
+            written += n
+        return written
     finally:
         try:
             os.close(fd)

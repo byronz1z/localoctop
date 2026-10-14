@@ -295,7 +295,11 @@ class ToolService:
             hint = "The output was too long and only the first part is shown."
         else:
             hint = "The output was too long and only the first part is shown; narrow the request."
-        note = f"[result too large to show in full: {total:,} bytes, only the first part above is shown. {hint}]"
+        # Two numbers, always: how big the full answer was AND how much of it
+        # is actually shown above (the kept head, in bytes) — "the first part"
+        # alone leaves the model guessing how much it is missing.
+        note = (f"[result too large to show in full: {total:,} bytes in total, "
+                f"{kept:,} bytes shown above. {hint}]")
         out_blocks.append({"type": "text", "text": note})
         return {"content": out_blocks, "isError": False}
 

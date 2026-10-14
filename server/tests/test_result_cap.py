@@ -90,3 +90,40 @@ class TestCapNotesPerTool:
         assert "narrow the request" in note
         assert "edit" not in note.lower()
         assert "the whole result" not in note
+
+
+class TestCapNoteShowsBothSizes:
+    """LOX-002 T3-3: the truncation note must state BOTH numbers — how big
+    the full answer was and how many bytes are actually shown — and the
+    whole capped result (note included) must still fit the cap."""
+
+    def _check(self, monkeypatch, tool: str):
+        import re as _re
+        cap = 4096
+        monkeypatch.setattr(tools_mod, "MODEL_RESULT_CAP_BYTES", cap)
+        text = "line of text\n" * 500  # 7000 bytes > cap
+        total = len(text.encode("utf-8"))
+        rendered = _svc()._cap(tool, _big_text_result(text))
+        assert rendered["isError"] is False
+        # The whole result, note included, never exceeds the cap.
+        whole = "".join(b["text"] for b in rendered["content"] if b["type"] == "text")
+        assert len(whole.encode("utf-8")) <= cap
+        note = rendered["content"][-1]["text"]
+        # Both numbers are in the note: the full size and the shown size.
+        m = _re.search(r"([\d,]+) bytes in total, ([\d,]+) bytes shown", note)
+        assert m, f"note lacks the two sizes: {note}"
+        assert int(m.group(1).replace(",", "")) == total
+        shown = int(m.group(2).replace(",", ""))
+        # "Shown" equals the bytes actually kept above the note.
+        kept = "".join(b["text"] for b in rendered["content"][:-1] if b["type"] == "text")
+        assert shown == len(kept.encode("utf-8"))
+        assert 0 < shown < total
+
+    def test_listing_category(self, monkeypatch):
+        self._check(monkeypatch, "list_directory")
+
+    def test_edit_file_category(self, monkeypatch):
+        self._check(monkeypatch, "edit_file")
+
+    def test_other_category(self, monkeypatch):
+        self._check(monkeypatch, "get_file_info")

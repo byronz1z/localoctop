@@ -711,3 +711,94 @@ async def test_unzip_file_routes_when_writes_on():
         await task
         assert body["result"]["isError"] is False
         assert "extracted" in body["result"]["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 T2: the last-resort net — an exception the tool layer did not
+# anticipate must reach the model as a normal isError tool result (what
+# happened + a reference id + the next step), never as a raw JSON-RPC error
+# carrying the exception text.
+# ---------------------------------------------------------------------------
+
+class TestToolCallSafetyNet:
+    async def _run(self, monkeypatch, caplog, tool, arguments, write=False):
+        client, app = await _mk(_settings(allow_write=write))
+        registry = app.state.registry
+        ws = FakeWebSocket()
+        await registry.register(make_session("alice", ws, write_enabled=write,
+                                             pair_id=_pair(app, "alice")))
+        # Make the tool's actual handling blow up with the kind of error the
+        # code never saw coming (the real-world example was a TypeError from
+        # `in` on an int). Patch deep, past every gate, so the full endpoint
+        # path runs and only the safety net can catch it.
+        async def boom(*a, **kw):
+            raise TypeError("argument of type 'int' is not iterable")
+        if tool == "fetch_to_cloud":
+            monkeypatch.setattr(app.state.transfers, "start_upload", boom)
+        else:
+            monkeypatch.setattr(registry, "call_paired", boom)
+        async with client:
+            headers = await _handshake(client, "tok-alice")
+            with caplog.at_level("ERROR", logger="localoctop.mcp"):
+                r = await client.post("/mcp/localoctop/", headers=headers, json={
+                    "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments},
+                })
+            assert r.status_code == 200
+            body = r.json()
+            # A normal tool result — NOT a JSON-RPC error object.
+            assert "error" not in body, body
+            result = body["result"]
+            assert result["isError"] is True
+            text = result["content"][0]["text"]
+            # No raw exception text, no traceback, no file paths. Match the
+            # exception's signature as whole words so ordinary English
+            # ("internal", "point") does not false-positive.
+            import re as _re
+            for leaked in (r"\bint\b", "iterable", "Traceback", "TypeError",
+                           "argument of type", r"\.py"):
+                assert not _re.search(leaked, text), f"{leaked!r} leaked into: {text}"
+            # A reference id the user can hand to the administrator, and the
+            # two next steps (retry once / tell the user, no endless retries).
+            m = _re.search(r"\b[0-9a-f]{8}\b", text)
+            assert m, f"no reference id in: {text}"
+            assert "try the exact same call once more" in text
+            assert "tell the user" in text
+            assert "do not keep retrying" in text
+            # The same reference id and the full traceback are in the log.
+            assert any(m.group(0) in rec.getMessage() and rec.levelname == "ERROR"
+                       for rec in caplog.records), [r.getMessage() for r in caplog.records]
+            assert any(rec.exc_info for rec in caplog.records if m.group(0) in rec.getMessage())
+
+    @pytest.mark.asyncio
+    async def test_transfer_tool_unexpected_error(self, monkeypatch, caplog):
+        await self._run(monkeypatch, caplog, "fetch_to_cloud", {"path": "a.txt"})
+
+    @pytest.mark.asyncio
+    async def test_read_tool_unexpected_error(self, monkeypatch, caplog):
+        await self._run(monkeypatch, caplog, "read_file", {"path": "a.txt"})
+
+    @pytest.mark.asyncio
+    async def test_write_tool_unexpected_error(self, monkeypatch, caplog):
+        await self._run(monkeypatch, caplog, "write_file",
+                        {"path": "a.txt", "content": "hi"}, write=True)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_is_not_swallowed(self, monkeypatch):
+        """The net catches only Exception; asyncio.CancelledError (a
+        BaseException) must travel up untouched."""
+        from types import SimpleNamespace
+        from localoctop.mcp_app import MCPEndpoint, SCOPE_PAIR_KEY, SCOPE_USER_KEY
+        from localoctop.audit import AuditLog
+        from localoctop.sessions import SessionRegistry
+        endpoint = MCPEndpoint(_settings(), SessionRegistry(request_timeout=2.0), AuditLog(path=""))
+        assert isinstance(endpoint, MCPEndpoint)
+
+        async def cancel(*a, **kw):
+            raise asyncio.CancelledError()
+        monkeypatch.setattr(endpoint.tools, "call_tool", cancel)
+        scope = {SCOPE_USER_KEY: "alice", SCOPE_PAIR_KEY: "p1"}
+        ctx = SimpleNamespace(request=SimpleNamespace(scope=scope))
+        params = SimpleNamespace(name="read_file", arguments={})
+        with pytest.raises(asyncio.CancelledError):
+            await endpoint._on_call_tool(ctx, params)

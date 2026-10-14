@@ -14,6 +14,7 @@ Linux test container; nothing about the filesystem is mocked.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -1781,3 +1782,202 @@ class TestStateDirStartup:
         m = TransferManager(_Settings(make_token_store()), FakeRegistry(), "/mcp/localoctop/transfer")
         assert statmod.S_IMODE(m.state_dir.stat().st_mode) == 0o700
         assert statmod.S_IMODE(m.ledger_dir.stat().st_mode) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 T2: last-resort net on the bridge-facing transfer HTTP routes —
+# an exception the route did not anticipate must end the transfer as FAILED
+# (plain reason + reference id, handles released), never leave it "active".
+# ---------------------------------------------------------------------------
+
+class TestTransferRouteSafetyNet:
+    @staticmethod
+    def _fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    async def test_chunk_route_unexpected_error_fails_transfer(self, users_dir, mgr, monkeypatch, caplog):
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.txt": (b"hello world", 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.txt")
+        assert t.state == "active"
+        before = self._fds()
+
+        def boom(fd, data, offset):
+            raise RuntimeError("something nobody planned for")
+        monkeypatch.setattr("localoctop.transfers._pwrite_own", boom)
+
+        client = _client_for(mgr)
+        async with client:
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+            with caplog.at_level("ERROR", logger="localoctop.transfers"):
+                r = await client.put(f"/mcp/localoctop/transfer/{t.id}/chunk?offset=0",
+                                     content=b"hello world", headers=auth)
+            assert r.status_code == 500
+        # The transfer is FAILED with a plain reason + reference — not active.
+        assert t.state == "failed"
+        assert "internal problem" in t.error
+        assert "something nobody planned for" not in t.error
+        assert t.file_fd < 0 and t.dirs is None  # handles released
+        assert self._fds() <= before
+        # transfer_status now answers FAILED in plain language, not IN PROGRESS.
+        text = mgr.describe(t)
+        assert text.startswith("FAILED")
+        assert "internal problem" in text
+        # The log carries the same reference id and the real traceback.
+        import re as _re
+        m = _re.search(r"\b[0-9a-f]{8}\b", t.error)
+        assert m
+        assert any(m.group(0) in rec.getMessage() and rec.exc_info
+                   for rec in caplog.records)
+
+    async def test_complete_route_unexpected_error_fails_transfer(self, users_dir, mgr, monkeypatch, caplog):
+        _mk_user(users_dir, "alice")
+        content = b"hello world"
+        mgr.registry = FakeRegistry({"f.txt": (content, 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.txt")
+        client = _client_for(mgr)
+        auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+        base = f"/mcp/localoctop/transfer/{t.id}"
+        before = self._fds()
+        async with client:
+            r = await client.put(f"{base}/chunk?offset=0", content=content, headers=auth)
+            assert r.status_code == 200
+
+            async def boom(transfer, digest):
+                raise RuntimeError("landing blew up unexpectedly")
+            monkeypatch.setattr(mgr, "_land", boom)
+            sha = hashlib.sha256(content).hexdigest()
+            with caplog.at_level("ERROR", logger="localoctop.transfers"):
+                r = await client.post(f"{base}/complete",
+                                      json={"ok": True, "size": len(content), "sha256": sha},
+                                      headers=auth)
+            assert r.status_code == 500
+        assert t.state == "failed"
+        assert "internal problem" in t.error
+        assert "landing blew up unexpectedly" not in t.error
+        assert t.file_fd < 0 and t.dirs is None
+        assert self._fds() <= before
+
+    async def test_content_route_unexpected_error_fails_transfer(self, users_dir, mgr, monkeypatch, caplog):
+        _mk_user(users_dir, "alice")
+        src = users_dir / "alice" / "doc.txt"
+        src.write_bytes(b"serve me")
+        mgr.registry = FakeRegistry()
+        t = await mgr.start_download("alice", "pair-1", "/doc.txt", "out.txt", False)
+        assert t.state == "active"
+        before = self._fds()
+
+        def boom(fd, n, offset):
+            raise RuntimeError("read blew up unexpectedly")
+        monkeypatch.setattr("localoctop.transfers._pread_own", boom)
+
+        client = _client_for(mgr)
+        async with client:
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+            with caplog.at_level("ERROR", logger="localoctop.transfers"):
+                # The stream is cut (headers were already sent); what matters
+                # is the transfer ends FAILED, never stuck "active".
+                try:
+                    await client.get(f"/mcp/localoctop/transfer/{t.id}/content", headers=auth)
+                except Exception:
+                    pass
+        assert t.state == "failed"
+        assert "internal problem" in t.error
+        assert "read blew up unexpectedly" not in t.error
+        assert t.file_fd < 0 and t.dirs is None
+        assert self._fds() <= before
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 T3-1: a failure to create the anonymous temp file AFTER the
+# transfer was registered must fail the transfer on the spot (plain reason,
+# handles closed exactly once) — not strand it "active" for the sweep.
+# ---------------------------------------------------------------------------
+
+class TestStartUploadTmpfileFailure:
+    @staticmethod
+    def _fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    @pytest.mark.parametrize("err", [errno.ENOSPC, errno.EOPNOTSUPP])
+    async def test_tmpfile_open_failure_fails_transfer_once(self, users_dir, mgr, monkeypatch, err):
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.txt": (b"data", 1000)})
+        real_open = os.open
+
+        def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+            # O_TMPFILE itself includes the O_DIRECTORY bit, so test for the
+            # full flag set, not a single overlapping bit.
+            if flags & os.O_TMPFILE == os.O_TMPFILE:
+                raise OSError(err, os.strerror(err))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+        monkeypatch.setattr(os, "open", guarded_open)
+
+        before = self._fds()
+        t = await mgr.start_upload("alice", "pair-1", "f.txt")
+        # This very call reports the failure with the system's reason.
+        assert t.state == "failed"
+        assert "temporary file could not be created" in t.error
+        assert os.strerror(err) in t.error
+        assert t.file_fd < 0 and t.dirs is None
+        # A background sweep neither raises nor closes anything twice: the fd
+        # count is unchanged, and a concurrent healthy transfer still works.
+        mgr.sweep_transfers()
+        assert self._fds() <= before
+
+        monkeypatch.undo()  # restore os.open for the healthy transfer
+        _mk_user(users_dir, "bob")
+        mgr.registry = FakeRegistry({"g.txt": (b"ok", 1000)})
+        t2 = await mgr.start_upload("bob", "pair-1", "g.txt")
+        assert t2.state == "active"
+        t2.finish(True)
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 T3-2: a short pwrite must be retried until the whole chunk is on
+# disk; a write that makes no progress fails the chunk (and the transfer)
+# instead of recording a hole as "received".
+# ---------------------------------------------------------------------------
+
+class TestShortWriteHandling:
+    async def test_partial_then_full_write_lands_byte_identical(self, users_dir, mgr, monkeypatch):
+        _mk_user(users_dir, "alice")
+        content = os.urandom(100_000)
+        mgr.registry = FakeRegistry({"big.bin": (content, 1000)})
+        real_pwrite = os.pwrite
+        state = {"calls": 0}
+
+        def flaky_pwrite(fd, data, offset):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                return real_pwrite(fd, data[: len(data) // 2], offset)  # half
+            return real_pwrite(fd, data, offset)
+        monkeypatch.setattr(os, "pwrite", flaky_pwrite)
+
+        client = _client_for(mgr)
+        async with client:
+            t, resp = await _push_upload(mgr, client, "alice", "big.bin", content)
+        assert resp.json()["state"] == "done"
+        landed = _landing(users_dir, "alice") / "big.bin"
+        assert landed.read_bytes() == content
+
+    async def test_zero_progress_write_fails_never_reports_success(self, users_dir, mgr, monkeypatch):
+        _mk_user(users_dir, "alice")
+        content = b"x" * 10_000
+        mgr.registry = FakeRegistry({"z.bin": (content, 1000)})
+
+        def stuck_pwrite(fd, data, offset):
+            return 0
+        monkeypatch.setattr(os, "pwrite", stuck_pwrite)
+
+        t = await mgr.start_upload("alice", "pair-1", "z.bin")
+        client = _client_for(mgr)
+        async with client:
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+            r = await client.put(f"/mcp/localoctop/transfer/{t.id}/chunk?offset=0",
+                                 content=content, headers=auth)
+            assert r.status_code == 507
+        assert t.state == "failed"
+        assert "could not write" in t.error
+        assert t.received == 0
+        assert not (_landing(users_dir, "alice") / "z.bin").exists()

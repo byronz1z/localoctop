@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from typing import Any
 
 import mcp.types as mcp_types
@@ -235,13 +236,37 @@ class MCPEndpoint:
         arguments = params.arguments if isinstance(params.arguments, dict) else {}
         try:
             result = await self.tools.call_tool(user_id, pair_id, params.name, arguments)
+            return to_call_tool_result(result)
         except BridgeProtocolError as exc:
             # Routing/protocol failures ride in the JSON-RPC error object with
             # our domain codes (the connector probe parses them). Tool-level
             # failures (denied path, timeout, ...) come back as isError
             # results instead, per the MCP spec.
             raise MCPError(code=exc.code, message=exc.message) from exc
-        return to_call_tool_result(result)
+        except Exception:
+            # Last-resort net for anything between the call coming in and the
+            # result going out that the tool layer did not turn into a normal
+            # or isError result (a bug, an unexpected type, a malformed
+            # result block, ...). The model must NEVER receive a raw
+            # exception string it cannot act on: answer a normal tool result
+            # (isError=true) that says what happened, carries a reference id
+            # for the logs, and names the next step. asyncio.CancelledError
+            # is BaseException and is NOT caught here — cancellation travels
+            # up untouched.
+            ref = secrets.token_hex(4)
+            logger.error("internal error while handling tool %r for user %r (ref %s)",
+                         params.name, user_id, ref, exc_info=True)
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(text=(
+                    f"The localoctop service hit an internal problem while handling "
+                    f"{params.name}. Nothing may have been done. "
+                    f"Reference for the administrator: {ref}. "
+                    f"You can try the exact same call once more; if it fails again, "
+                    f"tell the user the localoctop service has an internal problem "
+                    f"and give them the reference {ref} — do not keep retrying."
+                ))],
+                isError=True,
+            )
 
 
 def build_router(settings: Settings, registry: SessionRegistry, audit: AuditLog, mcp_path: str) -> APIRouter:
