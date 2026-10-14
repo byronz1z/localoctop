@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -257,6 +258,61 @@ func TestWriteFile_Base64(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(root, "b.bin"))
 	if err != nil || len(data) != 3 || data[1] != 0xff {
 		t.Fatalf("bad base64 write: %v %v", data, err)
+	}
+}
+
+// TestWriteFile_OverwriteRecyclesOld: overwriting an existing file sends the
+// old version to the recycle bin first, then writes the new content in place.
+func TestWriteFile_OverwriteRecyclesOld(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t)
+	p := filepath.Join(root, "hello.txt")
+	res, berr := tl.writeFile(map[string]any{"path": "hello.txt", "content": "brand new"})
+	if berr != nil {
+		t.Fatalf("overwrite write failed: %v", berr)
+	}
+	if res.Created {
+		t.Fatalf("overwriting an existing file must not report Created: %+v", res)
+	}
+	if !res.Recycled || res.Note == "" {
+		t.Fatalf("result must report the recycled previous version: %+v", res)
+	}
+	if data, err := os.ReadFile(p); err != nil || string(data) != "brand new" {
+		t.Fatalf("new content not in place: %q %v", data, err)
+	}
+	// The pre-existing version ("hi there\n" from newTestTools) is in the bin.
+	if old, err := os.ReadFile(filepath.Join(bin, "hello.txt")); err != nil || string(old) != "hi there\n" {
+		t.Fatalf("old version not in the recycle bin: %q %v", old, err)
+	}
+}
+
+// TestWriteFile_OverwriteRefusedWithoutBin: when the recycle bin is
+// unavailable, write_file refuses and leaves the existing file untouched.
+func TestWriteFile_OverwriteRefusedWithoutBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows offers a real recycle bin; refusal path not exercised")
+	}
+	tl, root := newTestTools(t, true, 0)
+	p := filepath.Join(root, "hello.txt")
+	st0, err := os.Stat(p)
+	must(t, err)
+	_, berr := tl.writeFile(map[string]any{"path": "hello.txt", "content": "brand new"})
+	if berr == nil {
+		t.Fatalf("expected refusal on platform without recycle bin")
+	}
+	if berr.Code != CodeInvalidParams {
+		t.Fatalf("expected CodeInvalidParams, got %d", berr.Code)
+	}
+	if !strings.Contains(berr.Message, "recycle bin") || !strings.Contains(berr.Message, "nothing was changed") {
+		t.Fatalf("refusal must explain the missing bin and that nothing changed: %q", berr.Message)
+	}
+	// Content and mtime unchanged.
+	data, err := os.ReadFile(p)
+	must(t, err)
+	st1, err := os.Stat(p)
+	must(t, err)
+	if string(data) != "hi there\n" || !st1.ModTime().Equal(st0.ModTime()) {
+		t.Fatalf("refused overwrite must not touch the file: %q %v %v", data, st0.ModTime(), st1.ModTime())
 	}
 }
 

@@ -507,11 +507,30 @@ func (t *tools) writeFile(params map[string]any) (*WriteResult, *BridgeError) {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return nil, errInternal("create parent dir failed", err)
 	}
-	existed := fileExists(abs)
+	// Overwriting an existing FILE: its old version goes to the recycle bin
+	// FIRST. When the bin cannot take it we refuse and leave the file exactly
+	// as it was — never overwrite in place, never delete directly. A target
+	// that is a directory keeps its existing rejection: the WriteFile below
+	// fails on it just as before (no recycle attempt on a directory).
+	existed := false
+	recycled := false
+	if st, serr := os.Stat(abs); serr == nil && !st.IsDir() {
+		existed = true
+		status, terr := recycleExisting(abs)
+		if status == RecycleUnavailable {
+			return nil, errInvalidParams(recycleRefusal(refuseNoRecycleBin, terr) +
+				" Next step: write to a new file name instead, or tell the user.")
+		}
+		recycled = status == Recycled
+	}
 	if err := os.WriteFile(abs, payload, 0o644); err != nil { // #nosec G306 - validated path
 		return nil, errInternal("write failed", err)
 	}
-	return &WriteResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Size: int64(len(payload)), Created: !existed}, nil
+	res := &WriteResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Size: int64(len(payload)), Created: !existed, Recycled: recycled}
+	if recycled {
+		res.Note = "the previous version of this file was moved to the recycle bin before writing"
+	}
+	return res, nil
 }
 
 // ---- create_directory (reserved) ----

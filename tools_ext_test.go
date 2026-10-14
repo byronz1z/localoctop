@@ -4,17 +4,44 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 // v0.5.0 covers the official-MCP-aligned tools plus user-requested
 // extensions. Handlers are exercised directly (no WebSocket) via newTestTools.
 
+// fakeTrashBin substitutes the platform trashPath with a fake recycle bin:
+// a temp directory that "recycled" items are moved into. Production code
+// keeps the real platform implementation (trashImpl is only replaced for the
+// duration of the test). Returns the bin directory.
+func fakeTrashBin(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir()
+	orig := trashImpl
+	trashImpl = func(abs string) (bool, error) {
+		name := filepath.Base(abs)
+		dest := filepath.Join(bin, name)
+		for i := 1; fileExists(dest); i++ {
+			dest = filepath.Join(bin, fmt.Sprintf("%s.%d", name, i))
+		}
+		if err := os.Rename(abs, dest); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	t.Cleanup(func() { trashImpl = orig })
+	return bin
+}
+
 func TestEditFile_ApplyAndDryRun(t *testing.T) {
 	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t) // the apply path recycles the pre-edit version
 	p := filepath.Join(root, "edit.txt")
 	must(t, os.WriteFile(p, []byte("alpha bravo charlie\n"), 0o644))
 
@@ -34,7 +61,7 @@ func TestEditFile_ApplyAndDryRun(t *testing.T) {
 		t.Fatalf("dryRun modified the file: %q", onDisk)
 	}
 
-	// apply writes through the tmp+rename path.
+	// apply writes through the tmp+recycle+rename path.
 	ar, berr := tl.editFile(map[string]any{
 		"path":  "edit.txt",
 		"edits": []any{map[string]any{"oldText": "bravo", "newText": "BETA"}},
@@ -47,6 +74,14 @@ func TestEditFile_ApplyAndDryRun(t *testing.T) {
 	}
 	if onDisk, _ := os.ReadFile(p); string(onDisk) != "alpha BETA charlie\n" {
 		t.Fatalf("file not edited: %q", onDisk)
+	}
+	// The pre-edit version went to the recycle bin (fake) first.
+	old, err := os.ReadFile(filepath.Join(bin, "edit.txt"))
+	if err != nil || string(old) != "alpha bravo charlie\n" {
+		t.Fatalf("pre-edit version not in the fake recycle bin: %q %v", old, err)
+	}
+	if !ar.Recycled {
+		t.Fatalf("result must report the recycled previous version: %+v", ar)
 	}
 }
 
@@ -182,18 +217,45 @@ func TestMoveFile_WriteGate(t *testing.T) {
 	}
 }
 
-func TestDeleteFile_Permanent(t *testing.T) {
+func TestDeleteFile_PermanentIgnoredGoesToRecycleBin(t *testing.T) {
+	// permanent is no longer a supported parameter: a caller that still sends
+	// permanent=true gets the recycle bin anyway, with a note saying the
+	// permanent path is gone.
 	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t)
 	must(t, os.WriteFile(filepath.Join(root, "gone.txt"), []byte("x"), 0o644))
 	res, berr := tl.deleteFile(map[string]any{"path": "gone.txt", "permanent": true})
 	if berr != nil {
-		t.Fatalf("permanent delete failed: %v", berr)
+		t.Fatalf("delete failed: %v", berr)
 	}
-	if !res.Deleted || !res.Permanent {
-		t.Fatalf("unexpected result: %+v", res)
+	if !res.Deleted || !res.Recycle {
+		t.Fatalf("expected a recycle-bin delete: %+v", res)
+	}
+	if !strings.Contains(res.Note, "permanent") || !strings.Contains(res.Note, "recycle bin") {
+		t.Fatalf("result must state permanent delete is unavailable and the bin was used: %+v", res)
 	}
 	if _, err := os.Stat(filepath.Join(root, "gone.txt")); !os.IsNotExist(err) {
-		t.Fatalf("file should be deleted")
+		t.Fatalf("file should be gone from its original place")
+	}
+	// …but recoverable: it sits in the (fake) recycle bin.
+	if data, err := os.ReadFile(filepath.Join(bin, "gone.txt")); err != nil || string(data) != "x" {
+		t.Fatalf("deleted file must be in the recycle bin, got %q %v", data, err)
+	}
+}
+
+func TestDeleteFile_Recycled(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t)
+	must(t, os.WriteFile(filepath.Join(root, "gone.txt"), []byte("x"), 0o644))
+	res, berr := tl.deleteFile(map[string]any{"path": "gone.txt"})
+	if berr != nil {
+		t.Fatalf("delete failed: %v", berr)
+	}
+	if !res.Deleted || !res.Recycle || res.Note != "" {
+		t.Fatalf("expected a plain recycle-bin delete: %+v", res)
+	}
+	if _, err := os.ReadFile(filepath.Join(bin, "gone.txt")); err != nil {
+		t.Fatalf("deleted file must be in the recycle bin: %v", err)
 	}
 }
 
@@ -204,27 +266,86 @@ func TestDeleteFile_RecycleRefusedWithoutBin(t *testing.T) {
 		t.Skip("windows offers a real recycle bin; refusal path not exercised")
 	}
 	tl, root := newTestTools(t, true, 0)
-	must(t, os.WriteFile(filepath.Join(root, "keep.txt"), []byte("x"), 0o644))
-	if _, berr := tl.deleteFile(map[string]any{"path": "keep.txt"}); berr == nil {
+	p := filepath.Join(root, "keep.txt")
+	must(t, os.WriteFile(p, []byte("x"), 0o644))
+	st0, err := os.Stat(p)
+	must(t, err)
+	_, berr := tl.deleteFile(map[string]any{"path": "keep.txt"})
+	if berr == nil {
 		t.Fatalf("expected refusal on platform without recycle bin")
 	}
-	// The file must survive the refused delete.
-	if _, err := os.Stat(filepath.Join(root, "keep.txt")); err != nil {
-		t.Fatalf("refused delete must not remove the file: %v", err)
+	if berr.Code != CodeInvalidParams {
+		t.Fatalf("expected CodeInvalidParams, got %d", berr.Code)
+	}
+	if !strings.Contains(berr.Message, "recycle bin") || !strings.Contains(berr.Message, "nothing was deleted") {
+		t.Fatalf("refusal must explain the missing recycle bin and that nothing was deleted: %q", berr.Message)
+	}
+	// The file must survive the refused delete: content and mtime unchanged.
+	data, err := os.ReadFile(p)
+	must(t, err)
+	st1, err := os.Stat(p)
+	must(t, err)
+	if string(data) != "x" || !st1.ModTime().Equal(st0.ModTime()) {
+		t.Fatalf("refused delete must not touch the file: %q %v %v", data, st0.ModTime(), st1.ModTime())
+	}
+}
+
+func TestRemoveDirectory_Recycled(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t)
+	res, berr := tl.removeDirectory(map[string]any{"path": "docs", "recursive": true})
+	if berr != nil {
+		t.Fatalf("recursive remove failed: %v", berr)
+	}
+	if !res.Deleted || !res.Recycle {
+		t.Fatalf("expected a recycle-bin remove: %+v", res)
+	}
+	if res.Entries < 3 { // dir + a.md + b.md
+		t.Fatalf("expected entry count >=3, got %d", res.Entries)
+	}
+	if _, err := os.Stat(filepath.Join(root, "docs")); !os.IsNotExist(err) {
+		t.Fatalf("directory should be gone from its original place")
+	}
+	if _, err := os.Stat(filepath.Join(bin, "docs", "a.md")); err != nil {
+		t.Fatalf("removed directory contents must be in the recycle bin: %v", err)
 	}
 }
 
 func TestRemoveDirectory_NonEmptyGuard(t *testing.T) {
 	tl, _ := newTestTools(t, true, 0)
+	fakeTrashBin(t) // a working bin so the recursive step can succeed
 	if _, berr := tl.removeDirectory(map[string]any{"path": "docs"}); berr == nil {
 		t.Fatalf("expected refusal removing a non-empty dir without recursive")
 	}
-	res, berr := tl.removeDirectory(map[string]any{"path": "docs", "recursive": true, "permanent": true})
+	res, berr := tl.removeDirectory(map[string]any{"path": "docs", "recursive": true})
 	if berr != nil {
-		t.Fatalf("recursive permanent remove failed: %v", berr)
+		t.Fatalf("recursive remove failed: %v", berr)
 	}
 	if res.Entries < 3 { // dir + a.md + b.md
 		t.Fatalf("expected entry count >=3, got %d", res.Entries)
+	}
+}
+
+func TestRemoveDirectory_RefusedWithoutBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows offers a real recycle bin; refusal path not exercised")
+	}
+	tl, root := newTestTools(t, true, 0)
+	p := filepath.Join(root, "docs", "a.md")
+	st0, err := os.Stat(p)
+	must(t, err)
+	if _, berr := tl.removeDirectory(map[string]any{"path": "docs", "recursive": true}); berr == nil {
+		t.Fatalf("expected refusal on platform without recycle bin")
+	} else if !strings.Contains(berr.Message, "nothing was deleted") {
+		t.Fatalf("refusal must state nothing was deleted: %q", berr.Message)
+	}
+	st1, err := os.Stat(p)
+	must(t, err)
+	if !st1.ModTime().Equal(st0.ModTime()) {
+		t.Fatalf("refused remove must not touch the directory contents")
+	}
+	if _, err := os.Stat(filepath.Join(root, "docs")); err != nil {
+		t.Fatalf("directory must survive the refused remove: %v", err)
 	}
 }
 
@@ -287,6 +408,138 @@ func TestUnzip_WriteGate(t *testing.T) {
 	must(t, os.WriteFile(filepath.Join(root, "a.zip"), []byte("not a zip"), 0o644))
 	if _, berr := tl.unzipFile(map[string]any{"archive": "a.zip", "dest": "out"}); berr == nil || berr.Code != CodeWriteDisabled {
 		t.Fatalf("expected write-disabled, got %v", berr)
+	}
+}
+
+// makeZip builds a small archive at path with the given member->content map.
+func makeZip(t *testing.T, path string, members map[string]string) {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, body := range members {
+		w, err := zw.Create(name)
+		must(t, err)
+		_, _ = w.Write([]byte(body))
+	}
+	must(t, zw.Close())
+	must(t, os.WriteFile(path, buf.Bytes(), 0o644))
+}
+
+// TestUnzip_OverwriteRecyclesOld: overwrite=true replacing two existing files
+// sends both old versions to the recycle bin before extracting the new ones.
+func TestUnzip_OverwriteRecyclesOld(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t)
+	dest := filepath.Join(root, "landing")
+	must(t, os.MkdirAll(dest, 0o755))
+	must(t, os.WriteFile(filepath.Join(dest, "one.txt"), []byte("OLD-ONE"), 0o644))
+	must(t, os.WriteFile(filepath.Join(dest, "two.txt"), []byte("OLD-TWO"), 0o644))
+	makeZip(t, filepath.Join(root, "pkg.zip"), map[string]string{"one.txt": "NEW-ONE", "two.txt": "NEW-TWO"})
+
+	ur, berr := tl.unzipFile(map[string]any{"archive": "pkg.zip", "dest": "landing", "overwrite": true})
+	if berr != nil {
+		t.Fatalf("overwrite unzip failed: %v", berr)
+	}
+	if ur.Extracted != 2 || len(ur.Skipped) != 0 {
+		t.Fatalf("expected 2 extracted, none skipped: %+v", ur)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "one.txt")); string(data) != "NEW-ONE" {
+		t.Fatalf("one.txt not overwritten: %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "two.txt")); string(data) != "NEW-TWO" {
+		t.Fatalf("two.txt not overwritten: %q", data)
+	}
+	// Both old versions are recoverable in the (fake) recycle bin.
+	if old, err := os.ReadFile(filepath.Join(bin, "one.txt")); err != nil || string(old) != "OLD-ONE" {
+		t.Fatalf("old one.txt not in recycle bin: %q %v", old, err)
+	}
+	if old, err := os.ReadFile(filepath.Join(bin, "two.txt")); err != nil || string(old) != "OLD-TWO" {
+		t.Fatalf("old two.txt not in recycle bin: %q %v", old, err)
+	}
+}
+
+// TestUnzip_OverwriteRefusedWithoutBin: with no recycle bin, overwrite skips
+// the colliding members (originals untouched, content AND mtime unchanged) and
+// lists them; a member with no collision still extracts.
+func TestUnzip_OverwriteRefusedWithoutBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows offers a real recycle bin; refusal path not exercised")
+	}
+	tl, root := newTestTools(t, true, 0)
+	dest := filepath.Join(root, "landing")
+	must(t, os.MkdirAll(dest, 0o755))
+	// one.txt collides; fresh.txt does not.
+	old := time.Now().Add(-2 * time.Hour)
+	must(t, os.WriteFile(filepath.Join(dest, "one.txt"), []byte("OLD-ONE"), 0o644))
+	must(t, os.Chtimes(filepath.Join(dest, "one.txt"), old, old))
+	makeZip(t, filepath.Join(root, "pkg.zip"), map[string]string{"one.txt": "NEW-ONE", "fresh.txt": "NEW-FRESH"})
+
+	ur, berr := tl.unzipFile(map[string]any{"archive": "pkg.zip", "dest": "landing", "overwrite": true})
+	if berr != nil {
+		t.Fatalf("unzip failed: %v", berr)
+	}
+	if len(ur.Skipped) != 1 || !strings.Contains(ur.Skipped[0], "one.txt") {
+		t.Fatalf("colliding member must be reported skipped: %+v", ur)
+	}
+	if ur.Extracted != 1 { // only fresh.txt
+		t.Fatalf("expected only the non-colliding member extracted, got %d", ur.Extracted)
+	}
+	// The skipped member's original is untouched: content and mtime unchanged.
+	data, err := os.ReadFile(filepath.Join(dest, "one.txt"))
+	must(t, err)
+	st, err := os.Stat(filepath.Join(dest, "one.txt"))
+	must(t, err)
+	if string(data) != "OLD-ONE" || !st.ModTime().Equal(old) {
+		t.Fatalf("skipped member must be untouched: %q %v", data, st.ModTime())
+	}
+	// The fresh member did land.
+	if nf, err := os.ReadFile(filepath.Join(dest, "fresh.txt")); err != nil || string(nf) != "NEW-FRESH" {
+		t.Fatalf("non-colliding member should have extracted: %q %v", nf, err)
+	}
+}
+
+// TestEditFile_RenameFailsAfterRecycle: the recycle succeeds but the tmp->abs
+// rename fails. The temp file must be cleaned up and the error must say the
+// original is now in the recycle bin (with how to restore it).
+func TestEditFile_RenameFailsAfterRecycle(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	bin := t.TempDir()
+	orig := trashImpl
+	p := filepath.Join(root, "edit.txt")
+	must(t, os.WriteFile(p, []byte("alpha bravo charlie\n"), 0o644))
+	// Fake bin that recycles the original, then plants a non-empty directory at
+	// the original name so os.Rename(tmp, abs) fails on every platform.
+	trashImpl = func(abs string) (bool, error) {
+		name := filepath.Base(abs)
+		if err := os.Rename(abs, filepath.Join(bin, name)); err != nil {
+			return false, err
+		}
+		must(t, os.MkdirAll(abs, 0o755))
+		must(t, os.WriteFile(filepath.Join(abs, "blocker"), []byte("x"), 0o644))
+		return true, nil
+	}
+	t.Cleanup(func() { trashImpl = orig })
+
+	_, berr := tl.editFile(map[string]any{
+		"path":  "edit.txt",
+		"edits": []any{map[string]any{"oldText": "bravo", "newText": "BETA"}},
+	})
+	if berr == nil {
+		t.Fatalf("expected the rename-after-recycle failure to surface")
+	}
+	if berr.Code != CodeInternal {
+		t.Fatalf("expected CodeInternal, got %d", berr.Code)
+	}
+	if !strings.Contains(berr.Message, "recycle bin") || !strings.Contains(berr.Message, "restore") {
+		t.Fatalf("error must say the original is in the recycle bin and how to restore it: %q", berr.Message)
+	}
+	// The temp file must not be left behind.
+	if _, err := os.Stat(p + ".tmp-localoctop"); !os.IsNotExist(err) {
+		t.Fatalf("temp file left behind after failure: %v", err)
+	}
+	// The original content is safe in the bin.
+	if data, err := os.ReadFile(filepath.Join(bin, "edit.txt")); err != nil || string(data) != "alpha bravo charlie\n" {
+		t.Fatalf("original must be recoverable in the recycle bin: %q %v", data, err)
 	}
 }
 

@@ -278,6 +278,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "name": M_UNZIP_FILE,
         "description": "Extract a zip archive that lives inside the whitelist into a whitelisted destination "
                        "directory. Zip-slip and zip-bomb defences enforced; existing members need overwrite=true. "
+                       "With overwrite=true each existing file being replaced is moved to the recycle bin first "
+                       "(if the bin is unavailable that member is skipped and its original left untouched). "
                        "Requires write access.",
         "inputSchema": {
             "type": "object",
@@ -300,6 +302,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     M_WRITE_FILE: {
         "name": M_WRITE_FILE,
         "description": "Write text or base64 content to a whitelisted path on the employee's machine. "
+                       "When the target file already exists, its previous version is moved to the recycle bin "
+                       "before the new content is written (nothing is lost). "
                        "Requires write access enabled on both server and client.",
         "inputSchema": {
             "type": "object",
@@ -329,7 +333,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "name": M_EDIT_FILE,
         "description": "Apply targeted text edits to a UTF-8 whitelisted file: each {oldText,newText} pair must "
                        "match exactly one location (ambiguous or missing matches are errors). dryRun=true returns "
-                       "the unified diff without writing. Atomic tmp+rename replace. Requires write access.",
+                       "the unified diff without writing. When applied, the previous version of the file is moved to "
+                       "the recycle bin before the edit replaces it (nothing is lost). Atomic tmp+rename replace. "
+                       "Requires write access.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -368,14 +374,14 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     M_DELETE_FILE: {
         "name": M_DELETE_FILE,
-        "description": "Delete a whitelisted FILE. Default moves it to the Windows recycle bin (recoverable); "
-                       "permanent=true hard-deletes. Platforms without a recycle bin refuse unless permanent=true. "
+        "description": "Delete a whitelisted FILE by moving it to the Windows recycle bin (recoverable by the "
+                       "employee). Deletion is always reversible — there is no permanent/hard delete. If the "
+                       "recycle bin is unavailable the file is left untouched and you are told so. "
                        "Requires write access.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": _path_prop("File to delete (directories need remove_directory)."),
-                "permanent": {"type": "boolean", "description": "Skip the recycle bin and delete irrevocably (default false)."},
             },
             "required": ["path"],
         },
@@ -383,15 +389,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     M_REMOVE_DIRECTORY: {
         "name": M_REMOVE_DIRECTORY,
-        "description": "Remove a whitelisted DIRECTORY. Non-empty directories require recursive=true; the "
-                       "whitelist root itself is always refused. Recycle-bin default like delete_file; "
-                       "permanent=true hard-deletes. Requires write access.",
+        "description": "Remove a whitelisted DIRECTORY by moving it to the Windows recycle bin (recoverable). "
+                       "Non-empty directories require recursive=true; the whitelist root itself is always refused. "
+                       "Deletion is always reversible — there is no permanent/hard delete. If the recycle bin is "
+                       "unavailable nothing is removed and you are told so. Requires write access.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": _path_prop("Directory to remove (files need delete_file)."),
                 "recursive": {"type": "boolean", "description": "Remove non-empty contents too (default false)."},
-                "permanent": {"type": "boolean", "description": "Skip the recycle bin (default false)."},
             },
             "required": ["path"],
         },
@@ -403,7 +409,8 @@ TOOL_SCHEMAS[M_READ_FILE] = {
     "name": M_READ_FILE,
     "description": "Read part of a TEXT file on the user's machine, by lines. Returns at most ~48 KB per call "
                    "and tells you the line range returned, the total line count and how to get the next part. "
-                   "Use it to peek at or read small/medium text. For binary files (PDF, Office, images, archives) "
+                   "Use it to peek at or read small/medium text. Text larger than 10 MB shows only its "
+                   "beginning — for the rest, use fetch_to_cloud. For binary files (PDF, Office, images, archives) "
                    "or to process a whole large file, use fetch_to_cloud instead — never try to page a big file "
                    "through this tool.",
     "inputSchema": {

@@ -515,6 +515,16 @@ class ToolService:
         start, end = int(result.get("start_line", 1)), int(result.get("end_line", 0))
         total = int(result.get("total_lines", -1))
         size = int(result.get("size", 0))
+        # A text file over the platform's 10 MB line is not paged: the bridge
+        # flags it large_file and only ever delivers the first screen. Later
+        # windows arrive with no content — say so and point at fetch_to_cloud
+        # (a normal answer, never an error).
+        if result.get("large_file") and start > 1:
+            big_text = (f"== {path} ({size:,} bytes): this file is larger than 10 MB, and read_file "
+                        f"does not page files this big, so nothing was read. Next step: call "
+                        f"fetch_to_cloud with path={path!r} to copy the file to the cloud machine, "
+                        "then process it there with your own file and command-line tools (execute). ==")
+            return {"content": [{"type": "text", "text": big_text}], "isError": False}
         of = f" of {total}" if total >= 0 else ""
         if end < start:
             head = f"== {path} ({size:,} bytes): no lines at {start}{of} =="
@@ -522,6 +532,11 @@ class ToolService:
             head = f"== {path} ({size:,} bytes): lines {start}-{end}{of} =="
         if result.get("eof"):
             tail = "[end of file]"
+        elif result.get("large_file"):
+            tail = (f"[large file: this file is larger than 10 MB, so only this beginning part is "
+                    f"shown and read_file will not page further into it. To work with the rest of "
+                    f"the file, call fetch_to_cloud with path={path!r}, then process it on the "
+                    "cloud machine with your own file and command-line tools.]")
         else:
             tail = (f"[not the whole file — next part: read_file with start_line={end + 1}. "
                     "To process the whole file, use fetch_to_cloud instead of paging.]")

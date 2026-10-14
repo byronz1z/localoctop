@@ -188,6 +188,117 @@ func TestReadTextErrors(t *testing.T) {
 	}
 }
 
+// writeBigText creates a text file of exactly `size` bytes made of whole
+// lines, so line-paging behaviour is realistic at the boundary. It returns the
+// path. Files are written sparsely-ish in a loop to keep memory bounded.
+func writeBigText(t *testing.T, path string, size int64) {
+	t.Helper()
+	f, err := os.Create(path) // #nosec G304 - test-controlled path
+	must(t, err)
+	// Each line is "pad...\n"; pick a line length that divides nicely.
+	const lineLen = 100 // 99 content bytes + '\n'
+	buf := bytes.Repeat([]byte("a"), lineLen-1)
+	buf = append(buf, '\n')
+	var written int64
+	for written+int64(len(buf)) <= size {
+		_, werr := f.Write(buf)
+		must(t, werr)
+		written += int64(len(buf))
+	}
+	if written < size { // top up the remainder with a final partial line
+		rest := bytes.Repeat([]byte("b"), int(size-written)-1)
+		rest = append(rest, '\n')
+		_, werr := f.Write(rest)
+		must(t, werr)
+	}
+	must(t, f.Close())
+}
+
+// TestReadTextLargeThresholdBoundary: exactly 10 MB (not over the line) pages
+// normally; 10 MB + 1 byte is a large file whose second page carries no body.
+func TestReadTextLargeThresholdBoundary(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+
+	// Exactly largeTextThreshold bytes: NOT large — page 2 still reads content.
+	atLine := filepath.Join(root, "at.txt")
+	writeBigText(t, atLine, largeTextThreshold)
+	st, err := os.Stat(atLine)
+	must(t, err)
+	if st.Size() != largeTextThreshold {
+		t.Fatalf("setup: expected exactly %d bytes, got %d", largeTextThreshold, st.Size())
+	}
+	p2, berr := tl.readText(map[string]any{"path": "at.txt", "start_line": 2})
+	if berr != nil {
+		t.Fatalf("read at the boundary failed: %v", berr)
+	}
+	if p2.LargeFile {
+		t.Fatalf("a file of exactly 10 MB must not be flagged large: %+v", p2)
+	}
+	if p2.Text == "" {
+		t.Fatalf("page 2 of a non-large file must carry content: %+v", p2)
+	}
+
+	// One byte over the line: large — page 1 has content and the flag, page 2
+	// has NO content but still the flag and is a normal result (no error).
+	overLine := filepath.Join(root, "over.txt")
+	writeBigText(t, overLine, largeTextThreshold+1)
+	st, err = os.Stat(overLine)
+	must(t, err)
+	if st.Size() != largeTextThreshold+1 {
+		t.Fatalf("setup: expected %d bytes, got %d", largeTextThreshold+1, st.Size())
+	}
+
+	p1, berr := tl.readText(map[string]any{"path": "over.txt"})
+	if berr != nil {
+		t.Fatalf("large page-1 read failed: %v", berr)
+	}
+	if !p1.LargeFile {
+		t.Fatalf("a file over 10 MB must be flagged large: %+v", p1)
+	}
+	if p1.Text == "" {
+		t.Fatalf("large page 1 must still deliver the first screen: %+v", p1)
+	}
+	if p1.Size != largeTextThreshold+1 {
+		t.Fatalf("large page 1 must report the file size, got %d", p1.Size)
+	}
+
+	p2, berr = tl.readText(map[string]any{"path": "over.txt", "start_line": 2})
+	if berr != nil {
+		t.Fatalf("large page-2 must be a normal result, not an error: %v", berr)
+	}
+	if !p2.LargeFile {
+		t.Fatalf("large page 2 must carry the large flag: %+v", p2)
+	}
+	if p2.Text != "" {
+		t.Fatalf("large page 2 must NOT read any content, got %d bytes", len(p2.Text))
+	}
+	if p2.Size != largeTextThreshold+1 {
+		t.Fatalf("large page 2 must report the file size, got %d", p2.Size)
+	}
+}
+
+// TestReadTextLargeBinaryStillBinary: the binary check runs before the large
+// gate, so an oversized binary file is still reported as not_text (no body),
+// not as a large text file.
+func TestReadTextLargeBinaryStillBinary(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	p := filepath.Join(root, "huge.bin")
+	f, err := os.Create(p) // #nosec G304
+	must(t, err)
+	must(t, f.Truncate(largeTextThreshold+1)) // sparse NUL-filled file
+	must(t, f.Close())
+	res, berr := tl.readText(map[string]any{"path": "huge.bin"})
+	if berr != nil {
+		t.Fatalf("large binary read failed: %v", berr)
+	}
+	if res.NotText != "binary" {
+		t.Fatalf("expected not_text=binary, got %q (large=%v)", res.NotText, res.LargeFile)
+	}
+	if res.Text != "" {
+		t.Fatalf("a not-text result carries no body, got %d bytes", len(res.Text))
+	}
+}
+
 // ---- claimFreeName ----
 
 func TestClaimFreeName(t *testing.T) {

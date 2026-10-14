@@ -45,6 +45,14 @@ const (
 	maxTextLines     = 2000
 	maxTextBytes     = 48 << 10 // hard cap on text returned to the model per call
 	maxTextLineBytes = 2000     // one very long line must not eat the whole budget
+
+	// largeTextThreshold is the size above which a text file is no longer
+	// paged through read_file. It matches the Octop platform's own file
+	// tools, which stop inlining files larger than 10 MB: above this line the
+	// bridge delivers only the first screen and points the model at
+	// fetch_to_cloud instead of letting it page a huge file a window at a
+	// time. Do not change this number — it is the platform's existing limit.
+	largeTextThreshold = 10 << 20
 )
 
 // transferBackoff is the wait before each retry of one chunk. The sum (~5 min)
@@ -76,6 +84,10 @@ type ReadTextResult struct {
 	Text       string `json:"text"`
 	Clipped    int    `json:"clipped_lines"`       // lines cut at maxTextLineBytes
 	NotText    string `json:"not_text,omitempty"` // "binary" | "not_utf8": not readable text, no body delivered
+	// LargeFile marks text above largeTextThreshold. Only the first screen is
+	// delivered for such a file and no paging is offered. The field is
+	// optional: an adapter that predates it ignores it and behaves as before.
+	LargeFile bool `json:"large_file,omitempty"`
 }
 
 type transferJob struct {
@@ -525,6 +537,9 @@ func claimFreeName(part, target string) (string, error) {
 // readText returns a window of whole lines. Unlike the byte-window read_file
 // it never splits a multi-byte character, never returns more than
 // maxTextBytes, and tells the caller exactly where the next window starts.
+// Text files above largeTextThreshold are not paged: only the first window
+// is delivered (flagged LargeFile), and later windows come back empty with
+// the flag so the adapter can point at fetch_to_cloud instead.
 func (t *tools) readText(params map[string]any) (*ReadTextResult, *BridgeError) {
 	abs, berr := t.resolveAny(getString(params, "path", ""))
 	if berr != nil {
@@ -567,7 +582,18 @@ func (t *tools) readText(params map[string]any) (*ReadTextResult, *BridgeError) 
 		return nil, errInternal("seek failed", err)
 	}
 
-	res := &ReadTextResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Size: st.Size(), StartLine: startLine, TotalLines: -1}
+	// A text file above largeTextThreshold is not paged (platform line: files
+	// larger than 10 MB are processed in the cloud, not window by window).
+	// The first screen is still delivered; anything past it is a normal
+	// result with no body, pointing the caller at fetch_to_cloud.
+	large := st.Size() > largeTextThreshold
+	if large && startLine > 1 {
+		return &ReadTextResult{Path: relDisplay(t.cfg.AllowedDirs, abs),
+			Size: st.Size(), StartLine: startLine, EndLine: startLine - 1,
+			TotalLines: -1, LargeFile: true}, nil
+	}
+
+	res := &ReadTextResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Size: st.Size(), StartLine: startLine, TotalLines: -1, LargeFile: large}
 	rd := bufio.NewReaderSize(f, 256<<10)
 	var sb strings.Builder
 	line, taken := 0, 0

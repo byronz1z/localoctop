@@ -5,8 +5,9 @@ package localoctop
 // Windows recycle-bin support via the shell operation API. FOF_ALLOWUNDO
 // asks the shell to move the item to the recycle bin. When the shell refuses
 // (network share, beyond quota, FOE_CANTUNDO) we report (false, nil) so the
-// caller refuses instead of silently hard-deleting — the employee's trash
-// stays recoverable, and only permanent=true forces the irreversible path.
+// caller refuses the operation instead of silently hard-deleting — nothing an
+// AI tool does may make an existing file's content vanish for good, and there
+// is no permanent-delete path to fall back on.
 
 import (
 	"syscall"
@@ -67,7 +68,8 @@ func trashPath(abs string) (movedToRecycle bool, err error) {
 		return true, nil
 	case ret == foeCantUndo || ret == foeAbort || op.fAnyOperationsAborted != 0:
 		// The shell won't/can't recycle this item — not an error, but "no
-		// recycle bin available". removeOne refuses unless permanent=true.
+		// recycle bin available". Every caller then refuses the operation and
+		// leaves the item in place.
 		return false, nil
 	case ret != 0:
 		return false, syscall.Errno(ret)

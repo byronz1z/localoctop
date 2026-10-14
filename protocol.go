@@ -132,6 +132,11 @@ type WriteResult struct {
 	Path    string `json:"path"`
 	Size    int64  `json:"size"`
 	Created bool   `json:"created"`
+	// Recycled marks that an existing file was set aside in the recycle bin
+	// before the new content was written (optional; old adapters ignore it).
+	Recycled bool `json:"recycled,omitempty"`
+	// Note carries model-facing detail about the recycle-bin step.
+	Note string `json:"note,omitempty"`
 }
 
 // ---- v0.5.0 official-MCP-aligned result shapes ----
@@ -180,6 +185,10 @@ type EditResult struct {
 	Diff         string `json:"diff"`    // git-style unified diff (context 3)
 	SizeBefore   int64  `json:"size_before"`
 	SizeAfter    int64  `json:"size_after"`
+	// Recycled marks that the pre-edit version went to the recycle bin
+	// before the new content replaced it (optional new field).
+	Recycled bool   `json:"recycled,omitempty"`
+	Note     string `json:"note,omitempty"`
 }
 
 // SizeListEntry is one row of list_directory_with_sizes.
@@ -219,14 +228,15 @@ type MoveResult struct {
 	Moved       bool   `json:"moved"`
 }
 
-// DeleteResult is the delete_file / remove_directory payload. Permanent=false
-// means the item went to the recycle bin (recoverable by the employee).
+// DeleteResult is the delete_file / remove_directory payload. Deletion is
+// always a move to the recycle bin (recoverable by the employee); the
+// Permanent field no longer exists — nothing is ever hard-deleted.
 type DeleteResult struct {
-	Path      string `json:"path"`
-	Deleted   bool   `json:"deleted"`
-	Permanent bool   `json:"permanent"`
-	Recycle   bool   `json:"recycle_bin"`       // moved to OS recycle bin
-	Entries   int    `json:"entries,omitempty"` // remove_directory: removed count
+	Path    string `json:"path"`
+	Deleted bool   `json:"deleted"`
+	Recycle bool   `json:"recycle_bin"`       // moved to OS recycle bin
+	Entries int    `json:"entries,omitempty"` // remove_directory: removed count
+	Note    string `json:"note,omitempty"`    // e.g. "permanent delete ignored"
 }
 
 // ZipResult is the zip_files payload: the archive is built client-side under
@@ -240,12 +250,15 @@ type ZipResult struct {
 	Truncated bool   `json:"truncated"`         // some requested paths skipped (cap)
 }
 
-// UnzipResult is the unzip_file payload.
+// UnzipResult is the unzip_file payload. Skipped lists members that were NOT
+// extracted because their existing target could not be set aside in the
+// recycle bin; the original files stay untouched.
 type UnzipResult struct {
-	Archive    string `json:"archive"`
-	Dest       string `json:"dest"`
-	Extracted  int    `json:"extracted"`
-	TotalBytes int64  `json:"total_bytes"`
+	Archive    string   `json:"archive"`
+	Dest       string   `json:"dest"`
+	Extracted  int      `json:"extracted"`
+	TotalBytes int64    `json:"total_bytes"`
+	Skipped    []string `json:"skipped,omitempty"`
 }
 
 // AllowedDirsResult is the list_allowed_directories payload.

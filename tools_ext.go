@@ -30,6 +30,64 @@ const (
 	maxMediaBytesDefault = DefaultMaxMediaBytes
 )
 
+// ---- recycle-bin plumbing (project rule: never hard-delete an existing file) ----
+//
+// trashImpl is the per-platform implementation (windows_trash.go /
+// trash_other.go) behind a package-level variable so tests can substitute a
+// fake bin; production code always uses the platform default.
+var trashImpl = trashPath
+
+// Recycle statuses returned by recycleExisting.
+const (
+	// RecycleAbsent: the path does not exist — nothing to set aside, the
+	// caller proceeds as a plain create.
+	RecycleAbsent = ""
+	// Recycled: the existing item is now in the recycle bin.
+	Recycled = "recycled"
+	// RecycleUnavailable: the platform offers no bin, or the move failed.
+	// The item is untouched and the caller MUST refuse the operation —
+	// never fall back to overwriting or deleting directly.
+	RecycleUnavailable = "unavailable"
+)
+
+// recycleExisting moves abs to the recycle bin when it exists. terr carries
+// the underlying recycle-bin error (nil when the platform simply offers no
+// bin); callers weave it into their own model-facing refusal message.
+func recycleExisting(abs string) (status string, terr error) {
+	if _, err := os.Lstat(abs); err != nil {
+		return RecycleAbsent, nil // nothing there: a plain create
+	}
+	ok, terr := trashImpl(abs)
+	if terr != nil {
+		return RecycleUnavailable, terr
+	}
+	if !ok {
+		return RecycleUnavailable, nil
+	}
+	return Recycled, nil
+}
+
+// refuseNoRecycleBin is the model-facing reason used whenever the recycle bin
+// cannot take an item being REPLACED. It states what did NOT happen; each tool
+// appends its own next step. Same wording everywhere so the model always sees
+// the same reason.
+const refuseNoRecycleBin = "the recycle bin is not available on this computer (or moving the item into it failed), " +
+	"so nothing was changed and nothing was deleted — the existing file is untouched."
+
+// refuseDeleteNoRecycleBin is the deletion-specific variant: nothing was
+// deleted. removeOne appends the underlying error (if any) and the next step.
+const refuseDeleteNoRecycleBin = "the recycle bin is not available on this computer (or moving the item into it failed), " +
+	"so nothing was deleted — the item is still in place, unchanged."
+
+// recycleRefusal renders the refusal text for a replace-class tool, with the
+// underlying recycle-bin error appended when there was one.
+func recycleRefusal(base string, terr error) string {
+	if terr != nil {
+		return base + " (recycle-bin error: " + terr.Error() + ")"
+	}
+	return base
+}
+
 // resolveAny resolves a raw path and requires it to exist.
 func (t *tools) resolveAny(raw string) (abs string, berr *BridgeError) {
 	if raw == "" {
@@ -210,13 +268,34 @@ func (t *tools) editFile(params map[string]any) (*EditResult, *BridgeError) {
 	if dryRun {
 		return res, nil
 	}
+	// Replace through the recycle bin: write the new content to a temp file
+	// first, set the ORIGINAL aside in the recycle bin, then rename the temp
+	// file into place. If the bin cannot take the original, nothing is
+	// changed at all. If the rename fails after the original was recycled,
+	// that is the one case where the original name is briefly empty — the
+	// answer says so honestly and tells the model how to get the old version
+	// back (restore from the recycle bin).
 	tmp := abs + ".tmp-localoctop"
 	if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil { // #nosec G306 - validated path
 		return nil, errInternal("write failed", err)
 	}
+	status, terr := recycleExisting(abs)
+	if status == RecycleUnavailable {
+		_ = os.Remove(tmp)
+		return nil, errInvalidParams(recycleRefusal(refuseNoRecycleBin, terr) +
+			" The new content was not written; the file still has its original content. Next step: tell the user.")
+	}
 	if err := os.Rename(tmp, abs); err != nil {
 		_ = os.Remove(tmp)
+		if status == Recycled {
+			return nil, errInternal("the original file is now in the recycle bin and the new content could NOT be written in its place "+
+				"(rename failed: "+err.Error()+"). To get the old version back, restore it from the recycle bin.", err)
+		}
 		return nil, errInternal("replace failed", err)
+	}
+	res.Recycled = status == Recycled
+	if res.Recycled {
+		res.Note = "the previous version of this file was moved to the recycle bin before the edit was applied"
 	}
 	return res, nil
 }
@@ -447,8 +526,11 @@ func (t *tools) deleteFile(params map[string]any) (*DeleteResult, *BridgeError) 
 	if st.IsDir() {
 		return nil, errInvalidParams("path is a directory; use remove_directory")
 	}
-	permanent := getBool(params, "permanent", false)
-	return t.removeOne(abs, false, permanent)
+	// permanent is no longer a parameter: deletion always goes to the recycle
+	// bin. A caller that still sends permanent=true gets the recycle bin too,
+	// with a note saying the permanent path does not exist.
+	askedPermanent := getBool(params, "permanent", false)
+	return t.removeOne(abs, false, askedPermanent)
 }
 
 // ---- remove_directory ----
@@ -478,45 +560,46 @@ func (t *tools) removeDirectory(params map[string]any) (*DeleteResult, *BridgeEr
 		}
 	}
 	recursive := getBool(params, "recursive", false)
-	permanent := getBool(params, "permanent", false)
+	// permanent is no longer a parameter: removal always goes to the recycle
+	// bin. A caller that still sends permanent=true gets the recycle bin too,
+	// with a note saying the permanent path does not exist.
+	askedPermanent := getBool(params, "permanent", false)
 	if !recursive {
 		if ents, rerr := os.ReadDir(abs); rerr == nil && len(ents) > 0 {
 			return nil, errInvalidParams("directory is not empty; pass recursive=true to remove its contents")
 		}
 	}
-	return t.removeOne(abs, recursive, permanent)
+	return t.removeOne(abs, recursive, askedPermanent)
 }
 
-// removeOne deletes one path honouring the recycle-bin default. When the
-// platform cannot offer a recycle bin we REFUSE rather than silently
-// hard-delete (the employee's trash stays available); only permanent=true
-// forces the irreversible path.
-func (t *tools) removeOne(abs string, recursive, permanent bool) (*DeleteResult, *BridgeError) {
+// removeOne deletes one path by moving it to the recycle bin. There is no
+// permanent/hard-delete path any more: nothing an AI tool does may make an
+// existing item vanish for good. When the platform cannot offer a recycle bin
+// (or the move fails) we REFUSE and leave the item exactly as it was.
+// askedPermanent only controls whether the result carries a note that the
+// permanent path is gone — it never triggers a hard delete.
+func (t *tools) removeOne(abs string, recursive, askedPermanent bool) (*DeleteResult, *BridgeError) {
 	entries := 1
 	if recursive {
 		entries = countSubtree(abs)
 	}
 	rel := relDisplay(t.cfg.AllowedDirs, abs)
-	if !permanent {
-		ok, err := trashPath(abs)
-		if err != nil {
-			return nil, errInternal("recycle-bin move failed", err)
-		}
-		if !ok {
-			return nil, errInvalidParams("this platform offers no recycle bin; re-send with permanent=true to confirm irreversible deletion")
-		}
-		return &DeleteResult{Path: rel, Deleted: true, Recycle: true, Entries: entries}, nil
+	status, terr := recycleExisting(abs)
+	if status == RecycleUnavailable {
+		return nil, errInvalidParams(recycleRefusal(refuseDeleteNoRecycleBin, terr) +
+			" Next step: tell the user that this deletion needs a working recycle bin on their computer.")
 	}
-	var err error
-	if recursive {
-		err = os.RemoveAll(abs)
-	} else {
-		err = os.Remove(abs)
+	if status != Recycled {
+		// recycleExisting reports RecycleAbsent only when the path does not
+		// exist, but the caller already Lstat'd it; treat a vanished item as
+		// not-found rather than claiming a successful delete.
+		return nil, errNotFound("path not found: "+rel, nil)
 	}
-	if err != nil {
-		return nil, errInternal("delete failed", err)
+	res := &DeleteResult{Path: rel, Deleted: true, Recycle: true, Entries: entries}
+	if askedPermanent {
+		res.Note = "permanent delete is not available; the item was moved to the recycle bin instead"
 	}
-	return &DeleteResult{Path: rel, Deleted: true, Permanent: true, Entries: entries}, nil
+	return res, nil
 }
 
 func countSubtree(dir string) int {
@@ -711,8 +794,22 @@ func (t *tools) unzipFile(params map[string]any) (*UnzipResult, *BridgeError) {
 		if res.TotalBytes+int64(f.UncompressedSize64) > mediaCap {
 			break // expansion-budget guard (zip-bomb defence)
 		}
-		if _, statErr := os.Lstat(target); statErr == nil && !overwrite {
-			return nil, errInvalidParams("member target already exists: " + filepath.ToSlash(target) + " (pass overwrite=true)")
+		if lst, statErr := os.Lstat(target); statErr == nil {
+			if !overwrite {
+				return nil, errInvalidParams("member target already exists: " + filepath.ToSlash(target) + " (pass overwrite=true)")
+			}
+			// Overwriting an existing FILE member: its old version must reach
+			// the recycle bin first. If the bin cannot take it, this member is
+			// SKIPPED — the original stays untouched and we report it; the rest
+			// of the archive still extracts normally. A directory target is not
+			// recycled: it keeps the existing rejection (the OpenFile below
+			// fails on a directory) rather than being sent to the bin.
+			if !lst.IsDir() {
+				if status, _ := recycleExisting(target); status == RecycleUnavailable {
+					res.Skipped = append(res.Skipped, relDisplay(t.cfg.AllowedDirs, target)+" (recycle bin unavailable; original left untouched)")
+					continue
+				}
+			}
 		}
 		rc, oerr := f.Open()
 		if oerr != nil {
