@@ -64,6 +64,7 @@ import re
 import secrets
 import shutil
 import stat as statmod
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -99,6 +100,12 @@ STALL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_STALL_SECONDS", 420))
 SCAN_INTERVAL_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_SCAN_INTERVAL", 30))
 # Finished transfer records are kept this long for transfer_status lookups.
 RECORD_TTL_SECONDS = 3600.0
+# How long aclose() waits for a transfer's in-flight completion flow (the
+# lock-holding section of _complete/_put_chunk) before cancelling it. The
+# whole landing path — hashing the moved-aside copy, renameat2, the ledger
+# write — is local disk I/O and normally finishes in well under a second;
+# 5 s is generous headroom for a slow disk without letting shutdown hang.
+CLOSE_WAIT_SECONDS = 5.0
 
 # A ledger larger than this is treated as "no ledger": the per-user ledger
 # holds a handful of small entries, so megabytes of JSON cannot be one.
@@ -323,6 +330,48 @@ def _sha256_fd_own(fd: int) -> str:
             pass
 
 
+async def _run_owning_fd(fn: Any, fd: int, *args: Any) -> Any:
+    """Run fn(fd, *args) on a worker thread; the fd is closed EXACTLY once,
+    whether or not the thread function ever runs.
+
+    The leak this guards against: the coroutine is cancelled while the work
+    item still sits in the executor queue — fn never runs, so nothing would
+    ever close the dup'd fd.
+
+    Ownership is settled under a lock so the two sides can never both close
+    (a double close can hit a *recycled* fd number belonging to another
+    transfer) and never both skip. The runner claims the fd under the lock
+    before touching it; the cancelling coroutine may only close when the
+    claim has not happened yet — and it marks the fd as taken, so a runner
+    that gets scheduled later returns without touching a closed fd. (The
+    return value of Future.cancel() cannot be used for this: asyncio's
+    wrapper reports cancellation even when the thread is already running.)
+    """
+    loop = asyncio.get_running_loop()
+    guard = threading.Lock()
+    taken = {"thread": False, "caller": False}
+
+    def runner() -> Any:
+        with guard:
+            if taken["caller"]:
+                return None  # the cancelled coroutine already closed the fd
+            taken["thread"] = True
+        return fn(fd, *args)
+
+    fut = loop.run_in_executor(None, runner)
+    try:
+        return await fut
+    except asyncio.CancelledError:
+        with guard:
+            if not taken["thread"]:
+                taken["caller"] = True
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        raise
+
+
 # ---------------------------------------------------------------- renameat2
 # The Python standard library has no renameat2, so call libc directly.
 # RENAME_NOREPLACE makes the rename fail with EEXIST when the destination
@@ -392,6 +441,11 @@ class Transfer:
     finished: float = 0.0
     done: asyncio.Event = field(default_factory=asyncio.Event)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # The coroutine currently running the completion flow (_complete),
+    # registered by the complete route so aclose() can cancel it when the
+    # shutdown wait runs out. Always the task that holds (or is about to
+    # hold) `lock`.
+    completion_task: asyncio.Task | None = None
     dirs: _Dirs | None = None       # verified dir handles of the landing folder
     file_fd: int = -1               # up: anonymous temp fd; down: verified source fd
 
@@ -641,21 +695,36 @@ class TransferManager:
             if t.state != "active" and now - t.finished > RECORD_TTL_SECONDS:
                 self._transfers.pop(tid, None)
 
-    def _check_stall(self, t: Transfer) -> None:
-        if t.state == "active" and time.monotonic() - t.updated > STALL_SECONDS:
-            self._abort(t, "the transfer stopped making progress — the local machine went offline "
-                           "or the localoctop client was closed. Start it again when the machine is back.")
+    async def _check_stall(self, t: Transfer) -> None:
+        """Declare a transfer dead if no byte moved for STALL_SECONDS.
 
-    def sweep_transfers(self) -> None:
+        The finish never races the completion flow: the flow
+        (_complete/_put_chunk) runs entirely inside t.lock and is the only
+        user of the transfer's dir handles in that window, so aborting
+        while the lock is held would close t.dirs under a coroutine still
+        using it. Held lock -> skipped; the next pass (or aclose's wait)
+        retries."""
+        if t.state != "active":
+            return
+        if time.monotonic() - t.updated <= STALL_SECONDS:
+            return
+        if t.lock.locked():
+            return  # completion in flight: retry next sweep
+        t.finish(False, "the transfer stopped making progress — the local machine went offline "
+                        "or the localoctop client was closed. Start it again when the machine is back.")
+
+    async def sweep_transfers(self) -> None:
         """One pass over every transfer record: stall-abort actives that
         stopped making progress (their handles are closed by finish()) and
         drop finished records past the retention TTL.
 
-        This is called by the background scan task AND directly by tests —
-        a transfer nobody ever asks about again must not hold its file and
-        directory handles forever."""
+        A transfer whose lock is held (a completion flow using its dir
+        handles) is skipped, never aborted mid-use — the scan itself never
+        blocks on a transfer. This is called by the background scan task AND
+        directly by tests — a transfer nobody ever asks about again must not
+        hold its file and directory handles forever."""
         for t in list(self._transfers.values()):
-            self._check_stall(t)
+            await self._check_stall(t)
         self._gc()
 
     def _ensure_scan_task(self) -> None:
@@ -675,7 +744,7 @@ class TransferManager:
         while True:
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
             try:
-                self.sweep_transfers()
+                await self.sweep_transfers()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -686,7 +755,16 @@ class TransferManager:
         transfer still in flight and release its handles (called from the
         app lifespan on shutdown). fds handed to worker threads were
         duplicated first (the thread closes its own copy), so closing the
-        coroutine's copies here cannot touch I/O still running."""
+        coroutine's copies here cannot touch I/O still running.
+
+        A completion flow in progress (holding the transfer's lock, using
+        its dir handles) is never closed out from under it: it gets
+        CLOSE_WAIT_SECONDS, then is cancelled, then the loop keeps waiting
+        until it has actually exited the lock-holding section — a cancelled
+        flow stops touching the handles before its lock exits. Shutdown may
+        take a moment past the deadline when the worker-thread hashing of
+        the moved-aside copy is still finishing; that is the price of never
+        closing a handle while it can still be read."""
         task = self._scan_task
         self._scan_task = None
         if task is not None:
@@ -696,8 +774,39 @@ class TransferManager:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         for t in list(self._transfers.values()):
-            if t.state == "active":
+            if t.state != "active":
+                continue
+            try:
+                # Acquiring the lock synchronises with the completion flow:
+                # once held, finish() is the only thing still using t.dirs
+                # and the flow has already exited the lock.
+                await asyncio.wait_for(t.lock.acquire(), timeout=CLOSE_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                # The completion flow is stuck in an await (a slow hash
+                # thread, typically): cancel it so the coroutine stops
+                # touching the handles, then keep waiting for its exit.
+                ct = t.completion_task
+                if ct is not None and not ct.done():
+                    ct.cancel()
+                logger.warning("aclose: waiting for the completion flow of transfer %s "
+                               "to exit after cancellation", t.id)
+                try:
+                    await asyncio.wait_for(t.lock.acquire(), timeout=CLOSE_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    # Still not out (a thread it awaits holds it far longer
+                    # than any sane shutdown window). The flow no longer
+                    # holds the event loop, so closing here would NOT close
+                    # a handle it can still use after resuming — but it
+                    # would close one a STUCK flow may resume into, so skip
+                    # the finish and let the process exit clean up instead.
+                    logger.error("aclose: transfer %s completion flow still not out; "
+                                 "skipping its finish (process exit reclaims the fd)",
+                                 t.id)
+                    continue
+            try:
                 t.finish(False, "the localoctop adapter is shutting down; start the transfer again")
+            finally:
+                t.lock.release()
 
     def _abort(self, t: Transfer, msg: str) -> None:
         t.finish(False, msg)
@@ -835,7 +944,7 @@ class TransferManager:
                 dup = os.dup(fd)
             except OSError:
                 return False
-            digest = await asyncio.to_thread(_sha256_fd_own, dup)
+            digest = await _run_owning_fd(_sha256_fd_own, dup)
             st2 = os.fstat(fd)
             if (st1.st_size, st1.st_mtime_ns, st1.st_ctime_ns) != \
                     (st2.st_size, st2.st_mtime_ns, st2.st_ctime_ns):
@@ -962,7 +1071,7 @@ class TransferManager:
             for other in self._transfers.values():
                 if (other.state == "active" and other.direction == "up" and other.user_id == user_id
                         and other.pair_id == pair_id and other.local_path == rel):
-                    self._check_stall(other)
+                    await self._check_stall(other)
                     if other.state == "active":
                         return other
 
@@ -1071,7 +1180,7 @@ class TransferManager:
             # Hash the held fd, not the path: the digest is of the exact
             # file /content will serve, whatever the user does to the name.
             # The thread gets its own duplicated fd and closes it itself.
-            t.expected_sha = await asyncio.to_thread(_sha256_fd_own, os.dup(fd))
+            t.expected_sha = await _run_owning_fd(_sha256_fd_own, os.dup(fd))
             acc = await self._call(user_id, pair_id, "transfer_download",
                                    {"path": t.local_path, "size": size, "sha256": t.expected_sha,
                                     "overwrite": bool(overwrite), **self._bridge_params(t)})
@@ -1096,7 +1205,7 @@ class TransferManager:
         """Wait up to `seconds` for the transfer to finish."""
         deadline = time.monotonic() + seconds
         while t.state == "active":
-            self._check_stall(t)
+            await self._check_stall(t)
             left = deadline - time.monotonic()
             if left <= 0 or t.state != "active":
                 return
@@ -1332,7 +1441,7 @@ class TransferManager:
                 dup = os.dup(fd)
             except OSError:
                 return False
-            digest = await asyncio.to_thread(_sha256_fd_own, dup)
+            digest = await _run_owning_fd(_sha256_fd_own, dup)
             if digest != idx_prev["sha256"]:
                 return False  # content changed since we landed it: cloud work — keep it
             st_after = os.fstat(fd)
@@ -1401,7 +1510,7 @@ class TransferManager:
                 except OSError as exc:
                     raise OSError(f"could not duplicate the temp fd: {exc}") from exc
                 try:
-                    await asyncio.to_thread(_pwrite_own, wfd, bytes(buf), t.received)
+                    await _run_owning_fd(_pwrite_own, wfd, bytes(buf), t.received)
                 except asyncio.CancelledError:
                     # The thread finishes on its own fd (it is allowed
                     # to — the temp data dies with the transfer).
@@ -1562,7 +1671,7 @@ class TransferManager:
                             rfd = os.dup(t.file_fd)
                         except OSError:
                             return
-                        data = await asyncio.to_thread(_pread_own, rfd, 1024 * 1024, pos)
+                        data = await _run_owning_fd(_pread_own, rfd, 1024 * 1024, pos)
                         if not data:
                             return
                         pos += len(data)
@@ -1612,7 +1721,7 @@ class TransferManager:
                         rfd = os.dup(t.file_fd)
                     except OSError:
                         return
-                    data = await asyncio.to_thread(_pread_own, rfd, 1024 * 1024, pos)
+                    data = await _run_owning_fd(_pread_own, rfd, 1024 * 1024, pos)
                     if not data:
                         return
                     pos += len(data)
@@ -1630,6 +1739,9 @@ class TransferManager:
             t = self._auth(request, tid)
             if isinstance(t, JSONResponse):
                 return t
+            # Register this coroutine's task so aclose() can cancel the
+            # completion flow if it does not exit its lock in time.
+            t.completion_task = asyncio.current_task()
             try:
                 return await self._complete(t, request)
             except Exception:
@@ -1642,6 +1754,8 @@ class TransferManager:
                              t.id, t.user_id, ref, exc_info=True)
                 self._fail_unexpected(t, "finishing the transfer", ref)
                 return JSONResponse({"error": f"internal error (ref {ref})"}, status_code=500)
+            finally:
+                t.completion_task = None
 
         return r
 

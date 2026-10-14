@@ -58,7 +58,9 @@ SERVER_INSTRUCTIONS = (
     "client running on the user's machine. Read tools are always available; "
     "write tools (edit/move/delete/remove/unzip) appear only when write access "
     "is enabled (server-side switch and the employee's client-side toggle). "
-    "Deletions go to the recycle bin by default; permanent=true is irreversible. "
+    "Deletions always go to the recycle bin and can be restored; there is no "
+    "permanent delete. Before an existing file is overwritten or modified, "
+    "its previous version goes to the recycle bin. "
     "Every path outside the whitelist roots is refused."
 )
 

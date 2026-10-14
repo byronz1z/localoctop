@@ -14,11 +14,13 @@ Linux test container; nothing about the filesystem is mocked.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -958,7 +960,7 @@ class TestBackgroundSweep:
         assert t.file_fd >= 0 and t.dirs is not None
         # Nobody ever asks for status; make it stale and sweep once directly.
         t.updated = time.monotonic() - 10
-        mgr.sweep_transfers()
+        await mgr.sweep_transfers()
         assert t.state == "failed" and "stopped making progress" in t.error
         assert t.file_fd == -1 and t.dirs is None
         assert len(os.listdir("/proc/self/fd")) <= before
@@ -972,7 +974,7 @@ class TestBackgroundSweep:
         t = await mgr.start_download("alice", "pair-1", "/out.txt", "", False)
         assert t.state == "active"
         t.updated = time.monotonic() - 10
-        mgr.sweep_transfers()
+        await mgr.sweep_transfers()
         assert t.state == "failed"
         assert t.file_fd == -1 and t.dirs is None
         assert len(os.listdir("/proc/self/fd")) <= before
@@ -986,7 +988,7 @@ class TestBackgroundSweep:
             t, _ = await _push_upload(mgr, client, "alice", "f.bin", b"x")
         assert t.id in mgr._transfers
         t.finished = time.monotonic() - 10
-        mgr.sweep_transfers()
+        await mgr.sweep_transfers()
         assert t.id not in mgr._transfers
 
     async def test_scan_task_started_lazily_and_stopped(self, users_dir, mgr):
@@ -1922,7 +1924,7 @@ class TestStartUploadTmpfileFailure:
         assert t.file_fd < 0 and t.dirs is None
         # A background sweep neither raises nor closes anything twice: the fd
         # count is unchanged, and a concurrent healthy transfer still works.
-        mgr.sweep_transfers()
+        await mgr.sweep_transfers()
         assert self._fds() <= before
 
         monkeypatch.undo()  # restore os.open for the healthy transfer
@@ -1981,3 +1983,265 @@ class TestShortWriteHandling:
         assert "could not write" in t.error
         assert t.received == 0
         assert not (_landing(users_dir, "alice") / "z.bin").exists()
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 T4 requirement 1: while a completion flow is still going to use its
+# dir handles, neither the background sweep nor aclose() may close them — a
+# closed fd number can be handed straight to ANOTHER user's transfer, and the
+# resumed flow would then operate on that user's folder.
+# ---------------------------------------------------------------------------
+
+class TestT4CompletionFlowKeepsItsHandles:
+    @staticmethod
+    def _fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    @staticmethod
+    def _stall_now(monkeypatch):
+        import localoctop.transfers as tr
+        monkeypatch.setattr(tr, "STALL_SECONDS", 0.01)
+
+    async def _first_upload(self, mgr, users_dir):
+        """Land doc.txt once so the ledger records our copy; the next landing
+        then has an occupant to move aside, which is the path that hashes on
+        a worker thread."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"doc.txt": (b"v1-old-copy", 1000)})
+        async with _client_for(mgr) as client:
+            t, _ = await _push_upload(mgr, client, "alice", "doc.txt", b"v1-old-copy")
+        assert t.state == "done"
+        return t
+
+    async def _second_upload_stuck_in_hash(self, mgr, users_dir, monkeypatch):
+        """Start alice's SECOND upload of doc.txt and let its completion flow
+        stop inside the moved-aside hashing thread. Returns (client, task, t,
+        release_event) where the task is the HTTP complete request driving the
+        flow (the flow, and thus t.lock and t.dirs, is in use until release is
+        set)."""
+        import localoctop.transfers as tr
+        release = threading.Event()
+        entered = threading.Event()
+        real = tr._sha256_fd_own
+
+        def slow(fd):
+            entered.set()
+            release.wait(10.0)
+            return real(fd)
+
+        monkeypatch.setattr(tr, "_sha256_fd_own", slow)
+        content = b"v2-fresh-content"
+        mgr.registry = FakeRegistry({"doc.txt": (content, 2000)})
+        client = _client_for(mgr)
+        t = await mgr.start_upload("alice", "pair-1", "doc.txt")
+        assert t.state == "active"
+        auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+        r = await client.put(f"/mcp/localoctop/transfer/{t.id}/chunk?offset=0",
+                             content=content, headers=auth)
+        assert r.status_code == 200
+        task = asyncio.create_task(client.post(
+            f"/mcp/localoctop/transfer/{t.id}/complete",
+            json={"ok": True, "size": len(content), "sha256": hashlib.sha256(content).hexdigest()},
+            headers=auth))
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 5.0), 6.0)
+        return client, task, t, release
+
+    async def test_sweep_skips_transfer_whose_completion_is_in_flight(
+            self, users_dir, mgr, monkeypatch):
+        await self._first_upload(mgr, users_dir)
+        before = self._fds()
+        client, task, t, release = await self._second_upload_stuck_in_hash(
+            mgr, users_dir, monkeypatch)
+        try:
+            self._stall_now(monkeypatch)
+            t.updated = time.monotonic() - 10
+            await mgr.sweep_transfers()
+            # The flow is mid-landing: its handles must still be open and the
+            # transfer must not have been aborted under it.
+            assert t.state == "active"
+            assert t.dirs is not None and t.file_fd >= 0
+            release.set()
+            resp = await task
+            assert resp.status_code == 200 and t.state == "done"
+            assert (_landing(users_dir, "alice") / "doc.txt").read_bytes() == b"v2-fresh-content"
+        finally:
+            release.set()
+            await client.aclose()
+        assert self._fds() <= before
+
+    async def test_aclose_waits_then_cancels_completion_and_frees_handles(
+            self, users_dir, mgr, monkeypatch):
+        import localoctop.transfers as tr
+        monkeypatch.setattr(tr, "CLOSE_WAIT_SECONDS", 0.3)
+        await self._first_upload(mgr, users_dir)
+        before = self._fds()
+        client, task, t, release = await self._second_upload_stuck_in_hash(
+            mgr, users_dir, monkeypatch)
+        try:
+            await asyncio.wait_for(mgr.aclose(), timeout=10.0)
+            assert t.state == "failed" and "shutting down" in t.error
+            assert t.file_fd == -1 and t.dirs is None
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+            await asyncio.sleep(0.3)  # let the orphaned hashing thread finish
+            await client.aclose()
+        assert self._fds() <= before
+
+    async def test_no_cross_talk_when_another_user_takes_the_fd_numbers(
+            self, users_dir, mgr, monkeypatch):
+        """alice's flow is stuck and declared dead by the sweep; bob then
+        starts a transfer and gets fresh handles. If alice's handles had been
+        closed, the resumed flow would operate on bob's folder. Bob's folder
+        must be untouched and his own transfer must complete normally."""
+        await self._first_upload(mgr, users_dir)
+        _mk_user(users_dir, "bob")
+        client, task, t, release = await self._second_upload_stuck_in_hash(
+            mgr, users_dir, monkeypatch)
+        try:
+            self._stall_now(monkeypatch)
+            t.updated = time.monotonic() - 10
+            await mgr.sweep_transfers()
+            assert t.state == "active"  # held lock: skipped, not aborted
+
+            bob_content = b"bob-little-file"
+            mgr.registry = FakeRegistry({"b0.bin": (bob_content, 1000)})
+            tb, _ = await _push_upload(mgr, client, "bob", "b0.bin", bob_content)
+            assert tb.state == "done"
+            bob_files = sorted(p.name for p in _landing(users_dir, "bob").iterdir())
+
+            release.set()
+            resp = await task
+            assert resp.status_code == 200 and t.state == "done"
+            assert (_landing(users_dir, "alice") / "doc.txt").read_bytes() == b"v2-fresh-content"
+            assert sorted(p.name for p in _landing(users_dir, "bob").iterdir()) == bob_files == ["b0.bin"]
+            assert (_landing(users_dir, "bob") / "b0.bin").read_bytes() == bob_content
+        finally:
+            release.set()
+            await client.aclose()
+
+    async def test_sweep_does_not_block_on_a_locked_transfer(
+            self, users_dir, mgr, monkeypatch):
+        """A transfer whose lock is held is skipped, and the scan still
+        finishes — it never waits on that transfer."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"a.bin": (b"aaa", 1000), "b.bin": (b"bbb", 1000)})
+        t_locked = await mgr.start_upload("alice", "pair-1", "a.bin")
+        t_stale = await mgr.start_upload("alice", "pair-1", "b.bin")
+        assert t_locked.state == "active" and t_stale.state == "active"
+        await t_locked.lock.acquire()  # a completion flow of its own, held
+        try:
+            self._stall_now(monkeypatch)
+            t_stale.updated = time.monotonic() - 10
+            started = time.monotonic()
+            await asyncio.wait_for(mgr.sweep_transfers(), timeout=1.0)
+            elapsed = time.monotonic() - started
+        finally:
+            t_locked.lock.release()
+        assert t_locked.state == "active" and t_locked.dirs is not None
+        assert t_stale.state == "failed"
+        assert elapsed < 1.0
+        t_locked.finish(True)
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 T4 requirement 2: every fd dup'd for a worker thread must be closed
+# exactly once — including when the awaiting coroutine is cancelled while the
+# work item is still queued and the thread function never runs.
+# ---------------------------------------------------------------------------
+
+class TestT4QueuedDupOwnership:
+    @staticmethod
+    def _fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    @staticmethod
+    def _default_workers(loop) -> int:
+        return min(32, (os.cpu_count() or 1) + 4)
+
+    async def test_cancelled_while_queued_closes_the_dup_exactly_once(
+            self, users_dir, mgr):
+        """Fill the thread pool, queue one more dup-then-thread operation, and
+        cancel it while queued. When the pool drains, the fd count is back and
+        the never-started thread function touched nothing."""
+        home = _mk_user(users_dir, "alice")
+        (home / "one.txt").write_bytes(b"first-file")
+        await asyncio.to_thread(lambda: None)  # ensure the default executor exists
+        loop = asyncio.get_running_loop()
+        workers = self._default_workers(loop)
+
+        release = threading.Event()
+        all_started = asyncio.Event()
+        count = {"running": 0}
+
+        def block():
+            count["running"] += 1
+            if count["running"] == workers:
+                loop.call_soon_threadsafe(all_started.set)
+            release.wait(10.0)
+
+        blockers = [asyncio.ensure_future(asyncio.to_thread(block)) for _ in range(workers)]
+        try:
+            # All workers are busy (do NOT wait from inside the pool: it is
+            # full, so a pool task waiting on a signal would deadlock).
+            await asyncio.wait_for(all_started.wait(), 5.0)
+            before = self._fds()
+            task = asyncio.create_task(
+                mgr.start_download("alice", "pair-1", "/one.txt", "", False))
+            await asyncio.sleep(0.1)  # it is now queued behind the blockers
+            assert not task.done()  # proving it never got a worker
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            for b in blockers:
+                await b
+            await asyncio.sleep(0.2)  # the orphaned work item, if run, must no-op
+            assert self._fds() <= before
+        finally:
+            release.set()
+            await asyncio.gather(*blockers, return_exceptions=True)
+
+    async def test_cancelled_after_the_thread_started_is_not_double_closed(
+            self, users_dir, mgr, monkeypatch):
+        """The worker is already inside the hash when the coroutine is
+        cancelled: it closes its own dup, the coroutine does not, and no fd is
+        closed twice."""
+        import localoctop.transfers as tr
+        home = _mk_user(users_dir, "alice")
+        (home / "one.txt").write_bytes(b"first-file")
+        real = tr._sha256_fd_own
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow(fd):
+            entered.set()
+            release.wait(10.0)
+            return real(fd)
+
+        monkeypatch.setattr(tr, "_sha256_fd_own", slow)
+        before = self._fds()
+        task = asyncio.create_task(mgr.start_download("alice", "pair-1", "/one.txt", "", False))
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 5.0), 6.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        await asyncio.sleep(0.3)
+        assert self._fds() <= before
+
+    async def test_run_owning_fd_normal_path_closes_exactly_once(self, users_dir):
+        """The helper's happy path: the thread closes the dup it was given."""
+        import localoctop.transfers as tr
+        home = _mk_user(users_dir, "alice")
+        src = home / "h.bin"
+        src.write_bytes(b"hash-me")
+        fd = os.open(src, os.O_RDONLY)
+        try:
+            before = self._fds()
+            digest = await tr._run_owning_fd(tr._sha256_fd_own, os.dup(fd))
+            assert digest == hashlib.sha256(b"hash-me").hexdigest()
+            assert self._fds() <= before
+        finally:
+            os.close(fd)
