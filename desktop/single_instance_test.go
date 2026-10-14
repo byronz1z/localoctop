@@ -60,6 +60,51 @@ func TestSecondDesktopAction_Strings(t *testing.T) {
 	}
 }
 
+// TestSecondDesktopFollowUp_BringToFrontAndFallback verifies the T11-final
+// behaviour: when another desktop instance is running, the second launch
+// tries BringWailsSingleInstanceWindowToFront and, only if that fails, falls
+// back to ShowAlreadyRunningMessageBox. Both paths must be distinguishable
+// (brought-to-front vs message-box) so callers can assert no silent exit.
+func TestSecondDesktopFollowUp_BringToFrontAndFallback(t *testing.T) {
+	called := false
+	bringOK := func() bool { called = true; return true }
+	got := runSecondDesktopFollowUp(localoctop.ProbeDesktop, bringOK)
+	if got != followUpBroughtToFront {
+		t.Fatalf("runSecondDesktopFollowUp(ProbeDesktop, ok) = %v, want followUpBroughtToFront", got)
+	}
+	if !called {
+		t.Fatal("bringToFront must be called when the probe says a desktop is running")
+	}
+
+	called = false
+	bringFail := func() bool { called = true; return false }
+	got = runSecondDesktopFollowUp(localoctop.ProbeDesktop, bringFail)
+	if got != followUpMessageBox {
+		t.Fatalf("runSecondDesktopFollowUp(ProbeDesktop, fail) = %v, want followUpMessageBox", got)
+	}
+	if !called {
+		t.Fatal("bringToFront must be attempted before falling back to the message box")
+	}
+
+	// A nil bringToFront (e.g. non-Windows stub) is treated as a failure and
+	// must also fall back to the message box.
+	got = runSecondDesktopFollowUp(localoctop.ProbeDesktop, nil)
+	if got != followUpMessageBox {
+		t.Fatalf("runSecondDesktopFollowUp(ProbeDesktop, nil) = %v, want followUpMessageBox", got)
+	}
+
+	// Non-desktop running instance: no follow-up at all (the caller handles
+	// message-box / stderr itself).
+	got = runSecondDesktopFollowUp(localoctop.ProbeBackground, bringOK)
+	if got != followUpNone {
+		t.Fatalf("runSecondDesktopFollowUp(ProbeBackground, ok) = %v, want followUpNone", got)
+	}
+	got = runSecondDesktopFollowUp(localoctop.ProbeNone, bringOK)
+	if got != followUpNone {
+		t.Fatalf("runSecondDesktopFollowUp(ProbeNone, ok) = %v, want followUpNone", got)
+	}
+}
+
 // TestAcquireSingleInstance_SecondLaunchFails holds the real mutex and
 // verifies the shared-lock acquisition fails, and that the probe classifies
 // the holder as background (no Wails window exists in this test process).

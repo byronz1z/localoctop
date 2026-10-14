@@ -82,24 +82,53 @@ func decideSecondDesktopAction(running localoctop.ProbeResult, secondIsGUI bool)
 	}
 }
 
+// followUpAction is what the second launch actually does after it decides
+// to act. Kept as an enum so the choice is unit-testable without touching
+// Win32.
+type followUpAction int
+
+const (
+	followUpBroughtToFront followUpAction = iota // called BringWailsSingleInstanceWindowToFront, it worked
+	followUpMessageBox                           // bring-to-front failed (or not applicable), fell back to a message box
+	followUpNone                                 // nothing further to do (stderr-only paths)
+)
+
+// runSecondDesktopFollowUp performs the post-decision action for a second
+// desktop launch. When the running instance is a desktop app we try to raise
+// its window; if that fails (window gone, access denied, non-Windows) we fall
+// back to a message box so the user always sees some feedback. bringToFront
+// is injected for testing; production passes localoctop.BringWailsSingleInstanceWindowToFront.
+func runSecondDesktopFollowUp(running localoctop.ProbeResult, bringToFront func() bool) followUpAction {
+	if running != localoctop.ProbeDesktop {
+		return followUpNone
+	}
+	if bringToFront != nil && bringToFront() {
+		return followUpBroughtToFront
+	}
+	localoctop.ShowAlreadyRunningMessageBox()
+	return followUpMessageBox
+}
+
 func main() {
 	// Single instance across ALL localoctop entry points (bridge headless,
 	// bridge desktop, this Wails desktop): one shared per-user lock. If the
 	// lock is already held we do NOT start. When the holder is another
-	// desktop instance we let Wails' own SingleInstanceLock bring its window
-	// forward (we still hold our shared lock, so a third copy is refused too).
-	// When the holder is a background program there is no window to raise, so
-	// we tell the user in a message box and exit.
+	// desktop instance we bring its window to front ourselves (Wails' own
+	// single-instance forwarding does not run because we exit before
+	// wails.Run). When the holder is a background program there is no window
+	// to raise, so we tell the user in a message box and exit.
 	if release, ok := localoctop.AcquireSingleInstance(); ok {
 		defer release()
 	} else {
 		// Lock held. Decide what to do, then do it; every branch ends in
 		// this process exiting without creating a second instance.
-		switch decideSecondDesktopAction(localoctop.ProbeSingleInstance(), true) {
+		probe := localoctop.ProbeSingleInstance()
+		switch decideSecondDesktopAction(probe, true) {
 		case actBringToFront:
-			// Another desktop instance is running. Wails' single-instance
-			// handler (registered below via SingleInstanceLock) receives our
-			// launch and raises the window; we just exit quietly.
+			// Another desktop instance is running. Raise its window directly;
+			// if that fails, fall back to a message box so the user is never
+			// left with no visible feedback.
+			runSecondDesktopFollowUp(probe, localoctop.BringWailsSingleInstanceWindowToFront)
 		case actMessageBox:
 			// A background / tray bridge holds the lock and has no window.
 			localoctop.ShowAlreadyRunningMessageBox()
