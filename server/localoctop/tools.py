@@ -84,6 +84,104 @@ TRANSFER_WAIT_SECONDS = float(os.environ.get("LOCALOCTOP_TRANSFER_WAIT", 20))
 TRANSFER_TOOLS = (M_FETCH_TO_CLOUD, M_DELIVER_TO_LOCAL, M_TRANSFER_STATUS)
 
 
+# --- error-text enrichment (T5-2) -------------------------------------------
+# Every error string that comes back from the employee's machine (or is
+# produced here for routing problems) must tell the model TWO things: what
+# happened, and what to do next (which tool, with which arguments). The
+# enrichment lives HERE, on the server, so a new adapter paired with an old
+# client program still produces actionable text — the old client's bare
+# messages are recognised and extended, never merely relayed.
+#
+# Matching is wording-based because that is all an old client gives us. The
+# patterns below cover every message the current Go client emits (pathguard.go
+# / tools.go / tools_ext.go / transfer.go) plus the server's own refusals.
+
+def _next_step_for_error(message: str) -> str:
+    """Append a concrete next step to a bare client error message. Messages
+    that already carry guidance ('Next step:' / 'What you can do') are returned
+    unchanged, as are messages no rule recognises (they get a generic fallback
+    so the model is never left with a bare cause)."""
+    m = message.strip()
+    low = m.lower()
+    if "next step" in low or "what you can do" in low or "call transfer_status" in low \
+            or "start it again" in low or "try again" in low:
+        return m
+    if "file not found" in low or "path not found" in low or "directory not found" in low \
+            or "folder not found" in low or "search root not found" in low:
+        return (m + " Next step: call list_directory on the containing folder to see the "
+                "names actually there, or search_files with the file name to find it.")
+    if "cloud file not found" in low:
+        return (m + " Next step: cloud_path is the absolute path as YOU see it on the cloud "
+                "machine (starting with '/'); list the folder in the cloud with your own tools "
+                "(execute) to see the names actually there.")
+    if "path is a directory" in low or "destination is a directory" in low:
+        return (m + " Next step: call list_directory on it to see what is inside; if you need "
+                "the whole folder, call fetch_to_cloud with the folder path.")
+    if "path is not a directory" in low or "must be a directory" in low:
+        return (m + " Next step: use get_file_info to check what the path actually is, or "
+                "list_directory on its parent folder.")
+    if "path traversal" in low or "escapes the whitelist" in low or "outside the whitelist" in low:
+        return (m + " Next step: call list_allowed_directories to see the allowed folders, "
+                "and give the path relative to one of them (e.g. \"docs/report.pdf\").")
+    if "must not be absolute" in low or "must not contain a drive letter" in low \
+            or "must not be a unc path" in low:
+        return (m + " Next step: give the path relative to an allowed folder "
+                "(e.g. \"docs/report.pdf\"); call list_allowed_directories to see the roots.")
+    if "nul byte" in low:
+        return m + " Next step: re-issue the call with a plain path (no NUL bytes)."
+    if "already exists" in low:
+        return (m + " Next step: choose a different name, or pass overwrite=true only if the "
+                "user explicitly asked to replace the existing file.")
+    if "not empty" in low and "recursive" in low:
+        return m + " Next step: pass recursive=true, or list_directory first to see what is inside."
+    if "not a valid zip" in low:
+        return (m + " Next step: check with get_file_info that the path really is a zip archive; "
+                "to read what is inside without extracting, fetch_to_cloud it and inspect it in "
+                "the cloud with your own tools.")
+    if "escapes destination" in low:
+        return m + " Next step: the archive is not safe to extract; tell the user instead of retrying."
+    if "recycle bin" in low:
+        return m  # the recycle-bin refusals already carry their own next step
+    if "exceeds" in low and ("limit" in low or "byte" in low):
+        return (m + " Next step: use fetch_to_cloud to copy the file to the cloud machine and "
+                "process it there with your own tools instead.")
+    if "utf-8" in low or "not directly readable text" in low or "invalid base64" in low:
+        return (m + " Next step: use fetch_to_cloud to copy the file to the cloud machine and "
+                "process it there with your own tools.")
+    if "write operations are disabled" in low or "does not allow" in low:
+        return (m + " Next step: tell the user this action needs write access enabled "
+                "(on their computer's localoctop switch), or do it a read-only way.")
+    if "unknown tool" in low or "unknown method" in low:
+        return (m + " Next step: the localoctop program on the user's computer is likely an "
+                "older version — ask the user to update it.")
+    if "whitelist root" in low:
+        return m + " Next step: choose a folder inside the whitelist root, not the root itself."
+    if "same path" in low:
+        return m + " Next step: choose a different destination name."
+    if "own subtree" in low:
+        return m + " Next step: choose a destination outside the folder being moved."
+    if "not found" in low:
+        return (m + " Next step: call list_directory on the containing folder to see the "
+                "names actually there, or search_files to find it by name.")
+    # Unrecognised: never leave the model with a bare cause.
+    return (m + " Next step: if the fix is not obvious from this message, tell the user "
+            "what was attempted and this reason — do not retry blindly.")
+
+
+def _strip_machine_paths(text: str, allowed_dirs: list[str]) -> str:
+    """T5-3: an error text must never carry an absolute path of the employee's
+    machine. Replace every known whitelist root (and common drive-letter /
+    home-dir forms) with a neutral placeholder. The text stays truthful —
+    paths the client already made relative are untouched."""
+    out = text
+    for root in allowed_dirs:
+        if root:
+            out = out.replace(root, "<allowed folder>")
+            out = out.replace(root.replace("/", "\\"), "<allowed folder>")
+    return out
+
+
+
 def _req_path(arguments: dict[str, Any]) -> str:
     """Pick the most meaningful path-ish value for audit logging across the
     v0.5.0 tool parameter names (path/source/archive/paths[0]/pattern)."""
@@ -201,7 +299,7 @@ class ToolService:
             # and routing/protocol failures as MCP protocol errors.
             if exc.code in (CODE_INTERNAL,):
                 raise
-            return self._error_result(exc.message)
+            return self._error_result(self._enrich_error(exc.message))
 
         rendered = self._cap(name, self._render(name, result))
         await self._audit(user_id, name, req_path, "allow", 0, "", started, session.client_id)
@@ -233,7 +331,7 @@ class ToolService:
             await tm.wait(t, max(1.0, TRANSFER_WAIT_SECONDS - (time.monotonic() - started)))
         except BridgeProtocolError as exc:
             await self._audit(user_id, name, req_path, "deny", exc.code, exc.message, started, client_id)
-            return self._error_result(exc.message)
+            return self._error_result(self._enrich_error(exc.message))
         text = tm.describe(t)
         await self._audit(user_id, name, req_path or t.local_path, "error" if t.state == "failed" else "allow",
                           0, f"{t.direction} {t.state} {t.received}/{t.size}", started, client_id)
@@ -321,6 +419,8 @@ class ToolService:
             return self._render_multi(result)
         if name == M_EDIT_FILE:
             return self._render_edit(result)
+        if name == M_UNZIP_FILE:
+            return self._render_unzip(result)
         if name in (M_LIST_DIRECTORY, M_LIST_DIRECTORY_WITH_SIZES):
             return self._render_listing(result)
         if name == M_SEARCH_FILES:
@@ -359,11 +459,57 @@ class ToolService:
     def _render_listing(self, result: dict[str, Any]) -> dict[str, Any]:
         entries = [e for e in result.get("entries", []) if isinstance(e, dict)]
         head = f"== {result.get('path', '')}: {len(entries)} entries (type, size in bytes, modified UTC, name) =="
+        truncated_note = ""
         if "total_bytes" in result:
-            head += (f"\ntotals: {result.get('total_files', 0)} files, {result.get('total_dirs', 0)} folders, "
+            # list_directory_with_sizes. T5-4: when the walk was cut at the
+            # internal cap, the totals count only what was LISTED — quoting
+            # them as the folder's totals is exactly the defect the tester
+            # hit ("totals: 5000 files" for a 6000-file folder).
+            head += (f"\ntotals of the {len(entries)} listed entries: "
+                     f"{result.get('total_files', 0)} files, {result.get('total_dirs', 0)} folders, "
                      f"{int(result.get('total_bytes', 0)):,} bytes")
-        return self._lines_result(head, [self._entry_line(e) for e in entries],
-                                  "List a sub-folder, or use search_files with a pattern.")
+            if result.get("truncated") or (result.get("totals_count_all") is False):
+                seen = result.get("total_entries_seen") or len(entries)
+                truncated_note = (f"[NOT the whole folder: only the first {len(entries)} entries are "
+                                  f"listed and counted; the folder holds more than {seen} entries in "
+                                  f"total. Next step: list a sub-folder, or use search_files with a "
+                                  f"pattern to find what you need.]")
+            elif result.get("totals_count_all"):
+                head = f"== {result.get('path', '')}: {len(entries)} entries (type, size in bytes, modified UTC, name) ==" + \
+                       (f"\ntotals: {result.get('total_files', 0)} files, {result.get('total_dirs', 0)} folders, "
+                        f"{int(result.get('total_bytes', 0)):,} bytes")
+        else:
+            # list_directory. T5-4: truncation must be stated, with the exact
+            # total when the client counted it, a lower bound otherwise; and
+            # with an OLD client (no truncation fields at all) a count equal
+            # to a round cap must read as "maybe incomplete", never "all".
+            if "truncated" in result or "total_known" in result:
+                if result.get("truncated"):
+                    if result.get("total_known"):
+                        more = f"the folder holds {result.get('total_entries', 0):,} entries in total"
+                    else:
+                        more = (f"the folder holds at least {int(result.get('total_entries', 0)):,} entries "
+                                f"(the full count was not taken)")
+                    truncated_note = (f"[NOT the whole listing: only the first {len(entries)} entries are "
+                                      f"shown; {more}. Next step: list a sub-folder, lower depth, or use "
+                                      f"search_files with a pattern.]")
+            else:
+                # Old client: no truncation fields at all. The count hitting
+                # a plausible cap (the tool's default 500 or the 2000 max) is
+                # the only signal left — take it, and say "may" not "is".
+                lim = result.get("limit") or 0
+                at_cap = len(entries) >= lim if lim else len(entries) in (500, 1000, 2000)
+                if at_cap and len(entries) > 0:
+                    cap_word = lim or len(entries)
+                    truncated_note = (f"[This may NOT be the whole listing: the entry count reached "
+                                      f"{cap_word}, and this version of the localoctop program does "
+                                      f"not say whether there are more. Next step: list a sub-folder, or "
+                                      f"use search_files with a pattern.]")
+        out = self._lines_result(head, [self._entry_line(e) for e in entries],
+                                 "List a sub-folder, or use search_files with a pattern.")
+        if truncated_note:
+            out["content"].append({"type": "text", "text": truncated_note})
+        return out
 
     def _render_search(self, result: dict[str, Any]) -> dict[str, Any]:
         lines = []
@@ -375,8 +521,27 @@ class ToolService:
                 line += f"\n      L{m['line']}: {str(m.get('preview', ''))[:200]}"
             lines.append(line)
         head = f"== search {result.get('pattern', '')!r} in {result.get('path', '')}: {len(lines)} match(es) =="
+        notes: list[str] = []
         if result.get("truncated"):
-            head += "\n(the search stopped at its match limit — there may be more)"
+            notes.append("the search stopped at its match limit — there may be more")
+        # T5-4: content search silently skipping very large files made a
+        # real "0 matches" answer indistinguishable from "the file with the
+        # match was never opened". Own up to every skip.
+        skipped = int(result.get("skipped_large") or 0)
+        if skipped:
+            names = [str(n) for n in (result.get("skipped_large_names") or [])][:10]
+            note = (f"{skipped} file(s) were NOT searched inside because they are larger than the "
+                    f"read limit")
+            if names:
+                note += ": " + ", ".join(names) + (" …" if skipped > len(names) else "")
+            note += (". To search inside them, fetch_to_cloud the file(s) and search with "
+                     "command-line tools (execute) in the cloud.")
+            notes.append(note)
+            if not lines:
+                # "0 matches" is only honest when everything was searched.
+                head += "\n(matches were NOT ruled out in the skipped file(s))"
+        if notes:
+            head += "\n(" + "; ".join(notes) + ")"
         return self._lines_result(head, lines, "Use a more specific pattern or search a sub-folder.")
 
     def _render_tree(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -547,11 +712,45 @@ class ToolService:
             text += chr(10)
         return {"content": [{"type": "text", "text": head + chr(10) + text + tail}], "isError": False}
 
+    def _render_unzip(self, result: dict[str, Any]) -> dict[str, Any]:
+        """unzip_file: the plain summary PLUS, when members overwrote existing
+        files, an explicit line saying their old versions went to the recycle
+        bin (T5-5b — write_file/edit_file/delete_file all say this; unzip was
+        the silent one). An old client sends no `recycled` field: then nothing
+        is claimed either way."""
+        blocks: list[dict[str, Any]] = []
+        head = (f"unzip_file: extracted {result.get('extracted', 0)} file(s), "
+                f"{int(result.get('total_bytes', 0)):,} bytes, into {result.get('dest', '')}")
+        blocks.append({"type": "text", "text": head})
+        recycled = [str(p) for p in (result.get("recycled") or [])][:20]
+        if recycled:
+            blocks.append({"type": "text", "text": (
+                f"{len(recycled)} existing file(s) were overwritten; their previous versions were "
+                f"moved to the recycle bin (recoverable by the user): " + ", ".join(recycled))})
+        skipped = [str(s) for s in (result.get("skipped") or [])]
+        if skipped:
+            blocks.append({"type": "text", "text": (
+                f"{len(skipped)} member(s) were NOT extracted (their originals are untouched): "
+                + ", ".join(skipped[:20]) + (" …" if len(skipped) > 20 else ""))})
+        return {"content": blocks, "isError": False}
+
     def _render_json(self, result: dict[str, Any]) -> dict[str, Any]:
         text = json.dumps(result, ensure_ascii=False, indent=1)
         if len(text.encode("utf-8", "replace")) > SERVER_MAX_RESULT_BYTES:
             raise BridgeProtocolError(CODE_TOO_LARGE, "bridge result exceeds server size ceiling")
         return {"content": [{"type": "text", "text": text}], "isError": False}
+
+    def _enrich_error(self, message: str) -> str:
+        """One place every client-produced error message passes through before
+        reaching the model: absolute machine paths are scrubbed (T5-3) and a
+        concrete next step is appended when the message lacks one (T5-2)."""
+        roots: list[str] = []
+        try:
+            for s in getattr(self.registry, "_sessions", {}).values():
+                roots.extend(getattr(s, "allowed_dirs", []) or [])
+        except Exception:  # noqa: BLE001 - scrubbing is best effort
+            pass
+        return _next_step_for_error(_strip_machine_paths(message, roots))
 
     def _error_result(self, message: str) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": message}], "isError": True}

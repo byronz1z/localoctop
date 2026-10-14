@@ -585,3 +585,206 @@ func TestSearchFilesRegex_NameAndContent(t *testing.T) {
 		t.Fatalf("expected banana at line 2 of notes.txt, got %d (%+v)", hitLine, cRes.Matches)
 	}
 }
+
+// ---- T5-3: error texts never carry an absolute path of this machine ----
+
+func TestUnzip_ConflictErrorHasNoAbsolutePath(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	fakeTrashBin(t)
+	dest := filepath.Join(root, "landing")
+	must(t, os.MkdirAll(dest, 0o755))
+	must(t, os.WriteFile(filepath.Join(dest, "a.txt"), []byte("OLD"), 0o644))
+	makeZip(t, filepath.Join(root, "pkg.zip"), map[string]string{"a.txt": "NEW"})
+
+	_, berr := tl.unzipFile(map[string]any{"archive": "pkg.zip", "dest": "landing"})
+	if berr == nil {
+		t.Fatal("expected a conflict refusal without overwrite")
+	}
+	msg := berr.Message
+	if !strings.Contains(msg, "member target already exists") {
+		t.Fatalf("conflict message lost its cause: %q", msg)
+	}
+	// The whitelist-relative name is fine; the machine's layout is not.
+	if !strings.Contains(msg, "landing/a.txt") {
+		t.Fatalf("the relative path must stay readable: %q", msg)
+	}
+	if strings.Contains(msg, root) || strings.Contains(msg, filepath.ToSlash(root)) {
+		t.Fatalf("error text leaks the machine's absolute path: %q", msg)
+	}
+	for _, marker := range []string{`D:\`, `C:\`, "D:/", "C:/", "/Users/", "/home/"} {
+		if strings.Contains(msg, marker) {
+			t.Fatalf("error text leaks an absolute path marker %q: %q", marker, msg)
+		}
+	}
+}
+
+// ---- T5-5b: unzip overwrite reports which old versions went to the bin ----
+
+func TestUnzip_OverwriteListsRecycledMembers(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	bin := fakeTrashBin(t)
+	dest := filepath.Join(root, "landing")
+	must(t, os.MkdirAll(dest, 0o755))
+	must(t, os.WriteFile(filepath.Join(dest, "one.txt"), []byte("OLD-ONE"), 0o644))
+	makeZip(t, filepath.Join(root, "pkg.zip"),
+		map[string]string{"one.txt": "NEW-ONE", "fresh.txt": "FRESH"})
+
+	ur, berr := tl.unzipFile(map[string]any{"archive": "pkg.zip", "dest": "landing", "overwrite": true})
+	if berr != nil {
+		t.Fatalf("overwrite unzip failed: %v", berr)
+	}
+	if ur.Extracted != 2 {
+		t.Fatalf("expected 2 extracted, got %+v", ur)
+	}
+	if len(ur.Recycled) != 1 || ur.Recycled[0] != "landing/one.txt" {
+		t.Fatalf("the overwritten member's old version must be named as recycled: %+v", ur.Recycled)
+	}
+	if _, err := os.ReadFile(filepath.Join(bin, "one.txt")); err != nil {
+		t.Fatalf("old one.txt must be in the recycle bin: %v", err)
+	}
+}
+
+// ---- T5-4: a listing/search that is not complete says so ----------------
+
+func TestListDirectory_ReportsTruncationAndLowerBound(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	// A folder with more entries than the listing cap.
+	big := filepath.Join(root, "big")
+	must(t, os.MkdirAll(big, 0o755))
+	for i := 0; i < 30; i++ {
+		must(t, os.WriteFile(filepath.Join(big, sprintf("f%03d.txt", i)), []byte("x"), 0o644))
+	}
+	res, berr := tl.listDirectory(map[string]any{"path": "big", "limit": 10})
+	if berr != nil {
+		t.Fatalf("list failed: %v", berr)
+	}
+	if len(res.Entries) != 10 || !res.Truncated {
+		t.Fatalf("expected 10 entries + truncated flag, got %d entries truncated=%v",
+			len(res.Entries), res.Truncated)
+	}
+	// The cap is never the total: the lower bound must exceed it.
+	if res.TotalKnown || res.TotalEntries <= 10 {
+		t.Fatalf("truncated listing must not claim the cap as the total: %+v", res)
+	}
+	if res.Limit != 10 {
+		t.Fatalf("the applied limit must ride along, got %d", res.Limit)
+	}
+}
+
+func TestListDirectory_ExactTotalWhenComplete(t *testing.T) {
+	tl, _ := newTestTools(t, false, 0)
+	res, berr := tl.listDirectory(map[string]any{"path": "."})
+	if berr != nil {
+		t.Fatalf("list failed: %v", berr)
+	}
+	if res.Truncated || !res.TotalKnown || res.TotalEntries != len(res.Entries) {
+		t.Fatalf("a complete listing must report the exact total: %+v", res)
+	}
+}
+
+func TestListDirWithSizes_NeverPresentsCapAsTotal(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	big := filepath.Join(root, "big")
+	must(t, os.MkdirAll(big, 0o755))
+	// The real cap is 5000 (too slow to fill here); the wiring under test is
+	// the flag plumbing, and collectDirEntries is shared with the capped
+	// paths, so a small folder proves the flags on the complete side.
+	for i := 0; i < 12; i++ {
+		must(t, os.WriteFile(filepath.Join(big, sprintf("f%02d.txt", i)), []byte("x"), 0o644))
+	}
+	res, berr := tl.listDirWithSizes(map[string]any{"path": "big"})
+	if berr != nil {
+		t.Fatalf("list_with_sizes failed: %v", berr)
+	}
+	// Under the cap: totals count everything and say so.
+	if res.Truncated || !res.TotalsCountAll || res.TotalFiles != 12 {
+		t.Fatalf("a full walk must mark its totals complete: %+v", res)
+	}
+	if res.TotalEntriesSeen != 12 {
+		t.Fatalf("seen-count wrong: %+v", res)
+	}
+}
+
+func TestListDirWithSizes_CappedWalkIsMarked(t *testing.T) {
+	// Drive collectDirEntries past a small cap directly: truncated must be
+	// set and the totals must be marked as NOT counting everything.
+	root := t.TempDir()
+	for i := 0; i < 25; i++ {
+		must(t, os.WriteFile(filepath.Join(root, sprintf("f%02d.txt", i)), []byte("x"), 0o644))
+	}
+	entries, truncated, total, err := collectDirEntries(root, root, 1, 1, 5)
+	must(t, err)
+	if len(entries) != 5 || !truncated {
+		t.Fatalf("expected 5 entries + truncated, got %d/%v", len(entries), truncated)
+	}
+	if total != 25 {
+		t.Fatalf("total must count every entry seen (lower bound would be wrong here), got %d", total)
+	}
+}
+
+// TestListDirectory_SixThousandFiles: the tester's real case — a 6000-file
+// folder through BOTH listing tools must come back marked incomplete with a
+// truthful count, never with the cap presented as the total.
+func TestListDirectory_SixThousandFiles(t *testing.T) {
+	tl, root := newTestTools(t, false, 0)
+	big := filepath.Join(root, "big")
+	must(t, os.MkdirAll(big, 0o755))
+	for i := 0; i < 6000; i++ {
+		must(t, os.WriteFile(filepath.Join(big, sprintf("f%05d.txt", i)), []byte("x"), 0o644))
+	}
+
+	// list_directory at its maximum limit: 2000 shown of 6000, marked
+	// truncated, lower bound above the cap.
+	res, berr := tl.listDirectory(map[string]any{"path": "big", "limit": 2000})
+	if berr != nil {
+		t.Fatalf("list failed: %v", berr)
+	}
+	if len(res.Entries) != 2000 || !res.Truncated || res.TotalKnown {
+		t.Fatalf("6000-file folder must truncate at the 2000 cap: entries=%d %+v",
+			len(res.Entries), res)
+	}
+	if res.TotalEntries <= 2000 {
+		t.Fatalf("the lower bound must exceed the cap (the folder has 6000): %d", res.TotalEntries)
+	}
+
+	// list_directory_with_sizes: the internal 5000 cap must NOT surface as
+	// the folder's totals.
+	ws, berr := tl.listDirWithSizes(map[string]any{"path": "big"})
+	if berr != nil {
+		t.Fatalf("list_with_sizes failed: %v", berr)
+	}
+	if !ws.Truncated || ws.TotalsCountAll {
+		t.Fatalf("capped walk must be marked incomplete: %+v", ws)
+	}
+	if ws.TotalFiles != 5000 {
+		t.Fatalf("totals count the 5000 listed entries, got %d", ws.TotalFiles)
+	}
+	if ws.TotalEntriesSeen <= 5000 {
+		t.Fatalf("the seen lower bound must exceed the cap, got %d", ws.TotalEntriesSeen)
+	}
+}
+
+func TestSearchFiles_ContentSearchNamesSkippedLargeFiles(t *testing.T) {
+	tl, root := newTestTools(t, false, 1024) // tiny read cap: 1 KB
+	// Both files match the NAME pattern; the big one's content would match
+	// too, but it is over the read cap — silently skipping it made
+	// "0 matches" a lie (the tester's 25 MB log case).
+	big := strings.Repeat("pad\n", 400) + "needle\n"
+	must(t, os.WriteFile(filepath.Join(root, "needle-big.log"), []byte(big), 0o644))
+	must(t, os.WriteFile(filepath.Join(root, "needle-small.log"), []byte("nothing here\n"), 0o644))
+
+	res, berr := tl.searchFiles(map[string]any{
+		"path": ".", "pattern": "needle", "match_content": true, "include_dirs": false})
+	if berr != nil {
+		t.Fatalf("search failed: %v", berr)
+	}
+	if len(res.Matches) != 0 {
+		t.Fatalf("no file's content matches: %+v", res.Matches)
+	}
+	if res.SkippedLarge != 1 {
+		t.Fatalf("the skipped large file must be counted: %+v", res)
+	}
+	if len(res.SkippedLargeNames) != 1 || res.SkippedLargeNames[0] != "needle-big.log" {
+		t.Fatalf("the skipped large file must be named: %+v", res.SkippedLargeNames)
+	}
+}

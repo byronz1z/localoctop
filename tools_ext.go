@@ -362,7 +362,7 @@ func (t *tools) listDirWithSizes(params map[string]any) (*ListWithSizesResult, *
 	if berr != nil {
 		return nil, berr
 	}
-	entries, err := collectDirEntries(abs, abs, 1, 1, maxListEntries)
+	entries, trunc, total, err := collectDirEntries(abs, abs, 1, 1, maxListEntries)
 	if err != nil {
 		return nil, errInternal("read dir failed", err)
 	}
@@ -377,6 +377,12 @@ func (t *tools) listDirWithSizes(params map[string]any) (*ListWithSizesResult, *
 			out.TotalBytes += e.Size
 		}
 	}
+	// Never present the internal cap as the true total: when the walk was cut
+	// at the cap, TotalsCountAll stays false and TotalEntriesSeen carries the
+	// lower bound, so the adapter can say "at least N" instead of "totals: cap".
+	out.Truncated = trunc
+	out.TotalsCountAll = !trunc
+	out.TotalEntriesSeen = total
 	if sortBy == "size" {
 		sort.SliceStable(out.Entries, func(i, j int) bool {
 			if (out.Entries[i].Type == "file") != (out.Entries[j].Type == "file") {
@@ -796,7 +802,10 @@ func (t *tools) unzipFile(params map[string]any) (*UnzipResult, *BridgeError) {
 		}
 		if lst, statErr := os.Lstat(target); statErr == nil {
 			if !overwrite {
-				return nil, errInvalidParams("member target already exists: " + filepath.ToSlash(target) + " (pass overwrite=true)")
+				// The model-facing text carries the whitelist-RELATIVE path
+				// only (T5-3): an error must never leak an absolute path of
+				// the employee's machine.
+				return nil, errInvalidParams("member target already exists: " + relDisplay(t.cfg.AllowedDirs, target) + " (pass overwrite=true)")
 			}
 			// Overwriting an existing FILE member: its old version must reach
 			// the recycle bin first. If the bin cannot take it, this member is
@@ -808,6 +817,10 @@ func (t *tools) unzipFile(params map[string]any) (*UnzipResult, *BridgeError) {
 				if status, _ := recycleExisting(target); status == RecycleUnavailable {
 					res.Skipped = append(res.Skipped, relDisplay(t.cfg.AllowedDirs, target)+" (recycle bin unavailable; original left untouched)")
 					continue
+				} else if status == Recycled && len(res.Recycled) < 20 {
+					// T5-5b: own up to every old version the overwrite sent to
+					// the recycle bin (up to 20 names).
+					res.Recycled = append(res.Recycled, relDisplay(t.cfg.AllowedDirs, target))
 				}
 			}
 		}
@@ -957,10 +970,19 @@ func (t *tools) searchFilesV05(params map[string]any) (*SearchResult, *BridgeErr
 		hit := SearchHit{Path: relDisplay(t.cfg.AllowedDirs, p)}
 		contentHit := false
 		if !d.IsDir() && matchContent {
-			ln, preview, ok := regexFirstLine(p, re, t.cfg.MaxReadBytes)
-			contentHit = ok
-			hit.Line = ln
-			hit.Preview = preview
+			ln, preview, ok, skippedLarge := regexFirstLine(p, re, t.cfg.MaxReadBytes)
+			if skippedLarge {
+				// The file's content was not searched; a name match still
+				// counts, but the result must own up to the skip.
+				res.SkippedLarge++
+				if len(res.SkippedLargeNames) < 10 {
+					res.SkippedLargeNames = append(res.SkippedLargeNames, relDisplay(t.cfg.AllowedDirs, p))
+				}
+			} else {
+				contentHit = ok
+				hit.Line = ln
+				hit.Preview = preview
+			}
 		}
 		if !nameHit && !contentHit {
 			return nil
@@ -983,15 +1005,19 @@ func (t *tools) searchFilesV05(params map[string]any) (*SearchResult, *BridgeErr
 }
 
 // regexFirstLine reports the first line of a text file matching re, with a
-// capped preview.
-func regexFirstLine(path string, re *regexp.Regexp, maxBytes int64) (int, string, bool) {
+// capped preview. skipped is true when the file was NOT searched because it
+// is over maxBytes.
+func regexFirstLine(path string, re *regexp.Regexp, maxBytes int64) (int, string, bool, bool) {
 	st, err := os.Stat(path)
-	if err != nil || st.IsDir() || st.Size() > maxBytes {
-		return 0, "", false
+	if err != nil || st.IsDir() {
+		return 0, "", false, false
+	}
+	if st.Size() > maxBytes {
+		return 0, "", false, true
 	}
 	data, err := os.ReadFile(path) // #nosec G304 - inside validated walk root
 	if err != nil || !utf8.Valid(data) {
-		return 0, "", false
+		return 0, "", false, false
 	}
 	for i, line := range strings.Split(string(data), "\n") {
 		if re.MatchString(line) {
@@ -999,10 +1025,10 @@ func regexFirstLine(path string, re *regexp.Regexp, maxBytes int64) (int, string
 			if len(prev) > 200 {
 				prev = prev[:200]
 			}
-			return i + 1, prev, true
+			return i + 1, prev, true, false
 		}
 	}
-	return 0, "", false
+	return 0, "", false, false
 }
 
 // stringSlice coerces a JSON array param to []string, dropping non-strings.

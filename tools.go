@@ -127,19 +127,38 @@ func (t *tools) listDirectory(params map[string]any) (*ListDirectoryResult, *Bri
 		limit = maxListLimit
 	}
 
-	entries, err := collectDirEntries(abs, abs, 1, depth, limit)
+	entries, truncated, total, err := collectDirEntries(abs, abs, 1, depth, limit)
 	if err != nil {
 		return nil, errInternal("read dir failed", err)
 	}
-	return &ListDirectoryResult{Path: relDisplay(t.cfg.AllowedDirs, abs), Entries: entries}, nil
+	res := &ListDirectoryResult{
+		Path:      relDisplay(t.cfg.AllowedDirs, abs),
+		Entries:   entries,
+		Truncated: truncated,
+		Limit:     limit,
+	}
+	if !truncated {
+		// The walk ran to the end: len(entries) IS the true total, and the
+		// adapter may quote it. When truncated the true count is unknown
+		// (counting a huge tree in full would defeat the limit) and only a
+		// lower bound is reported.
+		res.TotalEntries = total
+		res.TotalKnown = true
+	} else {
+		res.TotalEntries = total // lower bound: entries seen so far
+	}
+	return res, nil
 }
 
 // collectDirEntries walks from dir up to maxDepth levels below root (inclusive,
 // 1 = immediate children only). Entry names are paths relative to dir so that
 // nested results stay unambiguous. limit is a hard cap across all levels;
 // hitting it stops the walk (deeper siblings beyond maxWalkNodes are skipped).
-func collectDirEntries(root, dir string, level, maxDepth, limit int) ([]DirEntry, error) {
-	out := make([]DirEntry, 0, limit)
+// It reports whether the walk was cut short (truncated) and how many entries
+// were seen in total (when not truncated, the exact count; when truncated, a
+// lower bound — the adapter must never present the cap as the total).
+func collectDirEntries(root, dir string, level, maxDepth, limit int) (out []DirEntry, truncated bool, total int, err error) {
+	out = make([]DirEntry, 0, limit)
 	var walk func(d string, lvl int) error
 	walk = func(d string, lvl int) error {
 		ents, err := os.ReadDir(d)
@@ -150,8 +169,12 @@ func collectDirEntries(root, dir string, level, maxDepth, limit int) ([]DirEntry
 			return nil // unreadable nested dir: skip, don't abort
 		}
 		for _, e := range ents {
+			total++
 			if len(out) >= limit {
-				return nil
+				// Keep counting siblings so the caller can say "at least N",
+				// but do not descend or append past the cap.
+				truncated = true
+				continue
 			}
 			p := filepath.Join(d, e.Name())
 			info, ierr := e.Info()
@@ -188,9 +211,9 @@ func collectDirEntries(root, dir string, level, maxDepth, limit int) ([]DirEntry
 		return nil
 	}
 	if err := walk(dir, 1); err != nil {
-		return nil, err
+		return nil, false, 0, err
 	}
-	return out, nil
+	return out, truncated, total, nil
 }
 
 // ---- read_file ----
@@ -384,7 +407,18 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 			return nil
 		}
 		if matchContent && !d.IsDir() {
-			if !fileContains(p, pattern, t.cfg.MaxReadBytes) {
+			found, skippedLarge := fileContains(p, pattern, t.cfg.MaxReadBytes)
+			if skippedLarge {
+				// Content search does not look inside very large files; the
+				// adapter must say so instead of letting "0 matches" imply the
+				// file was searched.
+				res.SkippedLarge++
+				if len(res.SkippedLargeNames) < 10 {
+					res.SkippedLargeNames = append(res.SkippedLargeNames, relDisplay(t.cfg.AllowedDirs, p))
+				}
+				return nil
+			}
+			if !found {
 				return nil
 			}
 		}
@@ -419,16 +453,21 @@ func isGlob(p string) bool {
 }
 
 // fileContains reports whether a file's text contains needle (case-insensitive).
-func fileContains(path, needle string, maxBytes int64) bool {
+// skipped is true when the file was NOT searched because it is over maxBytes —
+// the caller must then not claim "nothing found".
+func fileContains(path, needle string, maxBytes int64) (found, skipped bool) {
 	st, err := os.Stat(path)
-	if err != nil || st.IsDir() || st.Size() > maxBytes {
-		return false
+	if err != nil || st.IsDir() {
+		return false, false
+	}
+	if st.Size() > maxBytes {
+		return false, true
 	}
 	data, err := os.ReadFile(path) // #nosec G304 - inside validated walk root
 	if err != nil || !utf8.Valid(data) {
-		return false
+		return false, false
 	}
-	return strings.Contains(strings.ToLower(string(data)), strings.ToLower(needle))
+	return strings.Contains(strings.ToLower(string(data)), strings.ToLower(needle)), false
 }
 
 // ---- get_file_info ----

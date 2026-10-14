@@ -581,16 +581,44 @@ func (b *Bridge) runDownload(job transferJob, abs string, size int64, wantSHA st
 		return
 	}
 	final := abs
+	// T6-1: the completion report of an EARLIER delivery of this same file may
+	// have been lost — the file is already in place, byte-identical, and the
+	// adapter judged the transfer failed and had it sent again. Writing again
+	// would produce a "name (1).ext" duplicate of a file that is already
+	// there. So: if the target already holds exactly these bytes (size and
+	// SHA-256 both match), do not write, do not save-as — report done and say
+	// the file was already there.
+	if st, err := os.Stat(final); err == nil && st.Mode().IsRegular() && st.Size() == size {
+		if eq, herr := fileSHA256Equals(final, got); herr == nil && eq {
+			os.Remove(part)
+			rel := relDisplay(b.cfg.AllowedDirs, final)
+			b.transferComplete(job, map[string]any{
+				"ok": true, "size": size, "sha256": got, "path": rel,
+				"replaced": false, "already_present": true,
+			})
+			b.audit.Record(AuditEvent{Method: MethodTransferDownload, Path: rel, Decision: "allow", Code: CodeOK,
+				Detail: sprintf("file already on the machine, identical (%d bytes); nothing written", size),
+				Duration: time.Since(start).String(), ClientID: b.clientID})
+			return
+		}
+	}
 	replaced := false
+	// T5-5: how the old version was actually set aside, reported truthfully.
+	setAside := ""
 	if _, err := os.Stat(final); err == nil && overwrite {
 		// Keep the old version recoverable: recycle bin when the platform
-		// has one, otherwise a timestamped sibling.
-		if ok, terr := trashPath(final); terr != nil || !ok {
+		// has one, otherwise a timestamped sibling. Goes through trashImpl
+		// like every other tool, so the bin is the same one write_file /
+		// edit_file / delete_file use (and tests can substitute it).
+		if ok, terr := trashImpl(final); terr != nil || !ok {
 			bak := final + time.Now().Format(".bak-20060102-150405")
 			if rerr := os.Rename(final, bak); rerr != nil {
 				fail("could not set aside the existing file: " + rerr.Error())
 				return
 			}
+			setAside = "renamed:" + relDisplay(b.cfg.AllowedDirs, bak)
+		} else {
+			setAside = "recycle_bin"
 		}
 		replaced = true
 	}
@@ -609,7 +637,10 @@ func (b *Bridge) runDownload(job transferJob, abs string, size int64, wantSHA st
 		return
 	}
 	rel := relDisplay(b.cfg.AllowedDirs, final)
-	b.transferComplete(job, map[string]any{"ok": true, "size": size, "sha256": got, "path": rel, "replaced": replaced})
+	b.transferComplete(job, map[string]any{
+		"ok": true, "size": size, "sha256": got, "path": rel, "replaced": replaced,
+		"set_aside": setAside,
+	})
 	b.audit.Record(AuditEvent{Method: MethodTransferDownload, Path: rel, Decision: "allow", Code: CodeOK,
 		Detail: sprintf("%d bytes received from cloud", size), Duration: time.Since(start).String(), ClientID: b.clientID})
 }
@@ -694,6 +725,22 @@ func claimFreeName(part, target string) (string, error) {
 		return "", lastErr
 	}
 	return "", fmt.Errorf("no free name for %q", target)
+}
+
+// fileSHA256Equals reports whether the file at path hashes (SHA-256) to
+// wantHex. Used by the T6-1 idempotent-delivery shortcut: a byte-identical
+// copy already in place makes a re-delivery a no-op.
+func fileSHA256Equals(path, wantHex string) (bool, error) {
+	f, err := os.Open(path) // #nosec G304 - path validated by guard upstream
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == wantHex, nil
 }
 
 // ---- read_text: bounded, line-based text reading ----

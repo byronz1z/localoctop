@@ -1550,7 +1550,8 @@ class TransferManager:
             if len(b["failed"]) > show:
                 lines.append(f"  (another {len(b['failed']) - show:,} not listed)")
         if b["kept"]:
-            lines.append("Previous cloud copies that had been modified were kept: "
+            lines.append("Previous cloud copies that were modified — or could not be confirmed "
+                         "unmodified — were kept: "
                          + ", ".join(b["kept"][:show])
                          + (f" (and {len(b['kept']) - show} more)" if len(b["kept"]) > show else ""))
         if b["saved_as"]:
@@ -1699,8 +1700,20 @@ class TransferManager:
         if t.state == "done" and t.direction == "up":
             fresh = " (cloud copy was already up to date — nothing re-sent)" if t.result.get("fresh") else ""
             kept = t.result.get("kept_as")
-            kept_line = (f"The previous cloud copy had been modified and was kept as {kept}.\n"
-                         if kept else "")
+            # T5-6: say WHY the previous cloud copy was kept, truthfully. When
+            # the ledger held no record (or the check was inconclusive) we do
+            # NOT know whether the copy had been modified — claiming it had is
+            # a false conclusion. Only a proven content change gets the
+            # "had been modified" wording.
+            unknown = set(t.result.get("kept_unknown") or [])
+            kept_line = ""
+            if kept:
+                if kept in unknown:
+                    kept_line = (f"A file with the same name already existed in the cloud and it "
+                                 f"could not be confirmed whether it was the unmodified copy from "
+                                 f"last time, so to avoid losing anything it was kept as {kept}.\n")
+                else:
+                    kept_line = f"The previous cloud copy had been modified and was kept as {kept}.\n"
             kept_list = t.result.get("kept_as_list") or []
             if len(kept_list) > 1:
                 kept_line += "All kept copies: " + ", ".join(kept_list) + ".\n"
@@ -1718,7 +1731,29 @@ class TransferManager:
                     "If the file is larger than 10 MB, process it with command-line tools (execute): "
                     "the platform's built-in search skips files over 10 MB.")
         if t.state == "done":
-            note = " The previous version was moved to the recycle bin." if t.result.get("replaced") else ""
+            if t.result.get("already_present"):
+                # T6-1: a re-delivery whose earlier completion report was
+                # lost — the file was already on the machine byte-identical,
+                # so nothing was written and no "name (1).ext" duplicate was
+                # made. Say exactly that.
+                return (f"DONE {what}\n"
+                        f"local_path: {t.result.get('path') or t.local_path}\n"
+                        f"size: {t.size:,} bytes\n"
+                        f"The file was already on the user's machine, exactly the same content — "
+                        f"nothing was written and no second copy was made.")
+            note = ""
+            if t.result.get("replaced"):
+                # T5-5: say where the old version ACTUALLY went — the recycle
+                # bin, or a renamed sibling when the bin was unavailable. An
+                # old client reports only `replaced`, in which case the
+                # recycle bin is the client's documented first choice.
+                set_aside = str(t.result.get("set_aside") or "")
+                if set_aside.startswith("renamed:"):
+                    note = (f" The old version could not be moved to the recycle bin and was "
+                            f"renamed to {set_aside[len('renamed:'):]} instead (it sits next to "
+                            f"the delivered file).")
+                else:
+                    note = " The previous version was moved to the recycle bin."
             return (f"DONE {what}\n"
                     f"local_path: {t.result.get('path') or t.local_path}\n"
                     f"size: {t.size:,} bytes\n"
@@ -1839,6 +1874,10 @@ class TransferManager:
                     t.result["kept_as_list"] = [
                         f"{base}/{k}" if base else f"/{k}" for k in kept_list]
                     t.result["kept_as"] = t.result["kept_as_list"][-1]
+                    if t.result.get("kept_unknown"):
+                        t.result["kept_unknown"] = [
+                            f"{base}/{k}" if base else f"/{k}"
+                            for k in t.result["kept_unknown"]]
                 return st, kept_list
             except FileExistsError:
                 pass  # the name is taken: move the occupant aside below
@@ -1861,16 +1900,23 @@ class TransferManager:
                 # retry the landing link against the now-free (or newly
                 # occupied) name.
                 continue
-            if await self._drop_if_our_last_copy(dirs, kept_as, idx_prev):
+            dropped, why = await self._drop_if_our_last_copy(dirs, kept_as, idx_prev)
+            if dropped:
                 continue  # it was our own untouched copy: nothing to report
             kept_list.append(kept_as)
+            if why == "unknown":
+                # T5-6: kept because we could NOT confirm what it was (no
+                # record, or the check was inconclusive) — the result text
+                # must say that, not claim the copy had been modified.
+                unknown = t.result.setdefault("kept_unknown", [])
+                unknown.append(kept_as)
         raise OSError(
             f"the landing path {final!r} stayed occupied through 20 attempts"
             + (f"; the conflicting copies were moved aside to: {', '.join(kept_list)}"
                if kept_list else ""))
 
     async def _drop_if_our_last_copy(self, dirs: _Dirs, kept_as: str,
-                                     idx_prev: Any) -> bool:
+                                     idx_prev: Any) -> tuple[bool, str]:
         """Delete the moved-aside occupant ONLY if it is provably the copy
         this adapter landed last time, untouched: its content hashes to the
         ledger's sha256, fstat before AND after hashing shows the same size,
@@ -1883,27 +1929,31 @@ class TransferManager:
         The before/after fstat does NOT close the race: a write landing
         between the last check and the unlink would still be lost. It only
         catches the obvious cases, and whenever in doubt the file is kept —
-        that residual risk is accepted. Returns True when the file was
-        removed."""
+        that residual risk is accepted.
+
+        Returns (removed, why_kept): why_kept is "modified" when the content
+        provably differs from the recorded copy, otherwise "unknown" — the
+        truthful distinction the result text needs (T5-6): "we could not
+        confirm whether it had been changed" is NOT "it had been changed"."""
         if not isinstance(idx_prev, dict) or not idx_prev.get("sha256"):
-            return False  # no record of it: it is somebody's work — keep it
+            return False, "unknown"  # no record of it: it is somebody's work — keep it
         try:
             fd = _open_regular_file(dirs.fd, kept_as)
         except OSError:
-            return False
+            return False, "unknown"
         try:
             st = os.fstat(fd)
             try:
                 dup = os.dup(fd)
             except OSError:
-                return False
+                return False, "unknown"
             digest = await _run_owning_fd(_sha256_fd_own, dup)
             if digest != idx_prev["sha256"]:
-                return False  # content changed since we landed it: cloud work — keep it
+                return False, "modified"  # content changed since we landed it: cloud work — keep it
             st_after = os.fstat(fd)
             if (st.st_size, st.st_mtime_ns, st.st_ctime_ns) != \
                     (st_after.st_size, st_after.st_mtime_ns, st_after.st_ctime_ns):
-                return False  # rewritten while we hashed: cannot prove untouched
+                return False, "unknown"  # rewritten while we hashed: cannot prove untouched
             # The stat between hashing and unlinking narrows the race, it
             # does not close it: the agent could still swap this
             # timestamped keep-as name in the microsecond between the two
@@ -1911,12 +1961,12 @@ class TransferManager:
             # there. That residual risk is accepted.
             st2 = _stat_name(dirs.fd, kept_as)
             if st2 is None or (st2.st_ino, st2.st_dev) != (st.st_ino, st.st_dev):
-                return False
+                return False, "unknown"
             os.unlink(kept_as, dir_fd=dirs.fd)
             logger.info("removed the untouched previous copy of the landed file (kept-as %s)", kept_as)
-            return True
+            return True, ""
         except OSError:
-            return False
+            return False, "unknown"
         finally:
             os.close(fd)
 
@@ -1997,6 +2047,16 @@ class TransferManager:
                 return {"state": t.state}
             if t.direction == "down":
                 t.result = {"path": str(body.get("path") or ""), "replaced": bool(body.get("replaced"))}
+                # T5-5 / T6-1: how the landing actually went — the old version
+                # went to the recycle bin or was renamed aside ("renamed:<rel>"),
+                # or the file was already on the machine byte-identical and
+                # nothing was written. Old clients send neither key; the
+                # describe text then falls back to the recycle-bin wording only
+                # when `replaced` is set.
+                if body.get("set_aside"):
+                    t.result["set_aside"] = str(body["set_aside"])
+                if body.get("already_present"):
+                    t.result["already_present"] = True
                 t.received = t.size
                 t.finish(True)
                 return {"state": t.state}

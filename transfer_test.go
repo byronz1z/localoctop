@@ -534,3 +534,117 @@ func TestRunDownloadFailureCleansUp(t *testing.T) {
 		t.Fatalf("the adapter must be told the delivery failed, got %+v", c)
 	}
 }
+
+// ---- T6-1: a lost completion report must not produce a second copy ----
+
+// TestRunDownloadIdenticalAlreadyPresent: the target already holds exactly
+// the bytes being delivered (the earlier delivery landed but its completion
+// report was lost). The re-delivery must NOT write, must NOT save-as
+// "name (1).ext" — it reports done with already_present.
+func TestRunDownloadIdenticalAlreadyPresent(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("the very same bytes, already delivered once\n")
+	target := filepath.Join(root, "report.txt")
+	must(t, os.WriteFile(target, content, 0o644))
+	st0, err := os.Stat(target)
+	must(t, err)
+
+	fake := &downloadAdapter{t: t, contents: map[string][]byte{"id-dup": content}}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+
+	b := newDownloadBridge(t, root, srv.URL)
+	sha := sha256.Sum256(content)
+	job := transferJob{id: "id-dup", ticket: "tk", baseURL: srv.URL + "/t/id-dup"}
+	b.runDownload(job, target, int64(len(content)), hex.EncodeToString(sha[:]), false)
+
+	// Exactly one file, still the original (same inode/mtime): no rewrite,
+	// no "report (1).txt".
+	entries, err := os.ReadDir(root)
+	must(t, err)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".localoctop-part-") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+		if strings.HasPrefix(e.Name(), "report (") {
+			t.Fatalf("a duplicate was saved aside: %s", e.Name())
+		}
+	}
+	st1, err := os.Stat(target)
+	must(t, err)
+	if !st1.ModTime().Equal(st0.ModTime()) {
+		t.Fatalf("an identical re-delivery must not rewrite the file (mtime changed)")
+	}
+	c := fake.lastComplete()
+	if c == nil || c["ok"] != true {
+		t.Fatalf("the adapter must be told the delivery completed, got %+v", c)
+	}
+	if c["already_present"] != true {
+		t.Fatalf("the completion must be marked already_present, got %+v", c)
+	}
+	if c["replaced"] != false {
+		t.Fatalf("nothing was replaced, got %+v", c)
+	}
+}
+
+// TestRunDownloadDifferentContentStillSavedAside: the T6-1 shortcut applies
+// ONLY to byte-identical content; a different file at the target keeps the
+// old behaviour — saved aside as "name (1).ext".
+func TestRunDownloadDifferentContentStillSavedAside(t *testing.T) {
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "report.txt"), []byte("OLD"), 0o644))
+	content := []byte("NEW-CONTENT")
+	fake := &downloadAdapter{t: t, contents: map[string][]byte{"id-new": content}}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+
+	b := newDownloadBridge(t, root, srv.URL)
+	sha := sha256.Sum256(content)
+	job := transferJob{id: "id-new", ticket: "tk", baseURL: srv.URL + "/t/id-new"}
+	b.runDownload(job, filepath.Join(root, "report.txt"), int64(len(content)), hex.EncodeToString(sha[:]), false)
+
+	// Original untouched; new content under a numbered sibling.
+	if data, _ := os.ReadFile(filepath.Join(root, "report.txt")); string(data) != "OLD" {
+		t.Fatalf("original must be untouched without overwrite, got %q", data)
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "report (1).txt")); err != nil || string(data) != "NEW-CONTENT" {
+		t.Fatalf("new content must land as 'report (1).txt': %q %v", data, err)
+	}
+	c := fake.lastComplete()
+	if c == nil || c["ok"] != true || c["already_present"] == true {
+		t.Fatalf("a different-content delivery is a normal save-as, got %+v", c)
+	}
+}
+
+// TestRunDownloadOverwriteReportsSetAside: T5-5 — the completion report
+// tells the adapter HOW the old version was set aside (recycle bin, or a
+// renamed sibling when the bin was unavailable), so the model-facing text
+// can be truthful.
+func TestRunDownloadOverwriteReportsSetAside(t *testing.T) {
+	root := t.TempDir()
+	bin := fakeTrashBin(t)
+	must(t, os.WriteFile(filepath.Join(root, "report.txt"), []byte("OLD"), 0o644))
+	content := []byte("NEW-CONTENT")
+	fake := &downloadAdapter{t: t, contents: map[string][]byte{"id-ow": content}}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+
+	b := newDownloadBridge(t, root, srv.URL)
+	sha := sha256.Sum256(content)
+	job := transferJob{id: "id-ow", ticket: "tk", baseURL: srv.URL + "/t/id-ow"}
+	b.runDownload(job, filepath.Join(root, "report.txt"), int64(len(content)), hex.EncodeToString(sha[:]), true)
+
+	if data, _ := os.ReadFile(filepath.Join(root, "report.txt")); string(data) != "NEW-CONTENT" {
+		t.Fatalf("overwrite must replace the content, got %q", data)
+	}
+	if old, err := os.ReadFile(filepath.Join(bin, "report.txt")); err != nil || string(old) != "OLD" {
+		t.Fatalf("old version must be in the recycle bin: %q %v", old, err)
+	}
+	c := fake.lastComplete()
+	if c == nil || c["ok"] != true || c["replaced"] != true {
+		t.Fatalf("overwrite completion must report replaced, got %+v", c)
+	}
+	if c["set_aside"] != "recycle_bin" {
+		t.Fatalf("the report must name the recycle bin as the set-aside, got %+v", c)
+	}
+}

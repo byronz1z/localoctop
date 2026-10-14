@@ -79,6 +79,13 @@ type DirEntry struct {
 type ListDirectoryResult struct {
 	Path    string     `json:"path"`
 	Entries []DirEntry `json:"entries"`
+	// Optional fields (T5-4): an older adapter ignores them, an older bridge
+	// never sends them — in which case the adapter must not claim the listing
+	// is complete when the entry count equals the cap.
+	Truncated    bool `json:"truncated,omitempty"`      // the walk hit the limit: there is more
+	TotalKnown   bool `json:"total_known,omitempty"`    // TotalEntries is the exact count
+	TotalEntries int  `json:"total_entries,omitempty"`  // exact total, or a lower bound when truncated
+	Limit        int  `json:"limit,omitempty"`          // the cap that was applied
 }
 
 // ReadFileResult is the read_file payload. Text files come back in Text with
@@ -112,6 +119,11 @@ type SearchResult struct {
 	Path      string      `json:"path"`
 	Matches   []SearchHit `json:"matches"`
 	Truncated bool        `json:"truncated"` // hit the MaxResults cap
+	// Optional fields (T5-4): content search does not look inside files over
+	// the read limit; the adapter must say how many were skipped (and name up
+	// to 10) instead of letting "0 matches" imply they were searched.
+	SkippedLarge      int      `json:"skipped_large,omitempty"`
+	SkippedLargeNames []string `json:"skipped_large_names,omitempty"`
 }
 
 // FileInfo is the get_file_info payload.
@@ -205,6 +217,12 @@ type ListWithSizesResult struct {
 	TotalFiles int             `json:"total_files"`
 	TotalDirs  int             `json:"total_dirs"`
 	TotalBytes int64           `json:"total_bytes"`
+	// Optional fields (T5-4): when the internal cap cut the walk short,
+	// TotalFiles/TotalDirs/TotalBytes count only what was LISTED — never the
+	// real totals. TotalsCountAll=false tells the adapter to say "at least".
+	Truncated        bool `json:"truncated,omitempty"`
+	TotalsCountAll   bool `json:"totals_count_all,omitempty"`
+	TotalEntriesSeen int  `json:"total_entries_seen,omitempty"` // lower bound when truncated
 }
 
 // TreeNode is one node of directory_tree (official shape: name/type/children).
@@ -259,6 +277,10 @@ type UnzipResult struct {
 	Extracted  int      `json:"extracted"`
 	TotalBytes int64    `json:"total_bytes"`
 	Skipped    []string `json:"skipped,omitempty"`
+	// Recycled lists the whitelist-relative paths of existing files whose old
+	// version was moved to the recycle bin because overwrite=true replaced
+	// them (T5-5b; up to 20). Optional: old bridges never send it.
+	Recycled []string `json:"recycled,omitempty"`
 }
 
 // AllowedDirsResult is the list_allowed_directories payload.
