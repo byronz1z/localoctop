@@ -35,6 +35,7 @@ from localoctop.errors import (
     CODE_TOO_LARGE,
 )
 from localoctop.transfers import TransferManager
+import localoctop.transfers as transfers_mod
 
 from conftest import make_token_store
 
@@ -1888,6 +1889,92 @@ class TestTransferRouteSafetyNet:
         assert "read blew up unexpectedly" not in t.error
         assert t.file_fd < 0 and t.dirs is None
         assert self._fds() <= before
+
+    async def test_content_route_safety_net_is_the_live_handler(self, users_dir, mgr,
+                                                                monkeypatch, caplog):
+        """The content route is the one registered handler: its last-resort
+        net must be the code that actually runs on an unexpected read
+        failure (not a shadowed duplicate). A marker on _fail_unexpected
+        proves the net itself fired — a route without the net would leave
+        the transfer 'active' and never call it."""
+        _mk_user(users_dir, "alice")
+        src = users_dir / "alice" / "doc.txt"
+        src.write_bytes(b"serve me")
+        mgr.registry = FakeRegistry()
+        t = await mgr.start_download("alice", "pair-1", "/doc.txt", "out.txt", False)
+
+        fired = []
+        real_fail = mgr._fail_unexpected
+
+        def marked_fail(transfer, where, ref):
+            fired.append((transfer.id, where, ref))
+            return real_fail(transfer, where, ref)
+        monkeypatch.setattr(mgr, "_fail_unexpected", marked_fail)
+
+        def boom(fd, n, offset):
+            raise RuntimeError("read blew up unexpectedly")
+        monkeypatch.setattr("localoctop.transfers._pread_own", boom)
+
+        client = _client_for(mgr)
+        async with client:
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+            with caplog.at_level("ERROR", logger="localoctop.transfers"):
+                try:
+                    await client.get(f"/mcp/localoctop/transfer/{t.id}/content", headers=auth)
+                except Exception:
+                    pass
+        # The live handler's net ran exactly once, for THIS transfer, with a
+        # reference id that matches both the transfer error and the log.
+        assert len(fired) == 1
+        assert fired[0][0] == t.id and fired[0][1] == "sending the file"
+        assert t.state == "failed"
+        assert fired[0][2] in t.error
+        assert any(fired[0][2] in rec.getMessage() and rec.exc_info
+                   for rec in caplog.records)
+
+    async def test_content_touch_updates_activity_during_stream(self, users_dir, mgr,
+                                                                monkeypatch):
+        """A download served in several reads must keep the transfer's
+        activity clock moving: every read that produces data advances
+        t.updated, so a long send-back is never mistaken for a stalled
+        transfer by the background sweep."""
+        _mk_user(users_dir, "alice")
+        src = users_dir / "alice" / "big.bin"
+        # Three reads: 1 MiB + 1 MiB + a tail (the route reads 1 MiB a time).
+        payload = os.urandom(1024 * 1024 * 2 + 123)
+        src.write_bytes(payload)
+        mgr.registry = FakeRegistry()
+        t = await mgr.start_download("alice", "pair-1", "/big.bin", "out.bin", False)
+        assert t.state == "active"
+
+        # Freeze the clock: each _pread_own return bumps monotonic by a
+        # second, so a touch() after every read is the ONLY thing that can
+        # keep `updated` current — a missing touch shows up immediately.
+        # monkeypatch undoes both patches on teardown; nothing to restore.
+        now = [time.monotonic()]
+        monkeypatch.setattr("localoctop.transfers.time.monotonic",
+                            lambda: now[0])
+        real_pread = transfers_mod._pread_own
+
+        def advancing_pread(fd, n, offset):
+            data = real_pread(fd, n, offset)
+            now[0] += 1.0  # one second of wall time per read
+            return data
+        monkeypatch.setattr("localoctop.transfers._pread_own", advancing_pread)
+
+        client = _client_for(mgr)
+        async with client:
+            auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+            r = await client.get(f"/mcp/localoctop/transfer/{t.id}/content", headers=auth)
+            assert r.status_code == 206
+            assert r.content == payload
+        # The clock advanced by (number of reads) seconds from `created`;
+        # `updated` must have tracked the last read, not stayed at creation.
+        assert now[0] - t.created >= 3.0  # at least three reads happened
+        assert t.updated > t.created + 2.0
+        assert t.updated <= now[0]
+        # received tracks the highest byte served.
+        assert t.received == len(payload)
 
 
 # ---------------------------------------------------------------------------

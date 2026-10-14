@@ -1694,46 +1694,6 @@ class TransferManager:
                 "Content-Length": str(t.size - start),
             })
 
-        @r.get(base + "/{tid}/content")
-        async def content(tid: str, request: Request):
-            t = self._auth(request, tid)
-            if isinstance(t, JSONResponse):
-                return t
-            if t.direction != "down" or t.state != "active":
-                return JSONResponse({"error": f"transfer is {t.state}"}, status_code=410)
-            start = 0
-            m = re.match(r"bytes=(\d+)-", request.headers.get("range", ""))
-            if m:
-                start = int(m.group(1))
-            if start > t.size:
-                return JSONResponse({"error": "range not satisfiable"}, status_code=416)
-
-            async def body():
-                # Reads go through the fd captured at start_download: even if
-                # the source path was renamed or replaced by a link since,
-                # the bytes served are the file that was verified then. Each
-                # worker-thread read uses its own duplicated fd (closed by
-                # the thread), so a finished/cancelled transfer closing its
-                # handles can never redirect an in-flight read.
-                pos = start
-                while True:
-                    try:
-                        rfd = os.dup(t.file_fd)
-                    except OSError:
-                        return
-                    data = await _run_owning_fd(_pread_own, rfd, 1024 * 1024, pos)
-                    if not data:
-                        return
-                    pos += len(data)
-                    t.received = max(t.received, pos)
-                    t.touch()
-                    yield data
-
-            return StreamingResponse(body(), status_code=206, media_type="application/octet-stream", headers={
-                "Content-Range": f"bytes {start}-{max(t.size - 1, 0)}/{t.size}",
-                "Content-Length": str(t.size - start),
-            })
-
         @r.post(base + "/{tid}/complete")
         async def complete(tid: str, request: Request):
             t = self._auth(request, tid)
