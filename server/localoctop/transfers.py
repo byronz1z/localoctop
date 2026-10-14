@@ -73,6 +73,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from .errors import (
     BridgeProtocolError,
@@ -451,6 +452,13 @@ def _rename_noreplace(dir_fd: int, old: str, new: str) -> None:
 _renameat2_fallbacks = 0
 
 
+async def _first_of(*tasks: "asyncio.Task") -> None:
+    """Return as soon as any of the given tasks completes (FIRST_COMPLETED
+    semantics), without cancelling the others — wait() owns them and
+    cancels them in its own finally."""
+    await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+
 @dataclass
 class Transfer:
     id: str
@@ -585,6 +593,11 @@ class TransferManager:
         # batch; aclose() cancels every one of them and waits for it to stop
         # touching its file's handles before finishing the batch record.
         self._batch_tasks: set[asyncio.Task] = set()
+        # Set when the service enters its shutdown flow (aclose): every
+        # in-progress tool call waiting on a transfer must wake up AT ONCE
+        # and answer (with a "the service is restarting" line) instead of
+        # being cut off mid-wait. Checked inside wait().
+        self.shutdown_event: asyncio.Event = asyncio.Event()
 
     def _ledger_lock(self, user_id: str) -> asyncio.Lock:
         """One lock per user: the read-modify-write of that user's ledger
@@ -835,6 +848,11 @@ class TransferManager:
         take a moment past the deadline when the worker-thread hashing of
         the moved-aside copy is still finishing; that is the price of never
         closing a handle while it can still be read."""
+        # Wake every tool call waiting on a transfer RIGHT NOW, before any
+        # other shutdown work: they must get their "the service is
+        # restarting" answer out while uvicorn still lets in-flight requests
+        # finish, not be cut off mid-wait.
+        self.shutdown_event.set()
         task = self._scan_task
         self._scan_task = None
         if task is not None:
@@ -1315,12 +1333,15 @@ class TransferManager:
         # Over the limits: a normal answer that says exactly what the folder
         # holds, that nothing was sent, and how to split the work.
         if over or total > limit:
-            count = f"more than {limit}" if over else f"{total:,}"
-            size = (f"{_human(total_bytes)} in the first {len(files):,} files alone"
-                    if over else f"{_human(total_bytes)} in total")
+            count = f"more than {limit:,}" if over else f"{total:,}"
+            # Over the count cap the bridge only listed the first files:
+            # whatever byte total it sent covers just those, so quoting a
+            # size next to the real (larger) count would mislead — with
+            # zero-byte files it even reads like a broken counter. The count
+            # alone is the honest statement here.
             return self._folder_advisory(
                 user_id, pair_id, folder_rel, folder_visible,
-                f"NOT TRANSFERRED: the folder {base or '.'!r} holds {count} files ({size}); "
+                f"NOT TRANSFERRED: the folder {base or '.'!r} holds {count} files; "
                 f"the limit is {limit:,} files per fetch. Nothing was sent to the cloud.",
                 await self._folder_subdirs(user_id, pair_id, local_path))
 
@@ -1414,6 +1435,16 @@ class TransferManager:
             for i, spec in enumerate(batch["files"]):
                 if rec.state != "active":
                     return  # aclose() ended the batch
+                if self.shutdown_event.is_set():
+                    # The service is going down: stop driving new files. A
+                    # file transfer in flight would never finish (the bridge
+                    # is about to be cut off), and finishing the batch
+                    # record now lets aclose()'s own finish() be a no-op
+                    # instead of an unexplained "adapter is shutting down"
+                    # for a poll later.
+                    batch["stopped"] = True
+                    rec.touch()
+                    return
                 batch["index"] = i + 1
                 batch["current"] = spec["local"]
                 rec.touch()
@@ -1452,11 +1483,19 @@ class TransferManager:
 
     async def _wait_batch_file(self, rec: Transfer, ft: Transfer) -> bool:
         """Wait for one file of the batch to finish. Returns False when the
-        batch itself was ended (aclose), so the caller stops. The batch
-        record is touched every round so the stall sweep can never mistake a
-        long single file for a dead batch."""
+        batch itself was ended (aclose / shutdown), so the caller stops. The
+        batch record is touched every round so the stall sweep can never
+        mistake a long single file for a dead batch."""
         while ft.state == "active":
             if rec.state != "active":
+                return False
+            if self.shutdown_event.is_set():
+                # The service is going down. wait() returns AT ONCE in this
+                # state without yielding, so looping on would spin the loop
+                # with the event loop fully hogged — aclose()'s cancel would
+                # then never be delivered (a cancel only lands at an await
+                # point) and every test / shutdown that awaits it would
+                # hang. Treat shutdown as "the batch was ended" and stop.
                 return False
             rec.touch()
             await self.wait(ft, 2.0)
@@ -1528,7 +1567,12 @@ class TransferManager:
         else:
             head = "DONE local → cloud (folder)"
         stopped = (b["offline"] or b.get("stopped")) and not _all_done(b)
-        lines = [head + f": {ok:,} of {b['total']:,} file(s) sent, {_human(b['done_bytes'])}."]
+        if b["fresh"]:
+            lines = [head + f": {b['done']:,} file(s) sent this time ({_human(b['done_bytes'])}); "
+                            f"{b['fresh']:,} of the {b['total']:,} were already up to date in the cloud "
+                            f"and were not re-sent."]
+        else:
+            lines = [head + f": {ok:,} of {b['total']:,} file(s) sent, {_human(b['done_bytes'])}."]
         if stopped:
             lines.append("The batch was stopped early: the user's computer went offline (or the "
                          "localoctop program was closed) part-way through, so the remaining "
@@ -1649,17 +1693,38 @@ class TransferManager:
         return t
 
     async def wait(self, t: Transfer, seconds: float) -> None:
-        """Wait up to `seconds` for the transfer to finish."""
+        """Wait up to `seconds` for the transfer to finish — or for the
+        service to start shutting down, in which case return immediately so
+        the tool call can answer (with a restart note) instead of being cut
+        off mid-wait."""
         deadline = time.monotonic() + seconds
-        while t.state == "active":
-            await self._check_stall(t)
-            left = deadline - time.monotonic()
-            if left <= 0 or t.state != "active":
-                return
-            try:
-                await asyncio.wait_for(t.done.wait(), timeout=min(left, 2.0))
-            except asyncio.TimeoutError:
-                continue
+        # The shutdown event must wake this call even if it is sitting in a
+        # wait when the signal arrives. Wait on the transfer's done-event
+        # and the shutdown event together; the 2s slice keeps the stall
+        # check cadence the old loop had.
+        done_task = asyncio.create_task(t.done.wait())
+        shut_task = asyncio.create_task(self.shutdown_event.wait())
+        try:
+            while t.state == "active":
+                if self.shutdown_event.is_set():
+                    return
+                await self._check_stall(t)
+                left = deadline - time.monotonic()
+                if left <= 0 or t.state != "active":
+                    return
+                try:
+                    # asyncio.wait (not gather): wait never cancels the
+                    # tasks it watches, so a timed-out slice leaves both
+                    # waiters alive for the next round. wait_for cancels the
+                    # _first_of wrapper on timeout, which asyncio.wait
+                    # tolerates (it just stops watching).
+                    await asyncio.wait_for(
+                        _first_of(done_task, shut_task), timeout=min(left, 2.0))
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            done_task.cancel()
+            shut_task.cancel()
 
     def _agent_view(self, t: Transfer) -> str:
         """The path the agent should use, as seen from inside its folder."""
@@ -1766,6 +1831,14 @@ class TransferManager:
         speed = have / elapsed
         eta = f", about {int((t.size - have) / speed) + 1}s left" if speed > 0 and t.size else ""
         idle = time.monotonic() - t.updated
+        if self.shutdown_event.is_set():
+            # The service is going down: this answer is the tool call's last
+            # word, so it must carry the way forward by itself.
+            return (f"IN PROGRESS {what}: {pct:.0f}% ({have:,} of {t.size:,} bytes)\n"
+                    f"transfer_id: {t.id}\n"
+                    "The localoctop service is restarting right now. Wait a few seconds, then call "
+                    "transfer_status with this transfer_id to keep waiting; if the id is no longer "
+                    "known after the restart, start the transfer again.")
         if idle > 20:
             # No bytes for a while: say so plainly instead of showing a stale
             # speed. The bridge keeps retrying on its own and resumes from
@@ -1984,15 +2057,31 @@ class TransferManager:
         # Buffer the whole chunk first: a chunk is applied all-or-nothing,
         # so a connection cut mid-chunk leaves the file at a clean offset.
         buf = bytearray()
-        async for piece in request.stream():
-            buf.extend(piece)
-            # Bytes are arriving: that is activity and progress even
-            # though the chunk is only applied once it is complete (on a
-            # slow link one chunk takes tens of seconds).
-            t.inflight = len(buf)
+        try:
+            async for piece in request.stream():
+                buf.extend(piece)
+                # Bytes are arriving: that is activity and progress even
+                # though the chunk is only applied once it is complete (on a
+                # slow link one chunk takes tens of seconds).
+                t.inflight = len(buf)
+                t.touch()
+                if len(buf) > MAX_CHUNK_BYTES:
+                    return JSONResponse({"error": "chunk too large"}, status_code=413)
+        except (ClientDisconnect, ConnectionError, OSError):
+            # The bridge's connection dropped while the chunk was arriving —
+            # the normal case resume exists for. Nothing of this chunk is
+            # applied (received/sha stay as they were), the transfer stays
+            # active, and the bridge re-sends this chunk from t.received when
+            # it is back. NOT an internal error: never the last-resort
+            # handler, never an ERROR log. The answer is irrelevant (the
+            # peer is gone) but must not raise into it either.
+            logger.info("transfer %s: the bridge disconnected while a chunk was arriving "
+                        "(at offset %d, %d bytes of this chunk discarded); "
+                        "the transfer stays active for resume", t.id, t.received, len(buf))
+            t.inflight = 0
             t.touch()
-            if len(buf) > MAX_CHUNK_BYTES:
-                return JSONResponse({"error": "chunk too large"}, status_code=413)
+            return JSONResponse({"error": "client disconnected", "received": t.received},
+                                status_code=499)
         if declared and len(buf) != declared:
             return JSONResponse({"error": "short chunk", "received": t.received}, status_code=400)
         async with t.lock:
@@ -2193,7 +2282,25 @@ class TransferManager:
                         pos += len(data)
                         t.received = max(t.received, pos)
                         t.touch()
-                        yield data
+                        try:
+                            yield data
+                        except (ClientDisconnect, ConnectionError, OSError,
+                                GeneratorExit, asyncio.CancelledError):
+                            # The bridge stopped reading (network cut, client
+                            # closed, server shutting down): EXPECTED — the
+                            # bridge resumes from t.received when it is back.
+                            # The transfer stays active; nothing is failed,
+                            # no ERROR is logged.
+                            logger.info("transfer %s: the bridge disconnected while content "
+                                        "was being served (at offset %d); "
+                                        "the transfer stays active for resume", t.id, pos)
+                            return
+                except (ClientDisconnect, ConnectionError, OSError):
+                    # A source-read failure that is really the connection
+                    # going away: same expected case as above.
+                    logger.info("transfer %s: connection lost while serving content "
+                                "(at offset %d); the transfer stays active for resume", t.id, pos)
+                    return
                 except Exception:
                     # An unexpected failure mid-stream: the response headers
                     # are already sent, so the HTTP answer can only be cut —

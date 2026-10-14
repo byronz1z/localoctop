@@ -2443,3 +2443,290 @@ class TestT4QueuedDupOwnership:
             assert self._fds() <= before
         finally:
             os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 F1 (disconnect mid-transfer is EXPECTED, never the last-resort net)
+# ---------------------------------------------------------------------------
+
+class _DisconnectStream:
+    """An httpx async request-body generator that raises ClientDisconnect
+    after `cut_at` bytes — the bridge's connection dying mid-chunk."""
+
+    def __init__(self, payload: bytes, cut_at: int):
+        self._payload = payload
+        self._cut_at = cut_at
+
+    async def __call__(self):
+        from starlette.requests import ClientDisconnect
+        pos = 0
+        while pos < self._cut_at:
+            nxt = min(self._cut_at, pos + 8)
+            yield self._payload[pos:nxt]
+            pos = nxt
+        raise ClientDisconnect()
+
+
+class TestChunkDisconnectKeepsTransferAlive:
+    """Receiving a chunk and the peer vanishes mid-body: the chunk is NOT
+    applied, the transfer stays active, no ERROR is logged, and the retried
+    chunk lands byte-identical (LOX-002 item 1)."""
+
+    async def test_disconnect_mid_chunk_stays_active_and_resumes(
+            self, users_dir, mgr, caplog):
+        _mk_user(users_dir, "alice")
+        content = os.urandom(64 * 1024)
+        mgr.registry = FakeRegistry({"f.bin": (content, 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.bin")
+        assert t.state == "active"
+        client = _client_for(mgr)
+        auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+        base = f"/mcp/localoctop/transfer/{t.id}"
+        async with client:
+            with caplog.at_level("INFO", logger="localoctop.transfers"):
+                r = await client.put(f"{base}/chunk?offset=0",
+                                     content=_DisconnectStream(content, 100)(),
+                                     headers={**auth, "Content-Length": str(len(content))})
+            # The answer is irrelevant (the peer is gone) but must exist.
+            assert r.status_code != 500
+            # Nothing was applied; the transfer is still alive.
+            assert t.state == "active"
+            assert t.received == 0
+            assert not any(rec.levelname == "ERROR" for rec in caplog.records)
+            assert any("disconnected" in rec.getMessage() and t.id in rec.getMessage()
+                       for rec in caplog.records)
+            # The bridge comes back and re-sends the whole chunk from 0.
+            r = await client.put(f"{base}/chunk?offset=0", content=content, headers=auth)
+            assert r.status_code == 200
+            sha = hashlib.sha256(content).hexdigest()
+            r = await client.post(f"{base}/complete",
+                                  json={"ok": True, "size": len(content), "sha256": sha},
+                                  headers=auth)
+            assert r.status_code == 200
+        assert t.state == "done"
+        landed = _landing(users_dir, "alice") / "f.bin"
+        assert landed.read_bytes() == content
+
+    async def test_disconnect_after_partial_write_overwritten_on_resume(
+            self, users_dir, mgr, caplog):
+        """Bytes written into the temp file but never counted in `received`
+        (the chunk died before it could be applied) are overwritten by the
+        resumed chunk at the same offset, so the landed file is
+        byte-identical to the source."""
+        _mk_user(users_dir, "alice")
+        content = os.urandom(32 * 1024)
+        mgr.registry = FakeRegistry({"g.bin": (content, 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "g.bin")
+        client = _client_for(mgr)
+        auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+        base = f"/mcp/localoctop/transfer/{t.id}"
+
+        # Simulate "written but not counted": garbage sits in the temp file
+        # at offset 0 while received is still 0. The resumed chunk must
+        # overwrite exactly these bytes.
+        garbage = b"X" * 4096
+        os.pwrite(t.file_fd, garbage, 0)
+        async with client:
+            with caplog.at_level("INFO", logger="localoctop.transfers"):
+                r = await client.put(f"{base}/chunk?offset=0",
+                                     content=_DisconnectStream(content, 100)(),
+                                     headers={**auth, "Content-Length": str(len(content))})
+            assert r.status_code != 500
+            assert t.state == "active"
+            assert t.received == 0
+            # Resume: the full chunk is re-sent from offset 0.
+            r = await client.put(f"{base}/chunk?offset=0", content=content, headers=auth)
+            assert r.status_code == 200
+            sha = hashlib.sha256(content).hexdigest()
+            r = await client.post(f"{base}/complete",
+                                  json={"ok": True, "size": len(content), "sha256": sha},
+                                  headers=auth)
+            assert r.status_code == 200
+        assert t.state == "done"
+        landed = _landing(users_dir, "alice") / "g.bin"
+        assert landed.read_bytes() == content
+
+    async def test_unexpected_exception_still_hits_the_net(
+            self, users_dir, mgr, caplog):
+        """A RuntimeError while the body is being read is NOT an expected
+        disconnect: it must still go to the last-resort net (regression guard
+        for the new except clause)."""
+        _mk_user(users_dir, "alice")
+        content = b"hello world"
+        mgr.registry = FakeRegistry({"f.txt": (content, 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.txt")
+        client = _client_for(mgr)
+        auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+
+        async def boom():
+            yield b"hel"
+            raise RuntimeError("body reader blew up unexpectedly")
+
+        async with client:
+            with caplog.at_level("ERROR", logger="localoctop.transfers"):
+                r = await client.put(f"/mcp/localoctop/transfer/{t.id}/chunk?offset=0",
+                                     content=boom(), headers=auth)
+            assert r.status_code == 500
+        assert t.state == "failed"
+        assert "internal problem" in t.error
+
+
+class TestContentDisconnectKeepsTransferAlive:
+    """Serving content to a peer that vanishes mid-stream: the transfer
+    stays active, no ERROR is logged, and the bridge resumes from its own
+    received offset (LOX-002 item 1, send-back direction)."""
+
+    async def test_disconnect_mid_stream_stays_active_and_resumes(
+            self, users_dir, mgr, caplog):
+        _mk_user(users_dir, "alice")
+        payload = os.urandom(3 * 1024 * 1024)  # three 1 MiB reads
+        src = users_dir / "alice" / "big.bin"
+        src.write_bytes(payload)
+        mgr.registry = FakeRegistry()
+        t = await mgr.start_download("alice", "pair-1", "/big.bin", "out.bin", False)
+        assert t.state == "active"
+        client = _client_for(mgr)
+        auth = {"Authorization": "Bearer btok-alice", "X-Transfer-Ticket": t.ticket}
+        base = f"/mcp/localoctop/transfer/{t.id}"
+
+        # First fetch: read only the first network chunk of the stream, then
+        # drop the response (the bridge dying). The server-side generator
+        # sees the consumer go away on its next yield.
+        async with client:
+            with caplog.at_level("INFO", logger="localoctop.transfers"):
+                async with client.stream("GET", f"{base}/content", headers=auth) as r:
+                    assert r.status_code == 206
+                    got = b""
+                    async for piece in r.aiter_bytes():
+                        got += piece
+                        break  # take one network chunk, then close
+            # The transfer must NOT be failed: the bridge will resume.
+            assert t.state == "active"
+            assert t.received >= len(got) > 0
+            assert not any(rec.levelname == "ERROR" for rec in caplog.records)
+            # Resume from exactly what the bridge holds.
+            async with client.stream("GET", f"{base}/content",
+                                     headers={**auth, "Range": f"bytes={len(got)}-"}) as r2:
+                assert r2.status_code == 206
+                rest = b""
+                async for piece in r2.aiter_bytes():
+                    rest += piece
+            assert got + rest == payload
+            # Now complete it like the bridge would.
+            r3 = await client.post(f"{base}/complete",
+                                   json={"ok": True, "path": "out.bin", "replaced": False},
+                                   headers=auth)
+            assert r3.status_code == 200
+        assert t.state == "done"
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 item 2: shutdown wakes every waiting tool call immediately.
+# ---------------------------------------------------------------------------
+
+class TestShutdownWakesWaitingCalls:
+    async def test_wait_returns_at_once_when_shutdown_is_set(self, users_dir, mgr):
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.txt": (b"hello world", 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.txt")
+        assert t.state == "active"
+        started = time.monotonic()
+        waiter = asyncio.create_task(mgr.wait(t, 20.0))
+        await asyncio.sleep(0.2)
+        assert not waiter.done()  # genuinely waiting
+        mgr.shutdown_event.set()
+        await asyncio.wait_for(waiter, timeout=5.0)
+        assert time.monotonic() - started < 5.0
+        # The answer the model gets: progress + the restart guidance.
+        text = mgr.describe(t)
+        assert "restarting" in text
+        assert "transfer_status" in text
+        assert t.id in text
+
+    async def test_many_waiters_all_wake(self, users_dir, mgr):
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.txt": (b"hello world", 1000)})
+        ts = [await mgr.start_upload("alice", "pair-1", "f.txt", force=True)
+              for _ in range(4)]
+        waiters = [asyncio.create_task(mgr.wait(t, 20.0)) for t in ts]
+        await asyncio.sleep(0.2)
+        assert not any(w.done() for w in waiters)
+        mgr.shutdown_event.set()
+        await asyncio.wait_for(asyncio.gather(*waiters), timeout=5.0)
+        assert all(w.done() for w in waiters)
+        for t in ts:
+            assert "restarting" in mgr.describe(t)
+
+    async def test_aclose_wakes_waiters_before_finishing(self, users_dir, mgr):
+        """aclose() sets the shutdown flag FIRST: a call in wait() must
+        observe it even while aclose goes on to fail the transfers."""
+        _mk_user(users_dir, "alice")
+        mgr.registry = FakeRegistry({"f.txt": (b"hello world", 1000)})
+        t = await mgr.start_upload("alice", "pair-1", "f.txt")
+        waiter = asyncio.create_task(mgr.wait(t, 20.0))
+        await asyncio.sleep(0.2)
+        await mgr.aclose()
+        # aclose finishes the transfer (which also wakes the waiter) — the
+        # call must be out of its wait, not left hanging until the 20s
+        # budget expires.
+        await asyncio.wait_for(waiter, timeout=5.0)
+        assert waiter.done()
+
+
+class TestSignalNotifyingServer:
+    def test_handle_exit_sets_shutdown_event_before_super(self, users_dir, mgr):
+        """The uvicorn subclass in main.py flags the transfer manager the
+        moment the signal arrives (item 2's early wake-up hook)."""
+        from localoctop.main import SignalNotifyingServer
+
+        class _Cfg:
+            class app:  # uvicorn Config-shaped stub
+                state = type("S", (), {})()
+        _Cfg.app.state.transfers = mgr
+        srv = SignalNotifyingServer.__new__(SignalNotifyingServer)
+        srv.config = _Cfg()
+        # Stub the bits of uvicorn.Server.handle_exit that need __init__ state.
+        srv.should_exit = False
+        srv.force_exit = False
+        srv._captured_signals = []
+        SignalNotifyingServer.handle_exit(srv, 2, None)
+        assert mgr.shutdown_event.is_set()
+        assert srv.should_exit  # the parent's flag-setting half still ran
+
+
+# ---------------------------------------------------------------------------
+# LOX-002 item 3: folder summary / over-limit wording.
+# ---------------------------------------------------------------------------
+
+class TestFolderWording:
+    def test_summary_distinguishes_sent_from_already_up_to_date(self, mgr):
+        b = {"done": 3, "fresh": 9, "total": 12, "done_bytes": 300,
+             "failed": [], "kept": [], "saved_as": [], "skipped": 0,
+             "offline": False, "visible": "/localoctop/docs", "folder": "docs",
+             "total_bytes": 300, "index": 12, "current": ""}
+        text = mgr._batch_text_with(b, 20)
+        first = text.splitlines()[0]
+        assert "3 file(s) sent this time" in first
+        assert "9 of the 12" in first and "already up to date" in first
+        assert "12 of 12 file(s) sent" not in text
+
+    def test_summary_without_fresh_keeps_old_shape(self, mgr):
+        b = {"done": 12, "fresh": 0, "total": 12, "done_bytes": 300,
+             "failed": [], "kept": [], "saved_as": [], "skipped": 0,
+             "offline": False, "visible": "/localoctop/docs", "folder": "docs",
+             "total_bytes": 300, "index": 12, "current": ""}
+        text = mgr._batch_text_with(b, 20)
+        assert text.splitlines()[0].startswith(
+            "DONE local → cloud (folder): 12 of 12 file(s) sent")
+
+    async def test_over_limit_mentions_count_not_bytes(self, users_dir, mgr):
+        _mk_user(users_dir, "alice")
+        # A folder the bridge reports as over its listing cap, all files
+        # zero bytes: the advisory must name the count only.
+        mgr.registry = FakeRegistry(dirs={"big": {"files": ["f%d.txt" % i for i in range(2001)],
+                                                  "over_limit": True, "total_files": 2001,
+                                                  "total_bytes": 0}})
+        t = await mgr.start_upload("alice", "pair-1", "big")
+        text = mgr.describe(t)
+        assert "more than 2,000 files" in text
+        assert "0 B" not in text and "bytes" not in text.splitlines()[0]

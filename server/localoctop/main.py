@@ -19,6 +19,15 @@ session manager):
 Exactly one uvicorn server drives the ASGI lifespan (the plain listener);
 the TLS server runs with lifespan="off" against the same app instance, so
 the MCP SDK session manager starts and shuts down precisely once.
+
+Shutdown ordering (why SignalNotifyingServer exists): on SIGTERM/SIGINT
+uvicorn first closes its listeners, then waits for in-flight requests to
+finish, and only THEN runs the ASGI lifespan shutdown. A tool call waiting
+on a transfer would otherwise sit in its wait through that whole window and
+get cut off without an answer. SignalNotifyingServer sets the transfer
+manager's shutdown_event the moment the signal arrives, so every waiting
+call wakes up immediately and replies ("the service is restarting, poll
+transfer_status") while uvicorn is still draining the connection.
 """
 
 from __future__ import annotations
@@ -33,6 +42,26 @@ from .app import create_app
 from .config import load_settings
 
 logger = logging.getLogger("localoctop")
+
+
+class SignalNotifyingServer(uvicorn.Server):
+    """A uvicorn.Server that flags shutdown to the transfer manager the
+    moment a termination signal arrives — before uvicorn starts draining
+    in-flight requests and long before the ASGI lifespan shutdown runs.
+    handle_exit is invoked exactly once per process lifetime (the signal
+    handler guards with should_exit), so the flag is set exactly once."""
+
+    def handle_exit(self, sig, frame):  # type: ignore[no-untyped-def]
+        try:
+            transfers = getattr(self.config.app.state, "transfers", None)
+            if transfers is not None and not transfers.shutdown_event.is_set():
+                transfers.shutdown_event.set()
+                logger.info("shutdown signal %s received: waking the tool calls "
+                            "waiting on transfers so they answer before the "
+                            "connections close", sig)
+        except Exception:  # noqa: BLE001 - never break signal handling
+            pass
+        super().handle_exit(sig, frame)
 
 
 def _build_server(app, settings, *, host: str, port: int, tls: bool, drive_lifespan: bool) -> uvicorn.Server:
@@ -53,7 +82,7 @@ def _build_server(app, settings, *, host: str, port: int, tls: bool, drive_lifes
     if tls:
         kwargs["ssl_certfile"] = settings.ssl_certfile
         kwargs["ssl_keyfile"] = settings.ssl_keyfile
-    return uvicorn.Server(uvicorn.Config(app, **kwargs))
+    return SignalNotifyingServer(uvicorn.Config(app, **kwargs))
 
 
 async def run() -> None:

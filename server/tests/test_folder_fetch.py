@@ -347,7 +347,11 @@ class TestFolderFetchLimits:
         t = await mgr.start_upload_dir("alice", "pair-1", "huge")
         assert t.is_error() is False
         text = mgr.describe(t)
-        assert "more than 2000" in text
+        # Over the count cap the text names the count only: the byte total
+        # the bridge sent covers just the first listed files, so quoting it
+        # next to the real (larger) count would mislead (LOX-002 item 3).
+        assert "more than 2,000 files" in text
+        assert "99,999" not in text and "97.7 KiB" not in text
         assert "Nothing was sent" in text
         assert "subA" in text and "subB" in text
         assert reg.upload_count() == 0
