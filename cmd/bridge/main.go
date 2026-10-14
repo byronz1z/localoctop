@@ -79,6 +79,7 @@ func acquireSingleInstance(headless bool) func() {
 	}
 	fmt.Fprintln(os.Stderr, "localoctop is already running on this computer; not starting a second copy")
 	os.Exit(1)
+	return nil // unreachable, but Go requires a terminating statement
 }
 
 // ---- desktop mode: console + tray + bridge, one process ----
