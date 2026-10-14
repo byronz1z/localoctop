@@ -4,8 +4,16 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/byronz1z/localoctop/internal/appcfg"
 )
+
+// autostartCommand builds the Run value for the given exe path:
+// `"C:\path\localoctop-desktop.exe" --minimized`.
+func autostartCommand(exe string) string {
+	return fmt.Sprintf(`"%s" --minimized`, exe)
+}
 
 // autostartErrPayload is the SetAutostart return when the registry write
 // succeeded but persisting the mirror failed: the frontend shows the

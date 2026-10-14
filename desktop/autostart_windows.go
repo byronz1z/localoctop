@@ -23,12 +23,6 @@ const (
 	autostartRunName = "localoctop-desktop"
 )
 
-// autostartCommand builds the Run value for the given exe path:
-// `"C:\path\localoctop-desktop.exe" --minimized`.
-func autostartCommand(exe string) string {
-	return fmt.Sprintf(`"%s" --minimized`, exe)
-}
-
 // setAutostartEnabled creates or removes the HKCU Run entry. enable=false
 // deletes the value (DeleteValue is a no-op when absent). A true value is
 // always rewritten so a stale path (moved install) heals on next toggle.

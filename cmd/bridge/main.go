@@ -53,6 +53,19 @@ func main() {
 	runDesktop(*verbose)
 }
 
+// acquireSingleInstance takes the per-user lock so only one localoctop
+// program (bridge headless, bridge desktop, or Wails desktop) runs on this
+// computer at a time. On contention it prints the required message and exits
+// with a non-zero code.
+func acquireSingleInstance() func() {
+	release, ok := localoctop.AcquireSingleInstance()
+	if !ok {
+		fmt.Fprintln(os.Stderr, "localoctop is already running on this computer; not starting a second copy")
+		os.Exit(1)
+	}
+	return release
+}
+
 // ---- desktop mode: console + tray + bridge, one process ----
 
 // appState is the mutable desktop state: the settings on disk and the
@@ -66,6 +79,9 @@ type appState struct {
 }
 
 func runDesktop(verbose bool) {
+	releaseLock := acquireSingleInstance()
+	defer releaseLock()
+
 	cfg, existed, err := appcfg.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
@@ -220,6 +236,9 @@ func bridgeConfig(cfg appcfg.File, verbose bool) (localoctop.Config, error) {
 // ---- headless mode: the original cmd/bridge behavior, flag/env driven ----
 
 func runHeadless(server, token, dirs string, allowWrite bool, audit string, verbose bool) {
+	releaseLock := acquireSingleInstance()
+	defer releaseLock()
+
 	// Fall back to the settings file for anything the flags leave empty, so a
 	// configured desktop install also runs headless out of the box.
 	if server == "" || token == "" || dirs == "" {
