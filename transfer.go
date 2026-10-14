@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,7 @@ import (
 const (
 	MethodTransferUpload   = "transfer_upload"
 	MethodTransferDownload = "transfer_download"
+	MethodTransferManifest = "transfer_manifest"
 	MethodReadText         = "read_text"
 
 	// 4 MiB chunks with a 5-minute budget each: a chunk still gets through on
@@ -53,6 +55,14 @@ const (
 	// fetch_to_cloud instead of letting it page a huge file a window at a
 	// time. Do not change this number — it is the platform's existing limit.
 	largeTextThreshold = 10 << 20
+
+	// manifestMaxFiles is the count at which transfer_manifest stops walking:
+	// one over maxListLimit, so the caller can tell "over the 2000-file
+	// folder limit" apart from "exactly 2000 files". maxListLimit (tools.go)
+	// is the real limit for fetching a whole folder; this constant exists
+	// only to bound the walk itself, so a folder with hundreds of thousands
+	// of files is never enumerated in full just to be told it is too big.
+	manifestMaxFiles = maxListLimit + 1
 )
 
 // transferBackoff is the wait before each retry of one chunk. The sum (~5 min)
@@ -71,6 +81,146 @@ type TransferAccept struct {
 	Size     int64  `json:"size"`
 	MTime    string `json:"mtime"`
 	MTimeU   int64  `json:"mtime_unix"`
+	// IsDir marks a stat_only probe of a DIRECTORY: the adapter answers
+	// "fetch this whole folder" by asking for a manifest next. A real
+	// (non-stat) upload request for a directory is still refused. Optional:
+	// an older adapter ignores it, an older bridge never sends it.
+	IsDir bool `json:"is_dir,omitempty"`
+}
+
+// ManifestEntry is one regular file inside a folder being fetched whole.
+// Rel is the path relative to that folder, always in slash form, so the
+// adapter can rebuild the same directory layout in the cloud.
+type ManifestEntry struct {
+	Rel    string `json:"rel"`
+	Size   int64  `json:"size"`
+	MTime  string `json:"mtime"`
+	MTimeU int64  `json:"mtime_unix"`
+}
+
+// TransferManifest is the transfer_manifest payload: every regular file below
+// a folder, recursively, plus what was skipped and whether the walk stopped
+// early. Hitting the cap is a normal result, not an error — the caller
+// answers "too many files" with a way forward.
+type TransferManifest struct {
+	Path string `json:"path"`
+	// DirName is the folder's own name, so the adapter can keep it as the
+	// top-level component of the cloud layout.
+	DirName string          `json:"dir_name"`
+	Files   []ManifestEntry `json:"files"`
+	// TotalFiles/TotalBytes count what is IN Files (so they stay truthful
+	// when the walk was cut short at the cap).
+	TotalFiles int   `json:"total_files"`
+	TotalBytes int64 `json:"total_bytes"`
+	// SkippedNonRegular counts symlinks, fifos, sockets and device nodes
+	// that were seen and deliberately not followed.
+	SkippedNonRegular int `json:"skipped_non_regular"`
+	// FileLimit is the number of files a folder fetch may contain
+	// (maxListLimit, the same limit list_directory documents). It rides
+	// along so the adapter quotes the real number instead of its own copy.
+	FileLimit int `json:"file_limit"`
+	// OverLimit is true when the walk stopped because manifestMaxFiles
+	// regular files were already found (> the folder limit of 2000).
+	OverLimit bool `json:"over_limit"`
+}
+
+// transferManifest lists every regular file below a folder without touching
+// a single byte of their content. Symlinks are never followed (neither into
+// a directory nor as a file): a link is counted as skipped and left alone,
+// so the walk can never leave the whitelisted folder. The walk stops after
+// manifestMaxFiles regular files — enough to know the folder is over the
+// limit — so a huge tree is never enumerated in full.
+func (b *Bridge) transferManifest(params map[string]any) (*TransferManifest, *BridgeError) {
+	abs, berr := b.tools.resolveAny(getString(params, "path", ""))
+	if berr != nil {
+		return nil, berr
+	}
+	st, err := os.Lstat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errNotFound("folder not found: "+relDisplay(b.cfg.AllowedDirs, abs), err)
+		}
+		return nil, errInternal("stat failed", err)
+	}
+	if !st.IsDir() {
+		return nil, errInvalidParams("path is not a directory; use transfer_upload for a single file")
+	}
+	res := &TransferManifest{
+		Path:      relDisplay(b.cfg.AllowedDirs, abs),
+		DirName:   filepath.Base(abs),
+		Files:     []ManifestEntry{},
+		FileLimit: maxListLimit,
+	}
+	walkErr := walkManifest(abs, "", res)
+	if walkErr != nil {
+		return nil, errInternal("reading the folder failed", walkErr)
+	}
+	return res, nil
+}
+
+// walkManifest appends every regular file below dir (rel is dir's path
+// relative to the manifest root) into res, and counts the non-regular
+// entries it refuses to follow. It stops as soon as the cap is reached:
+// res.OverLimit says so, and the caller must not treat the partial list as
+// a complete inventory.
+func walkManifest(dir, rel string, res *TransferManifest) error {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if rel == "" {
+			return err // the folder we were asked about itself is unreadable
+		}
+		return nil // an unreadable nested dir is skipped, like other walkers
+	}
+	// TotalFiles always mirrors the list. The check inside the defer is what
+	// marks a folder holding EXACTLY the cap's worth of files: the walk
+	// appended the last one and then ran out of entries, so the early exit in
+	// the loop below never fired. Both paths agree on the same constant.
+	defer func() {
+		res.TotalFiles = len(res.Files)
+		if len(res.Files) >= manifestMaxFiles {
+			res.OverLimit = true
+		}
+	}()
+	for _, e := range ents {
+		if len(res.Files) >= manifestMaxFiles {
+			res.OverLimit = true
+			return nil
+		}
+		child := e.Name()
+		if rel != "" {
+			child = rel + "/" + e.Name()
+		}
+		// A symlink is never followed — not as a file, not as a directory —
+		// so the walk can never leave the folder the caller asked about.
+		if e.Type()&fs.ModeSymlink != 0 {
+			res.SkippedNonRegular++
+			continue
+		}
+		if e.IsDir() {
+			if err := walkManifest(filepath.Join(dir, e.Name()), child, res); err != nil {
+				return err
+			}
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			res.SkippedNonRegular++ // vanished under us: nothing left to send
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			// A fifo, socket or device node: not a regular file, never sent.
+			res.SkippedNonRegular++
+			continue
+		}
+		res.Files = append(res.Files, ManifestEntry{
+			Rel:    child,
+			Size:   info.Size(),
+			MTime:  info.ModTime().UTC().Format(time.RFC3339),
+			MTimeU: info.ModTime().Unix(),
+		})
+		res.TotalBytes += info.Size()
+	}
+	return nil
 }
 
 // ReadTextResult is the read_text payload: a line window of a text file.
@@ -194,6 +344,20 @@ func (b *Bridge) transferUpload(params map[string]any) (*TransferAccept, *Bridge
 		return nil, errInternal("stat failed", err)
 	}
 	if st.IsDir() {
+		// A stat_only probe of a directory is how the adapter discovers
+		// "this is a folder, fetch it whole": it answers is_dir and the
+		// adapter asks for transfer_manifest next. A real upload request for
+		// a directory is still refused — bytes of a folder cannot be sent.
+		if getBool(params, "stat_only", false) {
+			return &TransferAccept{
+				Accepted: true,
+				Path:     relDisplay(b.cfg.AllowedDirs, abs),
+				Name:     st.Name(),
+				IsDir:    true,
+				MTime:    st.ModTime().UTC().Format(time.RFC3339),
+				MTimeU:   st.ModTime().Unix(),
+			}, nil
+		}
 		return nil, errInvalidParams("path is a directory; send files one at a time")
 	}
 	maxBytes := int64(toInt(params["max_bytes"], 0))

@@ -550,6 +550,8 @@ func (b *Bridge) dispatch(ctx context.Context, method string, params map[string]
 		return b.tools.listAllowedDirectories(params)
 	case MethodTransferUpload:
 		return b.transferUpload(params)
+	case MethodTransferManifest:
+		return b.transferManifest(params)
 	case MethodTransferDownload:
 		return b.transferDownload(params)
 	case MethodReadText:

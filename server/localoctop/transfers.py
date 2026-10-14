@@ -76,9 +76,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .errors import (
     BridgeProtocolError,
+    CODE_INTERNAL,
     CODE_INVALID_PARAMS,
+    CODE_METHOD_NOT_FOUND,
+    CODE_NO_BRIDGE,
     CODE_NOT_ALLOWED,
     CODE_NOT_FOUND,
+    CODE_TIMEOUT,
     CODE_TOO_LARGE,
 )
 from .tokens import KIND_BRIDGE
@@ -120,6 +124,35 @@ _LEDGER_MARK = "_localoctop_ledger"
 _CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 _O_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _human(n: int) -> str:
+    """A byte count the model can read at a glance."""
+    f = float(n)
+    for unit in ("bytes", "KiB", "MiB", "GiB", "TiB"):
+        if f < 1024 or unit == "TiB":
+            return f"{int(f):,} bytes" if unit == "bytes" else f"{f:.1f} {unit} ({n:,} bytes)"
+        f /= 1024
+    return f"{n:,} bytes"
+
+
+def _plain(exc: BaseException) -> str:
+    """A short plain-language reason from an exception, never a traceback."""
+    msg = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
+    return str(msg)[:300]
+
+
+def _all_done(b: dict[str, Any]) -> bool:
+    return b["done"] + b["fresh"] + len(b["failed"]) >= b["total"]
+
+
+def _is_directory_refusal(exc: BridgeProtocolError) -> bool:
+    """Whether a bridge error is the pre-whole-folder refusal of a directory.
+    Older bridges answer a directory with CODE_INVALID_PARAMS and the wording
+    "path is a directory; send files one at a time"; that is how a new adapter
+    recognises an old client and answers the normal update-program text
+    instead of relaying a program error."""
+    return exc.code == CODE_INVALID_PARAMS and "director" in exc.message.lower()
 
 
 def _open_dir(parent_fd: int, name: str) -> int:
@@ -448,9 +481,29 @@ class Transfer:
     completion_task: asyncio.Task | None = None
     dirs: _Dirs | None = None       # verified dir handles of the landing folder
     file_fd: int = -1               # up: anonymous temp fd; down: verified source fd
+    # Set when the transfer was declared dead because no byte moved for
+    # STALL_SECONDS — i.e. the machine went offline or the client was closed.
+    # A folder fetch uses this to tell "this one file failed" apart from "the
+    # whole machine is gone", and stops the batch in the second case.
+    offline: bool = False
+
+    # A folder fetch (fetch_to_cloud with a directory path) is ONE record
+    # whose batch field carries the progress of the whole run; the per-file
+    # transfers it drives are ordinary Transfer records going through the
+    # ordinary landing path. None for a single-file transfer.
+    batch: dict[str, Any] | None = None
+    # The background task driving that folder fetch, so the stall sweep can
+    # tell "the batch is alive and between two files" from "the whole run
+    # died". Only ever set together with batch.
+    batch_task: asyncio.Task | None = None
 
     def touch(self) -> None:
         self.updated = time.monotonic()
+
+    def is_error(self) -> bool:
+        """Whether the model should see this as an error. A limit advisory is
+        a normal answer with a way forward, not a failure."""
+        return self.state == "failed" and not self.result.get("advisory")
 
     def finish(self, ok: bool, error: str = "") -> None:
         if self.state != "active":
@@ -528,6 +581,10 @@ class TransferManager:
         self._transfers: dict[str, Transfer] = {}
         self._ledger_locks: dict[str, asyncio.Lock] = {}
         self._scan_task: asyncio.Task | None = None
+        # The background tasks driving folder fetches. One entry per running
+        # batch; aclose() cancels every one of them and waits for it to stop
+        # touching its file's handles before finishing the batch record.
+        self._batch_tasks: set[asyncio.Task] = set()
 
     def _ledger_lock(self, user_id: str) -> asyncio.Lock:
         """One lock per user: the read-modify-write of that user's ledger
@@ -703,13 +760,26 @@ class TransferManager:
         user of the transfer's dir handles in that window, so aborting
         while the lock is held would close t.dirs under a coroutine still
         using it. Held lock -> skipped; the next pass (or aclose's wait)
-        retries."""
+        retries.
+
+        A folder-batch record is never aborted by the sweep while its
+        driving task is alive: that task owns the record's lifecycle and
+        touches it at least every couple of seconds (once per file it
+        starts and once per poll of the file in flight), so a batch that
+        still has a live task is making progress by construction. The
+        per-file transfers it drives are swept by this same rule like any
+        other transfer."""
         if t.state != "active":
             return
+        if t.batch is not None:
+            task = t.batch_task
+            if task is not None and not task.done():
+                return
         if time.monotonic() - t.updated <= STALL_SECONDS:
             return
         if t.lock.locked():
             return  # completion in flight: retry next sweep
+        t.offline = True  # no byte moved for STALL_SECONDS: the machine is gone
         t.finish(False, "the transfer stopped making progress — the local machine went offline "
                         "or the localoctop client was closed. Start it again when the machine is back.")
 
@@ -773,6 +843,13 @@ class TransferManager:
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # Folder fetches run as background tasks that drive ordinary per-file
+        # transfers. Cancel them FIRST and wait for them to actually stop:
+        # while one is alive it may be inside a file's start_upload, and only
+        # once it has exited can the loop below be sure it is looking at every
+        # handle still held. Each cancelled batch finishes its own record (its
+        # finally block), so nothing is left 'active' for the model to poll.
+        await self._stop_batch_tasks()
         for t in list(self._transfers.values()):
             if t.state != "active":
                 continue
@@ -967,8 +1044,28 @@ class TransferManager:
             #    with a 4003 error before reporting its size, and deciding
             #    what an over-limit answer looks like is OUR job (a normal
             #    advisory below, not an error).
-            info = await self._call(user_id, pair_id, "transfer_upload",
-                                    {"path": local_path, "stat_only": True})
+            try:
+                info = await self._call(user_id, pair_id, "transfer_upload",
+                                        {"path": local_path, "stat_only": True})
+            except BridgeProtocolError as exc:
+                # An OLDER bridge answers a directory probe with its old
+                # "send files one at a time" refusal instead of is_dir. That
+                # is the one case where a folder fetch means "your program is
+                # old": answer a normal explanation, never the raw refusal.
+                if _is_directory_refusal(exc):
+                    return self._folder_advisory(
+                        user_id, pair_id, local_path, str(local_path),
+                        "this path is a folder, and the localoctop program on the user's computer "
+                        "is an older version that cannot fetch a whole folder in one call. "
+                        "Nothing was sent.\n"
+                        "Next step: ask the user to update the localoctop program on their "
+                        "computer, or fetch the individual files with fetch_to_cloud instead.",
+                        tail=False)
+                raise
+            # The path is a FOLDER: fetch it whole. A current bridge marks it
+            # on the stat probe, so detecting it costs no extra round trip.
+            if info.get("is_dir"):
+                return await self.start_upload_dir(user_id, pair_id, local_path, force=force)
             size, mtime = int(info.get("size", 0)), int(info.get("mtime_unix", 0))
             rel = str(info.get("path") or local_path)
             comps, visible = self._dest_for(user_id, rel, str(info.get("name") or ""))
@@ -1159,6 +1256,355 @@ class TransferManager:
             if root_fd >= 0:
                 os.close(root_fd)
 
+    # ------------------------------------------------- start: folder upload
+    # "Fetch this whole folder": list it first, decide whether it fits the
+    # limits, and only then hand every file to the ordinary single-file
+    # upload path — same ledger, same "already up to date" shortcut, same
+    # keep-the-old-cloud-copy rules. Nothing here bypasses or re-implements
+    # that path; it just drives it once per file, one file at a time.
+
+    async def start_upload_dir(self, user_id: str, pair_id: str, local_path: str,
+                               force: bool = False) -> Transfer:
+        """Fetch every file under a folder. Returns ONE record for the whole
+        batch (state active while it runs, done/failed at the end)."""
+        try:
+            man = await self._call(user_id, pair_id, "transfer_manifest", {"path": local_path})
+        except BridgeProtocolError as exc:
+            if exc.code == CODE_METHOD_NOT_FOUND:
+                # Compatibility: the employee's machine runs a localoctop
+                # program from before whole-folder fetches. That is a normal
+                # answer ("ask the user to update, or fetch one file at a
+                # time"), never a program error.
+                return self._folder_advisory(
+                    user_id, pair_id, local_path, str(local_path),
+                    "this folder cannot be fetched in one call: the localoctop program on the "
+                    "user's computer is an older version that does not support fetching a whole "
+                    "folder. Nothing was sent.\n"
+                    "Next step: ask the user to update the localoctop program on their computer, "
+                    "or fetch the files one at a time with fetch_to_cloud.",
+                    tail=False)
+            raise
+        if not isinstance(man, dict):
+            raise BridgeProtocolError(CODE_INTERNAL, "the folder listing came back malformed")
+        files = [f for f in (man.get("files") or []) if isinstance(f, dict)]
+        skipped = int(man.get("skipped_non_regular") or 0)
+        limit = int(man.get("file_limit") or 2000)
+        over = bool(man.get("over_limit"))
+        total = int(man.get("total_files") or len(files))
+        total_bytes = int(man.get("total_bytes") or 0)
+        folder_rel = str(man.get("path") or local_path)
+        base = "" if folder_rel in ("", ".", "/") else folder_rel
+        _, folder_vis = self._dest_for(user_id, (base + "/x") if base else "x", "x")
+        folder_visible = str(folder_vis).rsplit("/", 1)[0] or "/"
+
+        # A folder with only special files (or nothing) is a normal, finished
+        # answer — there is simply nothing to send.
+        if not files and not over:
+            why = ("the folder is empty" if not skipped else
+                   f"the folder holds no regular files ({skipped} symbolic link(s) or other "
+                   f"special file(s) were skipped)")
+            t = self._folder_advisory(
+                user_id, pair_id, folder_rel, folder_visible,
+                f"Nothing to send: {why}. Nothing was sent to the cloud.",
+                tail=False)
+            t.result.pop("advisory", None)
+            t.state = "done"
+            t.error = ""
+            return t
+
+        # Over the limits: a normal answer that says exactly what the folder
+        # holds, that nothing was sent, and how to split the work.
+        if over or total > limit:
+            count = f"more than {limit}" if over else f"{total:,}"
+            size = (f"{_human(total_bytes)} in the first {len(files):,} files alone"
+                    if over else f"{_human(total_bytes)} in total")
+            return self._folder_advisory(
+                user_id, pair_id, folder_rel, folder_visible,
+                f"NOT TRANSFERRED: the folder {base or '.'!r} holds {count} files ({size}); "
+                f"the limit is {limit:,} files per fetch. Nothing was sent to the cloud.",
+                await self._folder_subdirs(user_id, pair_id, local_path))
+
+        if total_bytes > self.max_bytes:
+            return self._folder_advisory(
+                user_id, pair_id, folder_rel, folder_visible,
+                f"NOT TRANSFERRED: the folder {base or '.'!r} holds {total:,} files totalling "
+                f"{_human(total_bytes)}, over the {_human(self.max_bytes)} one-shot transfer "
+                f"limit. Nothing was sent to the cloud.",
+                await self._folder_subdirs(user_id, pair_id, local_path))
+
+        # In the limits: one record for the batch, driven by a background task
+        # so a long folder keeps answering "in progress" and stays pollable
+        # through transfer_status, exactly like a single file.
+        planned = []
+        for f in files:
+            rel = str(f.get("rel") or "")
+            if not rel:
+                continue
+            rel = rel.replace("\\", "/")
+            planned.append({
+                "rel": rel,
+                "local": f"{base}/{rel}" if base else rel,
+                "size": int(f.get("size") or 0),
+            })
+        t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
+                      local_path=folder_rel, cloud_path=Path(folder_visible))
+        t.result = {"visible": folder_visible, "folder": True}
+        t.batch = {
+            "folder": folder_rel, "visible": folder_visible, "files": planned,
+            "total": len(planned), "total_bytes": total_bytes,
+            "index": 0, "done": 0, "done_bytes": 0, "fresh": 0,
+            "failed": [], "kept": [], "saved_as": [], "skipped": skipped,
+            "current": "", "offline": False,
+        }
+        t.size = total_bytes
+        task = asyncio.get_running_loop().create_task(
+            self._run_folder_batch(t, user_id, pair_id, force))
+        t.batch_task = task
+        self._batch_tasks.add(task)
+        task.add_done_callback(self._batch_tasks.discard)
+        return t
+
+    async def _folder_subdirs(self, user_id: str, pair_id: str, path: str) -> list[str]:
+        """Direct sub-folder names of `path`, for "fetch one sub-folder at a
+        time" advice. Best effort: a listing that fails just means no names."""
+        try:
+            res = await self._call(user_id, pair_id, "list_directory", {"path": path, "depth": 1})
+        except BridgeProtocolError:
+            return []
+        out: list[str] = []
+        for e in (res or {}).get("entries") or []:
+            if not isinstance(e, dict) or not str(e.get("type", "")).startswith("dir"):
+                continue
+            name = str(e.get("name") or "")
+            if name and "/" not in name and name not in ("", ".", "..") and name not in out:
+                out.append(name)
+        return out
+
+    def _folder_advisory(self, user_id: str, pair_id: str, folder: str, visible: str,
+                         text: str, subdirs: list[str] | None = None,
+                         tail: bool = True) -> Transfer:
+        """A finished, nothing-transferred record for a folder answer that hit
+        a limit or an old client. Hitting a limit is a normal result with a
+        way forward, so tools.py renders it as isError=false.
+
+        tail=False is for texts that already carry their own next step (the
+        empty-folder case, and the old-client explanation): appending the
+        generic advice there would repeat what the text just said."""
+        if tail and subdirs:
+            shown = ", ".join(subdirs[:20])
+            more = f" (and {len(subdirs) - 20} more)" if len(subdirs) > 20 else ""
+            text += (f"\nWhat you can do instead: fetch one sub-folder at a time "
+                     f"({shown}{more}), or fetch only the individual files you need.")
+        elif tail:
+            text += ("\nWhat you can do instead: fetch only the individual files you need, "
+                     "one call each.")
+        t = self._new(user_id=user_id, pair_id=pair_id, direction="up",
+                      local_path=folder, cloud_path=Path(visible))
+        t.result = {"advisory": True, "visible": visible, "batch_text": text}
+        t.finish(False, text)
+        return t
+
+    async def _run_folder_batch(self, rec: Transfer, user_id: str, pair_id: str,
+                                force: bool) -> None:
+        """Drive one folder fetch: start each file's ordinary upload, wait for
+        it to land, record the outcome, move on. A failure never stops the
+        rest; the machine going away does."""
+        batch = rec.batch or {}
+        try:
+            for i, spec in enumerate(batch["files"]):
+                if rec.state != "active":
+                    return  # aclose() ended the batch
+                batch["index"] = i + 1
+                batch["current"] = spec["local"]
+                rec.touch()
+                try:
+                    ft = await self.start_upload(user_id, pair_id, spec["local"], force=force)
+                except BridgeProtocolError as exc:
+                    batch["failed"].append((spec["local"], exc.message))
+                    if exc.code == CODE_NO_BRIDGE:
+                        batch["offline"] = True
+                        break
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    batch["failed"].append((spec["local"], _plain(exc)))
+                    continue
+                if not await self._wait_batch_file(rec, ft):
+                    # The batch was torn down (aclose) while this file ran.
+                    rec.touch()
+                    return
+                if ft.state == "failed" and ft.offline:
+                    batch["failed"].append((spec["local"], ft.error))
+                    batch["offline"] = True
+                    break
+                self._record_file_outcome(batch, ft, spec["local"])
+                rec.touch()
+        except asyncio.CancelledError:
+            # aclose() cancelled us: release what the current file still holds
+            # (start_upload already finishes its own record on cancellation).
+            batch["stopped"] = True
+            rec.touch()
+            raise
+        finally:
+            if rec.state == "active":
+                self._finish_batch(rec)
+
+    async def _wait_batch_file(self, rec: Transfer, ft: Transfer) -> bool:
+        """Wait for one file of the batch to finish. Returns False when the
+        batch itself was ended (aclose), so the caller stops. The batch
+        record is touched every round so the stall sweep can never mistake a
+        long single file for a dead batch."""
+        while ft.state == "active":
+            if rec.state != "active":
+                return False
+            rec.touch()
+            await self.wait(ft, 2.0)
+        return True
+
+    @staticmethod
+    def _record_file_outcome(batch: dict[str, Any], ft: Transfer, local: str) -> None:
+        if ft.state == "done" and ft.result.get("fresh"):
+            batch["fresh"] += 1
+        elif ft.state == "done":
+            batch["done"] += 1
+            batch["done_bytes"] += ft.size
+        else:
+            # A per-file advisory (over the limit / no cloud space) or a real
+            # failure: recorded with its reason, the batch carries on.
+            batch["failed"].append((local, ft.error or "the file could not be sent"))
+        # Kept/saved-as names are recorded whatever the outcome — a file that
+        # was already up to date can still have landed under a saved-as name
+        # the model needs to know about.
+        kept = ft.result.get("kept_as_list") or []
+        if ft.result.get("kept_as"):
+            if not kept:
+                kept = [ft.result["kept_as"]]
+            for name in kept:
+                base = str(name).rsplit("/", 1)[-1]
+                if base and base not in batch["kept"]:
+                    batch["kept"].append(base)
+        if ft.result.get("saved_as"):
+            vis = str(ft.result.get("visible") or "")
+            base = vis.rsplit("/", 1)[-1] if vis else ""
+            if base and base not in batch["saved_as"]:
+                batch["saved_as"].append(base)
+
+    def _finish_batch(self, rec: Transfer) -> None:
+        batch = rec.batch or {}
+        ok = batch["done"] + batch["fresh"]
+        batch["current"] = ""
+        rec.result["batch_text"] = self._batch_text(rec)
+        if ok == 0:
+            rec.finish(False, "not one file of the folder could be sent: "
+                              + (batch["failed"][0][1] if batch["failed"] else "unknown reason"))
+        else:
+            # At least one file landed: the call is a success, and the text
+            # says what was partial about it (isError stays false).
+            rec.finish(True)
+
+    def _batch_text(self, rec: Transfer) -> str:
+        """The finished folder result, kept inside the model-facing cap by
+        shrinking the list of named failures until it fits.
+
+        The cap is read at call time (not imported at module load) so it
+        always follows the live value — the tool layer's own limit is the one
+        source of truth for how much text the model may be handed."""
+        from .tools import MODEL_RESULT_CAP_BYTES as cap
+        b = rec.batch or {}
+        show = 20
+        while True:
+            text = self._batch_text_with(b, show)
+            if len(text.encode("utf-8", "replace")) <= cap or show <= 0:
+                return text
+            show //= 2
+
+    def _batch_text_with(self, b: dict[str, Any], show: int) -> str:
+        ok = b["done"] + b["fresh"]
+        if ok == 0:
+            head = "FAILED local → cloud (folder)"
+        elif b["failed"]:
+            head = "PART DONE local → cloud (folder)"
+        else:
+            head = "DONE local → cloud (folder)"
+        stopped = (b["offline"] or b.get("stopped")) and not _all_done(b)
+        lines = [head + f": {ok:,} of {b['total']:,} file(s) sent, {_human(b['done_bytes'])}."]
+        if stopped:
+            lines.append("The batch was stopped early: the user's computer went offline (or the "
+                         "localoctop program was closed) part-way through, so the remaining "
+                         "files were not attempted. Start it again when the computer is back.")
+        lines.append(f"cloud folder: {b['visible']}")
+        lines.append(f"local folder: {b['folder']}")
+        if b["total"] == 0:
+            lines.append("The folder holds no regular files to send.")
+        if b["fresh"]:
+            lines.append(f"{b['fresh']:,} file(s) were already up to date in the cloud "
+                         f"(nothing re-sent).")
+        if b["skipped"]:
+            lines.append(f"{b['skipped']:,} symbolic link(s) or other special file(s) were "
+                         f"skipped (only regular files are sent).")
+        if b["failed"]:
+            lines.append(f"{len(b['failed']):,} file(s) could not be sent:")
+            for path, why in b["failed"][:show]:
+                lines.append(f"  - {path}: {why}")
+            if len(b["failed"]) > show:
+                lines.append(f"  (another {len(b['failed']) - show:,} not listed)")
+        if b["kept"]:
+            lines.append("Previous cloud copies that had been modified were kept: "
+                         + ", ".join(b["kept"][:show])
+                         + (f" (and {len(b['kept']) - show} more)" if len(b["kept"]) > show else ""))
+        if b["saved_as"]:
+            lines.append("Some files were saved under a different name because the name was "
+                         "taken: " + ", ".join(b["saved_as"][:show])
+                         + (f" (and {len(b['saved_as']) - show} more)"
+                            if len(b["saved_as"]) > show else ""))
+        lines.append("Every file is under the cloud folder with the same layout it has on the "
+                     "machine. Work on them there with your own file/shell tools.")
+        if b["failed"] and ok > 0:
+            lines.append("Next step: call fetch_to_cloud on this same folder again — the files "
+                         "that already arrived will not be sent twice.")
+        return "\n".join(lines)
+
+    def _batch_progress_text(self, rec: Transfer) -> str:
+        b = rec.batch or {}
+        idx = b["index"]
+        lines = [f"IN PROGRESS local → cloud (folder): file {idx:,} of {b['total']:,}, "
+                 f"{_human(b['done_bytes'])} of {_human(b['total_bytes'])} sent so far."]
+        if b["current"]:
+            lines.append(f"current file: {b['current']}")
+        if b["failed"]:
+            lines.append(f"{len(b['failed']):,} file(s) failed so far (the batch carries on).")
+        lines.append(f"cloud folder: {b['visible']}")
+        lines.append(f"transfer_id: {rec.id}")
+        lines.append("Call transfer_status with this transfer_id to keep waiting. Do NOT start "
+                     "the same folder again — it is still running.")
+        return "\n".join(lines)
+
+    async def _stop_batch_tasks(self) -> None:
+        """Cancel every running folder-fetch task and wait for each to exit.
+
+        Cancellation is what makes a batch stop touching its file's handles;
+        waiting for the tasks is what makes it safe for aclose() to close
+        those handles afterwards. A task that refuses to exit within the
+        shutdown window is logged and left to process exit (its record is
+        still finished below, so the model is never left polling it)."""
+        while self._batch_tasks:
+            pending = [t for t in list(self._batch_tasks) if not t.done()]
+            for task in pending:
+                task.cancel()
+            if not pending:
+                break
+            done, still = await asyncio.wait(pending, timeout=CLOSE_WAIT_SECONDS)
+            for task in done:
+                self._batch_tasks.discard(task)
+            if still:
+                logger.error("aclose: %d folder-fetch task(s) did not stop within %.1fs; "
+                             "their records are finished anyway (process exit reclaims the fds)",
+                             len(still), CLOSE_WAIT_SECONDS)
+                for task in still:
+                    self._batch_tasks.discard(task)
+                break
+
     # ----------------------------------------------------- start: download
     async def start_download(self, user_id: str, pair_id: str, cloud_path: str,
                              local_path: str, overwrite: bool) -> Transfer:
@@ -1223,6 +1669,16 @@ class TransferManager:
     def describe(self, t: Transfer) -> str:
         """Plain-text status for the model. Short on purpose."""
         what = "local → cloud" if t.direction == "up" else "cloud → local"
+        if t.batch is not None:
+            # A whole-folder fetch: its own progress/completion wording, kept
+            # inside the model-facing cap by shrinking the listed names.
+            if t.state == "active":
+                return self._batch_progress_text(t)
+            return str(t.result.get("batch_text") or t.error or "the folder fetch ended")
+        if t.result.get("batch_text"):
+            # A folder answer that never became a batch (empty folder, over
+            # the limits, older client): the text is ready as it stands.
+            return str(t.result["batch_text"])
         if t.result.get("advisory"):
             # A limit was hit: nothing moved, and the text must hand the
             # model a concrete next step, not a dead end.

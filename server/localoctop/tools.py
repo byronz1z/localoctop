@@ -237,9 +237,10 @@ class ToolService:
         text = tm.describe(t)
         await self._audit(user_id, name, req_path or t.local_path, "error" if t.state == "failed" else "allow",
                           0, f"{t.direction} {t.state} {t.received}/{t.size}", started, client_id)
-        # A limit advisory is a normal answer with a way forward, not an error.
-        is_err = t.state == "failed" and not t.result.get("advisory")
-        return {"content": [{"type": "text", "text": text}], "isError": is_err}
+        # A limit advisory is a normal answer with a way forward, not an error —
+        # and so is a folder fetch that only partly succeeded (its text carries
+        # the failures and the way to continue).
+        return {"content": [{"type": "text", "text": text}], "isError": t.is_error()}
 
     def _cap(self, name: str, rendered: dict[str, Any]) -> dict[str, Any]:
         """Last line of defence: no tool result larger than the model can

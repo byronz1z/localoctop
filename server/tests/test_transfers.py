@@ -30,6 +30,8 @@ import pytest
 from localoctop.errors import (
     BridgeProtocolError,
     CODE_INVALID_PARAMS,
+    CODE_METHOD_NOT_FOUND,
+    CODE_NO_BRIDGE,
     CODE_NOT_ALLOWED,
     CODE_NOT_FOUND,
     CODE_TOO_LARGE,
@@ -60,31 +62,140 @@ class FakeRegistry:
     max_bytes is refused with error 4003 when the file is over that limit —
     stat_only probes carry no max_bytes, so they always answer. A fake that
     ignored max_bytes would hide exactly the round-4 bug (the adapter
-    asking for a stat WITH max_bytes and dying on the 4003)."""
+    asking for a stat WITH max_bytes and dying on the 4003).
 
-    def __init__(self, files: dict[str, tuple[bytes, int]] | None = None):
+    T10 adds the folder side of the real bridge:
+      * transfer_manifest lists the regular files below a folder — derived
+        from `files` (every key under "<folder>/") unless `dirs` names the
+        folder explicitly, which also lets a test set over_limit/skipped;
+      * a stat_only probe of a folder answers is_dir, exactly like the real
+        bridge, so the adapter switches to the whole-folder fetch.
+    Extra knobs let tests drive the batch's hard paths: `fail_uploads`
+    (local path -> reason) fails one file's upload; `offline_after`
+    (a count of upload starts) makes every later start fail with
+    CODE_NO_BRIDGE, i.e. the machine went away. `manifest_missing` makes the
+    manifest method unknown, i.e. an employee running a pre-T10 program."""
+
+    def __init__(self, files: dict[str, tuple[bytes, int]] | None = None,
+                 dirs: dict[str, dict] | None = None,
+                 fail_uploads: dict[str, str] | None = None,
+                 offline_after: int | None = None,
+                 manifest_missing: bool = False,
+                 manifest_raw: dict | None = None):
         # files: local_path -> (content, mtime_unix)
         self.files = files or {}
+        # dirs: folder path -> {"over_limit": bool, "skipped": int,
+        #                       "files": [rel, ...], "total_bytes": int|null}
+        self.dirs = dirs or {}
+        self.fail_uploads = fail_uploads or {}
+        self.offline_after = offline_after
+        self.manifest_missing = manifest_missing
+        self.manifest_raw = manifest_raw
         self.calls: list[tuple[str, dict]] = []
+        self.upload_starts = 0
+        self.upload_attempts = 0
+
+    def upload_count(self) -> int:
+        """Real (non-stat) upload starts that were ACCEPTED so far."""
+        return self.upload_starts
+
+    def _under(self, folder: str) -> bool:
+        """Whether any fake file or declared folder lives below `folder`."""
+        prefix = folder + "/"
+        return any(k.startswith(prefix) for k in self.files) or \
+            any(k.startswith(prefix) for k in self.dirs)
+
+    def _manifest(self, folder: str) -> dict:
+        if folder in self.dirs:
+            spec = self.dirs[folder]
+            rels = list(spec.get("files") or [])
+            files = []
+            total_bytes = 0
+            for rel in rels:
+                key = f"{folder}/{rel}"
+                content, mtime = self.files.get(key, (b"", 1000))
+                files.append({"rel": rel, "size": len(content),
+                              "mtime": "2024-01-01T00:00:00Z", "mtime_unix": mtime})
+                total_bytes += len(content)
+            over = bool(spec.get("over_limit"))
+            skipped = int(spec.get("skipped") or 0)
+            total = int(spec.get("total_files") or len(files))
+            if "total_bytes" in spec and spec["total_bytes"] is not None:
+                total_bytes = int(spec["total_bytes"])
+        else:
+            prefix = folder + "/"
+            files = []
+            total_bytes = 0
+            for key in sorted(self.files):
+                if not key.startswith(prefix):
+                    continue
+                content, mtime = self.files[key]
+                files.append({"rel": key[len(prefix):], "size": len(content),
+                              "mtime": "2024-01-01T00:00:00Z", "mtime_unix": mtime})
+                total_bytes += len(content)
+            over, skipped, total = False, 0, len(files)
+        return {"accepted": True, "path": folder, "dir_name": folder.rsplit("/", 1)[-1],
+                "files": files, "total_files": total, "total_bytes": total_bytes,
+                "skipped_non_regular": skipped, "file_limit": 2000, "over_limit": over}
 
     async def call_paired(self, user_id, pair_id, method, params, timeout=None):
         return await self.call(user_id, method, params, timeout=timeout)
 
     async def call(self, user_id, method, params, timeout=None):
         self.calls.append((method, params))
+        if method == "transfer_manifest":
+            if self.manifest_missing:
+                raise BridgeProtocolError(CODE_METHOD_NOT_FOUND, f"unknown method: {method}")
+            if self.manifest_raw is not None:
+                return self.manifest_raw
+            return self._manifest(params["path"])
         if method == "transfer_upload":
-            content, mtime = self.files[params["path"]]
+            path = params["path"]
+            if params.get("stat_only"):
+                if path not in self.files and (path in self.dirs or self._under(path)):
+                    return {"accepted": True, "path": path, "name": path.rsplit("/", 1)[-1],
+                            "size": 0, "mtime_unix": 1000, "is_dir": True}
+                content, mtime = self.files[path]
+                return {"accepted": True, "path": path, "name": os.path.basename(path),
+                        "size": len(content), "mtime_unix": mtime}
+            # A real upload start.
+            self.upload_attempts += 1
+            if self.offline_after is not None and self.upload_starts >= self.offline_after:
+                raise BridgeProtocolError(
+                    CODE_NO_BRIDGE,
+                    "pair-bridge-offline: the bridge paired with this token is not online")
+            content, mtime = self.files[path]
             max_bytes = int(params.get("max_bytes") or 0)
             if max_bytes > 0 and len(content) > max_bytes:
                 raise BridgeProtocolError(
                     CODE_TOO_LARGE,
                     f"file is {len(content)} bytes, larger than the {max_bytes}-byte transfer limit")
-            return {"accepted": True, "path": params["path"], "name": os.path.basename(params["path"]),
+            if path in self.fail_uploads:
+                self.upload_starts += 1
+                raise BridgeProtocolError(CODE_NOT_FOUND, self.fail_uploads[path])
+            self.upload_starts += 1
+            return {"accepted": True, "path": path, "name": os.path.basename(path),
                     "size": len(content), "mtime_unix": mtime}
         if method == "transfer_download":
             return {"accepted": True, "path": params["path"], "name": os.path.basename(params["path"]),
                     "size": params.get("size", 0)}
+        if method == "list_directory":
+            return {"path": params.get("path", ""), "entries": self._dir_entries(params.get("path", ""))}
         raise AssertionError(f"unexpected bridge call {method}")
+
+    def _dir_entries(self, folder: str) -> list[dict]:
+        seen: dict[str, dict] = {}
+        prefix = folder + "/"
+        for key in list(self.files) + list(self.dirs):
+            rel = key[len(prefix):] if key.startswith(prefix) else (
+                key if folder in ("", ".") else None)
+            if not rel:
+                continue
+            head = rel.split("/", 1)[0]
+            is_dir = "/" in rel or key in self.dirs
+            seen[head] = {"name": head, "type": "dir" if is_dir else "file",
+                          "size": 0, "mtime": "2024-01-01T00:00:00Z"}
+        return list(seen.values())
 
 
 @pytest.fixture

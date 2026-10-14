@@ -428,27 +428,36 @@ TOOL_SCHEMAS[M_READ_FILE] = {
 }
 TOOL_SCHEMAS[M_FETCH_TO_CLOUD] = {
     "name": M_FETCH_TO_CLOUD,
-    "description": "Copy ONE file from the user's machine to the cloud machine you run on, so you can process it "
+    "description": "Copy files from the user's machine to the cloud machine you run on, so you can process them "
                    "with your own file and shell tools. Any type and size (PDF, Excel, video, archives…). The file "
                    "content does not pass through this conversation: you get back only the cloud path. The user's "
-                   "original is not touched. If the cloud already has the current version nothing is re-sent, so "
-                   "it is cheap to call again before each use. Large files take a while: if the answer says "
-                   "IN PROGRESS, call transfer_status with the given transfer_id until it says DONE.",
+                   "original is not touched. "
+                   "path may be ONE file, or a FOLDER: every file inside it (including sub-folders) is copied to the "
+                   "cloud with the same directory layout. A folder fetch is limited to 2000 files and to the "
+                   "per-transfer size limit in total; if the folder is bigger you are told so and how to split it "
+                   "(fetch a sub-folder, or the individual files you need). "
+                   "If the cloud already has the current version nothing is re-sent, so it is cheap to call again "
+                   "before each use — including on a folder that was already fetched (unchanged files are skipped). "
+                   "Large files and folders take a while: if the answer says IN PROGRESS, call transfer_status with "
+                   "the given transfer_id until it says DONE.",
     "inputSchema": {
         "type": "object",
         "properties": {
-            "path": _path_prop("File on the user's machine, relative to the whitelist root or absolute inside it."),
+            "path": _path_prop("File or folder on the user's machine, relative to the whitelist root or absolute "
+                               "inside it."),
             "force": {"type": "boolean", "default": False,
                       "description": "Re-send even if the cloud copy looks current (default false)."},
         },
         "required": ["path"],
     },
-    "annotations": _ann("Fetch file to cloud", read_only=True),
+    "annotations": _ann("Fetch file or folder to cloud", read_only=True),
 }
 TOOL_SCHEMAS[M_TRANSFER_STATUS] = {
     "name": M_TRANSFER_STATUS,
-    "description": "Wait for / check a file transfer started by fetch_to_cloud or deliver_to_local. "
-                   "Returns DONE, FAILED (with the reason) or IN PROGRESS (with percent and time left).",
+    "description": "Wait for / check a transfer started by fetch_to_cloud or deliver_to_local. "
+                   "Returns DONE, FAILED (with the reason) or IN PROGRESS (with percent and time left). "
+                   "Also checks a whole-folder fetch started by fetch_to_cloud: you then get the "
+                   "file-by-file progress, and the final per-folder result.",
     "inputSchema": {
         "type": "object",
         "properties": {"transfer_id": {"type": "string", "description": "The transfer_id from the earlier answer."}},
