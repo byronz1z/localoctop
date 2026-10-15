@@ -102,6 +102,7 @@ type Status struct {
 	ClientID   string `json:"client_id"`
 	ServerURL  string `json:"server_url"`
 	LastError  string `json:"last_error,omitempty"`
+	ReasonText string `json:"reason_text,omitempty"` // T12: plain-Chinese cause for the card sub-line
 	Reconnects int    `json:"reconnects"`
 	ReconnectAttempt int `json:"reconnect_attempt"` // current attempt # from StatusDetail
 	LastPongAt  time.Time `json:"last_pong_at"`     // zero = never; drives the >90s warning
@@ -347,6 +348,7 @@ func (a *App) Disconnect() {
 		s.Connected = false
 		s.ConnState = string(stateDisconnected)
 		s.ReconnectAttempt = 0
+		s.ReasonText = "" // manual disconnect: card shows fixed copy, no cause
 	})
 	snap := a.st.snapshot()
 	a.mu.Unlock()
@@ -506,6 +508,8 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 		s.ConnState = string(stateConnecting)
 		s.ReconnectAttempt = 0
 		s.Connected = false
+		s.LastError = ""
+		s.ReasonText = "刚保存设置，正在重新连接…"
 	})
 
 	if a.cancel != nil {
@@ -541,8 +545,10 @@ func (a *App) applyDetail(d localoctop.StatusDetail) {
 		s.LastPongAt = d.LastPongAt
 		if d.LastError != "" {
 			s.LastError = d.LastError
+			s.ReasonText = friendlyReason(d.LastError)
 		} else if d.Connected {
 			s.LastError = ""
+			s.ReasonText = ""
 		}
 		switch {
 		case d.Connected:

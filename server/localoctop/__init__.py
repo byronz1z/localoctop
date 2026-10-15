@@ -18,4 +18,4 @@ The package is fully self-contained: it imports nothing from the Octop
 codebase and references no paths outside its own directory.
 """
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"

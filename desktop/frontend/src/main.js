@@ -222,19 +222,26 @@ function renderStatus(s) {
         // （自动重连已停）。点「连接」= 用户明示收回，属手动动作。
         cls = 'warn'; tagTxt = '已在别处登录';
         big.textContent = '已在别处登录';
-        sub.textContent = '该令牌已在另一台设备上接管，本机已暂停。点「连接」可从那台设备收回。';
+        sub.textContent = s.reason_text
+            ? s.reason_text + ' 点「连接」可从那台设备收回。'
+            : '该令牌已在另一台设备上接管，本机已暂停。点「连接」可从那台设备收回。';
         sub.title = s.last_error || '';
     } else if (st === 'reconnecting') {
         cls = 'err'; tagTxt = '重连中';
         big.textContent = '重连中…';
-        // Raw technical error stays out of the main copy; hover shows it.
-        sub.textContent = '连接中断，正在自动重连；若长时间未恢复，请检查网络。';
+        // T12: the plain-language cause goes right on the card (reason_text
+        // from the Go side); the raw technical error stays in the hover tip.
+        sub.textContent = s.reason_text
+            ? s.reason_text + '（正在自动重连）'
+            : '连接中断，正在自动重连；若长时间未恢复，请检查网络。';
         sub.title = s.last_error || '';
     } else if (st === 'connecting') {
         cls = 'conn'; tagTxt = '连接中';
         big.textContent = '连接中…';
-        sub.textContent = '正在与服务器建立连接…';
-        sub.title = '';
+        // T12: right after 保存设置 the Go side explains "刚保存设置，正在重新连接…";
+        // a first dial has no cause yet and keeps the generic line.
+        sub.textContent = s.reason_text || '正在与服务器建立连接…';
+        sub.title = s.last_error || '';
     } else if (st === 'disconnected') {
         cls = 'off'; tagTxt = '已断开';
         big.textContent = '已断开';

@@ -2,6 +2,18 @@
 
 本文件记录 localoctop 单仓所有组件的显著变更。格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；版本号遵循语义化（bug 修 +0.0.1，功能 +0.1.0）。
 
+## [0.7.0] - 2026-10-15
+
+员工端体验批（T12）：连不上时把原因讲明白，装到一般程序的位置。
+
+### 桌面客户端（desktop/）
+- **连不上时显示原因**：状态卡在「重连中」「连接中」等非正常状态直接写出大白话原因（令牌失效 / 连不上服务器 / 证书有问题 / 刚保存设置正在重连 / 其他带原文简短部分），技术原文仍留在悬停提示；新增 `friendlyReason` 及其单元测试
+- **默认安装位置**：NSIS `InstallDir` 由 `D:\Program Files\localoctop` 改为 `$PROGRAMFILES64\localoctop`（通常即 `C:\Program Files\localoctop`）；`InstallDirRegKey` 保留，D 盘旧版升级时沿用原位置
+- **图标更新**：应用与托盘图标换新（云图标）
+
+### 版本
+- 产品版本 0.6.1 → 0.7.0（`VERSION` / `protocol.go` / `server/localoctop/__init__.py` / `desktop/wails.json` / `wails_tools.nsh`）
+
 ## [0.6.0] - 2026-09-30
 
 首次单仓统一发版（bridge + server + desktop 同号）。起因：员工实机验收暴露 70 秒必掉线、状态假显示、无安装逻辑三类问题，一次性修完。

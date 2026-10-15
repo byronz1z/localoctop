@@ -81,9 +81,10 @@ ManifestDPIAware true
 
 Name "${INFO_PRODUCTNAME}"
 OutFile "..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the installer's file.
-# 0.6.1 (T3'): perMachine 安装目录（用户裁定）——Program Files 下 localoctop
-# 子文件夹；D 盘是员工机约定的数据盘。InstallDirRegKey 让升级安装记住上次位置。
-InstallDir "D:\Program Files\localoctop"
+# 0.7.0 (T12): perMachine 安装目录（用户裁定 10-15 #44）——与一般程序一致，装到
+# 64 位 Program Files 下的 localoctop 子文件夹（通常即 C:\Program Files\localoctop）。
+# InstallDirRegKey 让升级安装记住上次位置（D 盘旧版升级时沿用原位置）。
+InstallDir "$PROGRAMFILES64\localoctop"
 ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
