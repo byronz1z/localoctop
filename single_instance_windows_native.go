@@ -79,8 +79,8 @@ func BringWailsSingleInstanceWindowToFront() bool {
 func ShowAlreadyRunningMessageBox() {
 	title, _ := windows.UTF16PtrFromString("localoctop")
 	text, _ := windows.UTF16PtrFromString(
-		"localoctop is already running on this computer. " +
-			"Close it first, then start this program again.")
+		"localoctop 已经在这台电脑上运行了。" +
+			"请先在屏幕右下角的托盘图标上右键退出它，再重新打开。")
 	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(text)),
 		uintptr(unsafe.Pointer(title)), 0x00000040) // MB_ICONINFORMATION
 }

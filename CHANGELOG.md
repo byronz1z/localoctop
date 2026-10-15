@@ -10,6 +10,7 @@
 - **连不上时显示原因**：状态卡在「重连中」「连接中」等非正常状态直接写出大白话原因（令牌失效 / 连不上服务器 / 证书有问题 / 刚保存设置正在重连 / 其他带原文简短部分），技术原文仍留在悬停提示；新增 `friendlyReason` 及其单元测试
 - **默认安装位置**：NSIS `InstallDir` 由 `D:\Program Files\localoctop` 改为 `$PROGRAMFILES64\localoctop`（通常即 `C:\Program Files\localoctop`）；`InstallDirRegKey` 保留，D 盘旧版升级时沿用原位置
 - **图标更新**：应用与托盘图标换新（云图标）
+- **同机重复打开的提示框改为中文**：程序已在托盘运行时再次打开，弹出的"已在运行"提示由英文改为中文并写明退出路径（托盘图标右键退出）；实际文件为仓库根 `single_instance_windows_native.go`
 
 ### 版本
 - 产品版本 0.6.1 → 0.7.0（`VERSION` / `protocol.go` / `server/localoctop/__init__.py` / `desktop/wails.json` / `wails_tools.nsh`）
