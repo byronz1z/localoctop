@@ -176,6 +176,43 @@ func TestE2E_RegisterAndToolCall(t *testing.T) {
 	}
 }
 
+// TestE2E_ConnectStampsLastPong 防回归（LOX-002 用户实测 #58）：连上那一刻
+// StatusDetail.LastPongAt 必须非零——握手成功即"刚联系过服务器"。此前零值
+// 会让桌面前端把 0001-01-01 当真实时间戳算龄，一连上就误报"连接不稳定"
+// （第一次 pong 要等约一个 PingInterval）。
+func TestE2E_ConnectStampsLastPong(t *testing.T) {
+	mock := newMockAdapter(t, "tok-pong")
+	b := newTestBridge(t, mock.wsURL(), "tok-pong", false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = b.Run(ctx) }()
+
+	select {
+	case <-mock.register:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for register frame")
+	}
+
+	// The mock never answers pings, so before the fix LastPongAt stayed at
+	// its zero value for the whole session.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		d := b.StatusDetail()
+		if d.Connected && !d.LastPongAt.IsZero() {
+			if age := time.Since(d.LastPongAt); age > 10*time.Second {
+				t.Fatalf("LastPongAt stamped %v ago, want ≈ connect time", age)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after connect: Connected=%v LastPongAt=%v (want non-zero)",
+				d.Connected, d.LastPongAt)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestE2E_TraversalDeniedEndToEnd proves the denial travels the full wire
 // protocol with the CodeNotAllowed error.
 func TestE2E_TraversalDeniedEndToEnd(t *testing.T) {

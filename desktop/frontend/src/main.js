@@ -208,8 +208,12 @@ function renderStatus(s) {
     if (st === 'connected') {
         // >90s without a server acknowledgement = unstable link: still
         // "connected" on the wire, but warn in yellow and say what happens.
-        const pongAge = s.last_pong_at ? (Date.now() - new Date(s.last_pong_at).getTime()) : Infinity;
-        const stale = pongAge > STALE_PONG_MS;
+        // "从未收到"（空值 / Go 零值 0001-01-01T00:00:00Z，年份<2000 / 解析
+        // 失败 NaN）不算不稳定：刚连上时第一次心跳回应尚未到达，零值会算出
+        // 巨大间隔导致误报。只有真实时间戳且距今超过 90 秒才显示警告。
+        const pongMs = s.last_pong_at ? new Date(s.last_pong_at).getTime() : NaN;
+        const gotRealPong = pongMs > Date.UTC(2000, 0, 1);
+        const stale = gotRealPong && Date.now() - pongMs > STALE_PONG_MS;
         cls = stale ? 'warn' : 'ok';
         tagTxt = stale ? '连接不稳定' : '已连接';
         big.textContent = stale ? '连接不稳定' : '已连接';

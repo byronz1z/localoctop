@@ -247,6 +247,11 @@ func (b *Bridge) runOnce(ctx context.Context) error {
 		d.ReconnectAttempt = 0
 		d.ConnState = ConnStateOnline
 		d.LastError = ""
+		// The handshake succeeding is itself proof the server was just
+		// reached, so stamp LastPongAt now. Otherwise the desktop UI would
+		// age the zero time (0001-01-01) against the wall clock and flash
+		// 连接不稳定 until the first pong lands ~PingInterval later.
+		d.LastPongAt = time.Now()
 	})
 	// Pings pending from a previous session can never be answered now (their
 	// socket is gone); drop them so the pending set stays bounded to one
