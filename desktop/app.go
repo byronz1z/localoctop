@@ -299,7 +299,7 @@ func (a *App) SaveConfig(next appcfg.File) error {
 	}
 	a.cfg = cfg
 	a.userDisconnected = false // save = connect intent
-	if err := a.rebuildLocked(cfg); err != nil {
+	if err := a.rebuildLocked(cfg, "刚保存设置，正在重新连接…"); err != nil {
 		a.mu.Unlock()
 		return err
 	}
@@ -325,7 +325,7 @@ func (a *App) Connect() error {
 	if a.userDisconnected {
 		a.userDisconnected = false
 	}
-	err := a.rebuildLocked(a.cfg)
+	err := a.rebuildLocked(a.cfg, "正在连接…")
 	snap := a.st.snapshot()
 	a.mu.Unlock()
 	emitStatus(a.ctx, snap)
@@ -464,15 +464,16 @@ func (a *App) SetConfirmExit(on bool) error {
 func (a *App) rebuild(cfg appcfg.File) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.rebuildLocked(cfg)
+	return a.rebuildLocked(cfg, "正在连接…")
 }
 
 // rebuildLocked builds a Bridge from cfg and swaps it in, cancelling the
-// previous one's Run. Callers hold a.mu. A config that does not validate
-// (e.g. the unconfigured first run) or a bridge that cannot be built leaves
-// the previous bridge running and returns the error — copied from
-// cmd/bridge/main.go rebuildLocked.
-func (a *App) rebuildLocked(cfg appcfg.File) error {
+// previous one's Run. reason is the connecting-state card copy, chosen by
+// the caller (保存设置 / 手动连接 / 启动). Callers hold a.mu. A config that
+// does not validate (e.g. the unconfigured first run) or a bridge that
+// cannot be built leaves the previous bridge running and returns the error
+// — copied from cmd/bridge/main.go rebuildLocked.
+func (a *App) rebuildLocked(cfg appcfg.File, reason string) error {
 	bc := localoctop.NewConfig()
 	bc.ServerURL = cfg.ServerURL
 	bc.Token = cfg.Token
@@ -509,7 +510,7 @@ func (a *App) rebuildLocked(cfg appcfg.File) error {
 		s.ReconnectAttempt = 0
 		s.Connected = false
 		s.LastError = ""
-		s.ReasonText = "刚保存设置，正在重新连接…"
+		s.ReasonText = reason
 	})
 
 	if a.cancel != nil {

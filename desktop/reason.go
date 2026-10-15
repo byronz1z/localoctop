@@ -10,7 +10,7 @@
 //	localoctop: dial <host>: dial tcp ...: connectex: ...  / i/o timeout
 //	... no such host                                   (ws.go, net dial)
 //	localoctop: tls handshake: x509: ...               (ws.go, dialWS)
-//	websocket: close 4000 (replaced by reconnect)      (client.go, parked)
+//	localoctop: peer closed websocket (code=4000 reason="...")  (ws.go, parked)
 package main
 
 import "strings"
@@ -27,6 +27,11 @@ func friendlyReason(lastError string) string {
 	low := strings.ToLower(e)
 
 	switch {
+	// 已在别处登录：同令牌在另一台设备接管，服务器以 4000 关闭本机连接
+	// （ws.go CloseError.Error() 的真实文字含 code=4000）。
+	case strings.Contains(low, "code=4000"):
+		return "这个令牌已在另一台电脑上登录，本机已暂停。"
+
 	// 刚保存设置 / 手动点了连接：桥刚重建，还没有任何成败记录。
 	// (handled by callers passing "" — see rebuildLocked)
 

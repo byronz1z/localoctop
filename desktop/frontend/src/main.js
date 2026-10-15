@@ -222,9 +222,8 @@ function renderStatus(s) {
         // （自动重连已停）。点「连接」= 用户明示收回，属手动动作。
         cls = 'warn'; tagTxt = '已在别处登录';
         big.textContent = '已在别处登录';
-        sub.textContent = s.reason_text
-            ? s.reason_text + ' 点「连接」可从那台设备收回。'
-            : '该令牌已在另一台设备上接管，本机已暂停。点「连接」可从那台设备收回。';
+        // 固定文案，不用 reason_text：收回说明是产品文案，不该随错误原文漂移。
+        sub.textContent = '该令牌已在另一台设备上接管，本机已暂停。点「连接」可从那台设备收回。';
         sub.title = s.last_error || '';
     } else if (st === 'reconnecting') {
         cls = 'err'; tagTxt = '重连中';

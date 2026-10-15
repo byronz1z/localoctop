@@ -17,6 +17,11 @@ func TestT12FriendlyReason(t *testing.T) {
 	}{
 		{"empty means nothing to say", "", ""},
 
+		// 已在别处登录：ws.go CloseError.Error() 的真实文字（code=4000）
+		{"parked by 4000",
+			`localoctop: peer closed websocket (code=4000 reason="replaced by reconnect")`,
+			"这个令牌已在另一台电脑上登录，本机已暂停。"},
+
 		// 令牌不对或已失效：握手被服务器 401/403 拒（ws.go: handshake failed: HTTP %d）
 		{"401 bad token", "localoctop: handshake failed: HTTP 401", "令牌不对或已失效"},
 		{"403 forbidden", "localoctop: handshake failed: HTTP 403", "令牌不对或已失效"},
