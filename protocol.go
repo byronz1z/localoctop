@@ -127,6 +127,11 @@ type SearchResult struct {
 	// SkippedLargeLimit is the size line the skips happened at (bytes), so the
 	// adapter can state the real limit instead of leaving the model guessing.
 	SkippedLargeLimit int64 `json:"skipped_large_limit,omitempty"`
+	// Unreadable files/folders: entries that could not be opened or walked
+	// into. They were NOT searched — the adapter must say so (and name up to
+	// 10) instead of letting "0 matches" imply they were.
+	Unreadable      int      `json:"unreadable,omitempty"`
+	UnreadableNames []string `json:"unreadable_names,omitempty"`
 }
 
 // FileInfo is the get_file_info payload.

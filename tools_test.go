@@ -528,6 +528,47 @@ func TestSearchFiles_SkippedLargeNamesTheLimit(t *testing.T) {
 	}
 }
 
+// A file that cannot be opened is NOT "searched, no match" — it must be
+// counted and named as unreadable, in both the default and the regex mode.
+func TestSearchFiles_UnreadableFileIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not block reads on Windows")
+	}
+	tl, root := newTestTools(t, false, 0)
+	bad := filepath.Join(root, "locked.txt")
+	must(t, os.WriteFile(bad, []byte("needle inside\n"), 0o644))
+	must(t, os.Chmod(bad, 0o000))
+	t.Cleanup(func() { os.Chmod(bad, 0o644) })
+	if _, err := os.ReadFile(bad); err == nil {
+		t.Skip("running as root: permission bits do not block reads")
+	}
+
+	for _, mode := range []string{"", "regex"} {
+		params := map[string]any{
+			"path": ".", "pattern": "needle", "mode": mode,
+			"match_content": true, "include_dirs": false}
+		var res *SearchResult
+		var berr *BridgeError
+		if mode == "regex" {
+			res, berr = tl.searchFilesV05(params)
+		} else {
+			res, berr = tl.searchFiles(params)
+		}
+		if berr != nil {
+			t.Fatalf("search failed (mode %q): %v", mode, berr)
+		}
+		if res.Unreadable != 1 {
+			t.Fatalf("the unreadable file must be counted (mode %q): %+v", mode, res)
+		}
+		if len(res.UnreadableNames) != 1 || res.UnreadableNames[0] != "locked.txt" {
+			t.Fatalf("the unreadable file must be named (mode %q): %+v", mode, res.UnreadableNames)
+		}
+		if len(res.Matches) != 0 {
+			t.Fatalf("nothing readable contains the needle (mode %q): %+v", mode, res.Matches)
+		}
+	}
+}
+
 // Default (substring) mode and regex mode must agree on the hit set for the
 // same plain-text pattern — the two modes differed silently before (G2).
 func TestSearchFiles_GlobAndRegexModesAgreeOnContent(t *testing.T) {

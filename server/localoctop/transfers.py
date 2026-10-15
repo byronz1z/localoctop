@@ -1808,10 +1808,12 @@ class TransferManager:
                         f"nothing was written and no second copy was made.")
             note = ""
             if t.result.get("replaced"):
-                # T5-5: say where the old version ACTUALLY went — the recycle
-                # bin, or a renamed sibling when the bin was unavailable. An
-                # old client reports only `replaced`, in which case the
-                # recycle bin is the client's documented first choice.
+                # T5-5: say where the old version ACTUALLY went. The current
+                # client only overwrites after moving the old version into the
+                # recycle bin; an OLD client could rename it aside instead, so
+                # keep the "renamed:" rendering for compatibility with the
+                # versions that still send it. An old client that reports only
+                # `replaced` documented the bin as its first choice.
                 set_aside = str(t.result.get("set_aside") or "")
                 if set_aside.startswith("renamed:"):
                     note = (f" The old version could not be moved to the recycle bin and was "

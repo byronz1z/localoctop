@@ -359,7 +359,12 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 
 	werr := filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// Skip unreadable entries rather than aborting the whole walk.
+			// Skip unreadable entries rather than aborting the whole walk, but
+			// own up to every one: it was NOT searched.
+			res.Unreadable++
+			if len(res.UnreadableNames) < 10 {
+				res.UnreadableNames = append(res.UnreadableNames, relDisplay(t.cfg.AllowedDirs, p))
+			}
 			return nil
 		}
 		walked++
@@ -426,8 +431,13 @@ func (t *tools) searchFiles(params map[string]any) (*SearchResult, *BridgeError)
 				// "name AND content": a needle that lives only inside a file must
 				// still be found. The pattern is treated as a plain substring
 				// here, never as a glob.
-				ln, preview, found, skippedLarge := substringFirstLine(p, pattern, t.cfg.MaxReadBytes)
-				if skippedLarge {
+				ln, preview, found, skippedLarge, unreadable := substringFirstLine(p, pattern, t.cfg.MaxReadBytes)
+				if unreadable {
+					res.Unreadable++
+					if len(res.UnreadableNames) < 10 {
+						res.UnreadableNames = append(res.UnreadableNames, relDisplay(t.cfg.AllowedDirs, p))
+					}
+				} else if skippedLarge {
 					// Content search does not look inside very large files; the
 					// adapter must say so instead of letting "0 matches" imply the
 					// file was searched.
@@ -482,20 +492,20 @@ func isGlob(p string) bool {
 
 // substringFirstLine reports the first line of a text file containing needle
 // as a plain, case-insensitive substring (never a glob), with a capped
-// preview — the glob-mode counterpart of regexFirstLine. skipped is true when
-// the file was NOT searched because it is over maxBytes — the caller must
-// then not claim "nothing found".
-func substringFirstLine(path, needle string, maxBytes int64) (int, string, bool, bool) {
+// preview. skipped is true when the file was NOT searched because it is over
+// maxBytes; unreadable is true when it could not even be read — the caller
+// must then report it as unsearched, not as "no match".
+func substringFirstLine(path, needle string, maxBytes int64) (int, string, bool, bool, bool) {
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
-		return 0, "", false, false
+		return 0, "", false, false, err != nil
 	}
 	if st.Size() > maxBytes {
-		return 0, "", false, true
+		return 0, "", false, true, false
 	}
 	data, err := os.ReadFile(path) // #nosec G304 - inside validated walk root
 	if err != nil || !utf8.Valid(data) {
-		return 0, "", false, false
+		return 0, "", false, false, err != nil
 	}
 	lowerNeedle := strings.ToLower(needle)
 	for i, line := range strings.Split(string(data), "\n") {
@@ -504,10 +514,10 @@ func substringFirstLine(path, needle string, maxBytes int64) (int, string, bool,
 			if len(prev) > 200 {
 				prev = prev[:200]
 			}
-			return i + 1, prev, true, false
+			return i + 1, prev, true, false, false
 		}
 	}
-	return 0, "", false, false
+	return 0, "", false, false, false
 }
 
 // ---- get_file_info ----

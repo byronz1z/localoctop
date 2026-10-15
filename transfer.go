@@ -606,20 +606,20 @@ func (b *Bridge) runDownload(job transferJob, abs string, size int64, wantSHA st
 	// T5-5: how the old version was actually set aside, reported truthfully.
 	setAside := ""
 	if _, err := os.Stat(final); err == nil && overwrite {
-		// Keep the old version recoverable: recycle bin when the platform
-		// has one, otherwise a timestamped sibling. Goes through trashImpl
-		// like every other tool, so the bin is the same one write_file /
-		// edit_file / delete_file use (and tests can substitute it).
+		// R29: the old version must reach the recycle bin before the new file
+		// takes the name. When the bin cannot take it, the overwrite does NOT
+		// happen — the original stays untouched and the transfer fails; the
+		// downloaded temp file is removed by fail().
 		if ok, terr := trashImpl(final); terr != nil || !ok {
-			bak := final + time.Now().Format(".bak-20060102-150405")
-			if rerr := os.Rename(final, bak); rerr != nil {
-				fail("could not set aside the existing file: " + rerr.Error())
-				return
+			msg := "the recycle bin is not available on this computer, so the existing file was not replaced " +
+				"and the delivered file was not written."
+			if terr != nil {
+				msg += " (recycle-bin error: " + terr.Error() + ")"
 			}
-			setAside = "renamed:" + relDisplay(b.cfg.AllowedDirs, bak)
-		} else {
-			setAside = "recycle_bin"
+			fail(msg)
+			return
 		}
+		setAside = "recycle_bin"
 		replaced = true
 	}
 	if !replaced {

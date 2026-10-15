@@ -648,3 +648,47 @@ func TestRunDownloadOverwriteReportsSetAside(t *testing.T) {
 		t.Fatalf("the report must name the recycle bin as the set-aside, got %+v", c)
 	}
 }
+
+// TestRunDownloadOverwriteRefusedWithoutBin: R29 — when the recycle bin
+// cannot take the old version, the overwrite must NOT happen: the transfer
+// fails with the reason named, the original is untouched, no ".bak" sibling
+// is made, and the downloaded temp file is removed.
+func TestRunDownloadOverwriteRefusedWithoutBin(t *testing.T) {
+	root := t.TempDir()
+	// Substitute the bin with one that always refuses.
+	orig := trashImpl
+	trashImpl = func(string) (bool, error) { return false, nil }
+	t.Cleanup(func() { trashImpl = orig })
+	must(t, os.WriteFile(filepath.Join(root, "report.txt"), []byte("OLD"), 0o644))
+	content := []byte("NEW-CONTENT")
+	fake := &downloadAdapter{t: t, contents: map[string][]byte{"id-nr": content}}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+
+	b := newDownloadBridge(t, root, srv.URL)
+	sha := sha256.Sum256(content)
+	job := transferJob{id: "id-nr", ticket: "tk", baseURL: srv.URL + "/t/id-nr"}
+	b.runDownload(job, filepath.Join(root, "report.txt"), int64(len(content)), hex.EncodeToString(sha[:]), true)
+
+	if data, _ := os.ReadFile(filepath.Join(root, "report.txt")); string(data) != "OLD" {
+		t.Fatalf("the original must be untouched when the bin is unavailable, got %q", data)
+	}
+	entries, err := os.ReadDir(root)
+	must(t, err)
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".bak") {
+			t.Fatalf("no renamed-aside copy may be left: %s", e.Name())
+		}
+		if strings.Contains(e.Name(), ".localoctop-part-") {
+			t.Fatalf("the downloaded temp file must be removed: %s", e.Name())
+		}
+	}
+	c := fake.lastComplete()
+	if c == nil || c["ok"] != false {
+		t.Fatalf("the transfer must fail, got %+v", c)
+	}
+	msg, _ := c["error"].(string)
+	if !strings.Contains(msg, "recycle bin") || !strings.Contains(msg, "not replaced") {
+		t.Fatalf("the failure must name the recycle bin and the untouched original: %q", msg)
+	}
+}

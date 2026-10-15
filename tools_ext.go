@@ -275,9 +275,25 @@ func (t *tools) editFile(params map[string]any) (*EditResult, *BridgeError) {
 	// that is the one case where the original name is briefly empty — the
 	// answer says so honestly and tells the model how to get the old version
 	// back (restore from the recycle bin).
+	// Create the temp file exclusively: a file that already sits at that name
+	// belongs to the user and is never truncated — refuse and say so.
 	tmp := abs + ".tmp-localoctop"
-	if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil { // #nosec G306 - validated path
-		return nil, errInternal("write failed", err)
+	tf, terr := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644) // #nosec G304 - validated path
+	if terr != nil {
+		if os.IsExist(terr) {
+			return nil, errInvalidParams("a file named " + relDisplay(t.cfg.AllowedDirs, tmp) +
+				" already occupies the temporary name; the file was not modified and that file was left untouched. Next step: tell the user.")
+		}
+		return nil, errInternal("write failed", terr)
+	}
+	if _, werr := tf.WriteString(text); werr != nil {
+		tf.Close()
+		_ = os.Remove(tmp)
+		return nil, errInternal("write failed", werr)
+	}
+	if cerr := tf.Close(); cerr != nil {
+		_ = os.Remove(tmp)
+		return nil, errInternal("write failed", cerr)
 	}
 	status, terr := recycleExisting(abs)
 	if status == RecycleUnavailable {
@@ -791,6 +807,14 @@ func (t *tools) unzipFile(params map[string]any) (*UnzipResult, *BridgeError) {
 		if terr != nil {
 			return nil, terr
 		}
+		if pathHasLink(absDest, target) {
+			// A link (or Windows junction, which Go 1.23 may report as
+			// ModeIrregular) sits on the way to this member; extracting would
+			// write through it, possibly outside the destination. Skip this
+			// member only — the rest of the archive extracts normally.
+			res.Skipped = append(res.Skipped, relDisplay(t.cfg.AllowedDirs, target)+" (a link is on this path; not extracted for safety)")
+			continue
+		}
 		if f.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return nil, errInternal("mkdir failed", err)
@@ -848,6 +872,29 @@ func (t *tools) unzipFile(params map[string]any) (*UnzipResult, *BridgeError) {
 		res.TotalBytes += written
 	}
 	return res, nil
+}
+
+// pathHasLink reports whether any level from dest (exclusive) down to target
+// (inclusive, when it already exists) is a link — os.Lstat ModeSymlink, plus
+// ModeIrregular, which is how Go 1.23 reports Windows directory junctions.
+// Missing levels simply do not exist yet and are not links.
+func pathHasLink(dest, target string) bool {
+	rel, err := filepath.Rel(dest, target)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	cur := dest
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		cur = filepath.Join(cur, part)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			return false
+		}
+		if fi.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveInside joins an archive entry to dest and proves the result stays
@@ -936,6 +983,11 @@ func (t *tools) searchFilesV05(params map[string]any) (*SearchResult, *BridgeErr
 	walked := 0
 	werr := filepath.WalkDir(abs, func(p string, d fs.DirEntry, e error) error {
 		if e != nil {
+			// Not searched; say so instead of letting "0 matches" imply it was.
+			res.Unreadable++
+			if len(res.UnreadableNames) < 10 {
+				res.UnreadableNames = append(res.UnreadableNames, relDisplay(t.cfg.AllowedDirs, p))
+			}
 			return nil
 		}
 		walked++
@@ -970,8 +1022,13 @@ func (t *tools) searchFilesV05(params map[string]any) (*SearchResult, *BridgeErr
 		hit := SearchHit{Path: relDisplay(t.cfg.AllowedDirs, p)}
 		contentHit := false
 		if !d.IsDir() && matchContent {
-			ln, preview, ok, skippedLarge := regexFirstLine(p, re, t.cfg.MaxReadBytes)
-			if skippedLarge {
+			ln, preview, ok, skippedLarge, unreadable := regexFirstLine(p, re, t.cfg.MaxReadBytes)
+			if unreadable {
+				res.Unreadable++
+				if len(res.UnreadableNames) < 10 {
+					res.UnreadableNames = append(res.UnreadableNames, relDisplay(t.cfg.AllowedDirs, p))
+				}
+			} else if skippedLarge {
 				// The file's content was not searched; a name match still
 				// counts, but the result must own up to the skip.
 				res.SkippedLarge++
@@ -1009,18 +1066,18 @@ func (t *tools) searchFilesV05(params map[string]any) (*SearchResult, *BridgeErr
 
 // regexFirstLine reports the first line of a text file matching re, with a
 // capped preview. skipped is true when the file was NOT searched because it
-// is over maxBytes.
-func regexFirstLine(path string, re *regexp.Regexp, maxBytes int64) (int, string, bool, bool) {
+// is over maxBytes; unreadable is true when it could not even be read.
+func regexFirstLine(path string, re *regexp.Regexp, maxBytes int64) (int, string, bool, bool, bool) {
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
-		return 0, "", false, false
+		return 0, "", false, false, err != nil
 	}
 	if st.Size() > maxBytes {
-		return 0, "", false, true
+		return 0, "", false, true, false
 	}
 	data, err := os.ReadFile(path) // #nosec G304 - inside validated walk root
 	if err != nil || !utf8.Valid(data) {
-		return 0, "", false, false
+		return 0, "", false, false, err != nil
 	}
 	for i, line := range strings.Split(string(data), "\n") {
 		if re.MatchString(line) {
@@ -1028,10 +1085,10 @@ func regexFirstLine(path string, re *regexp.Regexp, maxBytes int64) (int, string
 			if len(prev) > 200 {
 				prev = prev[:200]
 			}
-			return i + 1, prev, true, false
+			return i + 1, prev, true, false, false
 		}
 	}
-	return 0, "", false, false
+	return 0, "", false, false, false
 }
 
 // stringSlice coerces a JSON array param to []string, dropping non-strings.

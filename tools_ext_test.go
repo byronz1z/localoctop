@@ -543,6 +543,69 @@ func TestEditFile_RenameFailsAfterRecycle(t *testing.T) {
 	}
 }
 
+// TestEditFile_TmpNameOccupied: a user file already sitting at the fixed temp
+// name must NOT be truncated — the edit is refused, and both the target and
+// the occupying file keep their content.
+func TestEditFile_TmpNameOccupied(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	p := filepath.Join(root, "edit.txt")
+	must(t, os.WriteFile(p, []byte("alpha bravo charlie\n"), 0o644))
+	tmp := p + ".tmp-localoctop"
+	must(t, os.WriteFile(tmp, []byte("USER-OWNED"), 0o644))
+
+	_, berr := tl.editFile(map[string]any{
+		"path":  "edit.txt",
+		"edits": []any{map[string]any{"oldText": "bravo", "newText": "BETA"}},
+	})
+	if berr == nil || berr.Code != CodeInvalidParams {
+		t.Fatalf("expected refusal when the temp name is occupied, got %v", berr)
+	}
+	if !strings.Contains(berr.Message, ".tmp-localoctop") || !strings.Contains(berr.Message, "not modified") {
+		t.Fatalf("error must name the occupying file and state nothing was modified: %q", berr.Message)
+	}
+	if data, _ := os.ReadFile(p); string(data) != "alpha bravo charlie\n" {
+		t.Fatalf("target must be untouched: %q", data)
+	}
+	if data, _ := os.ReadFile(tmp); string(data) != "USER-OWNED" {
+		t.Fatalf("the occupying file must be untouched: %q", data)
+	}
+}
+
+// TestUnzip_LinkOnPathSkipsMember: a link inside the destination folder that
+// points OUTSIDE it must not be extracted through — the member is skipped with
+// the reason named, nothing appears outside, other members extract normally.
+func TestUnzip_LinkOnPathSkipsMember(t *testing.T) {
+	tl, root := newTestTools(t, true, 0)
+	outside := t.TempDir()
+	dest := filepath.Join(root, "landing")
+	must(t, os.MkdirAll(dest, 0o755))
+	if err := os.Symlink(outside, filepath.Join(dest, "link")); err != nil {
+		t.Skipf("cannot create symlinks on this machine: %v", err)
+	}
+	makeZip(t, filepath.Join(root, "pkg.zip"), map[string]string{
+		"link/evil.txt": "EVIL",
+		"good.txt":      "GOOD",
+	})
+
+	ur, berr := tl.unzipFile(map[string]any{"archive": "pkg.zip", "dest": "landing"})
+	if berr != nil {
+		t.Fatalf("unzip failed: %v", berr)
+	}
+	if ur.Extracted != 1 {
+		t.Fatalf("only good.txt should have extracted: %+v", ur)
+	}
+	if len(ur.Skipped) != 1 || !strings.Contains(ur.Skipped[0], "link") ||
+		!strings.Contains(ur.Skipped[0], "not extracted") {
+		t.Fatalf("the linked member must be skipped with the reason named: %+v", ur.Skipped)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "evil.txt")); !os.IsNotExist(err) {
+		t.Fatalf("nothing may be written outside the destination: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(dest, "good.txt")); err != nil || string(data) != "GOOD" {
+		t.Fatalf("the plain member must extract normally: %q %v", data, err)
+	}
+}
+
 func TestListAllowedDirectories(t *testing.T) {
 	tl, root := newTestTools(t, false, 0)
 	res, berr := tl.listAllowedDirectories(nil)

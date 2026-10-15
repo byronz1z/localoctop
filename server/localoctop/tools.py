@@ -554,6 +554,17 @@ class ToolService:
             if not lines:
                 # "0 matches" is only honest when everything was searched.
                 head += "\n(matches were NOT ruled out in the skipped file(s))"
+        # T5: files/folders that could not be read were never searched; a
+        # "0 matches" answer must not imply they were.
+        unreadable = int(result.get("unreadable") or 0)
+        if unreadable:
+            unames = [str(n) for n in (result.get("unreadable_names") or [])][:10]
+            unote = f"{unreadable} file(s)/folder(s) could not be read and were NOT searched"
+            if unames:
+                unote += ": " + ", ".join(unames) + (" …" if unreadable > len(unames) else "")
+            notes.append(unote)
+            if not lines:
+                head += "\n(matches were NOT ruled out in the unreadable file(s))"
         if notes:
             head += "\n(" + "; ".join(notes) + ")"
         return self._lines_result(head, lines, "Use a more specific pattern or search a sub-folder.")
